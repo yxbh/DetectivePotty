@@ -1,0 +1,61 @@
+global:
+  dataset_dir: dataset
+  model_name: yolo11n.pt
+  inference_long_edge_px: 1280
+  device: auto
+  log_level: INFO
+  # Roster of dog identities offered as manual labels in the review portal.
+  dogs:
+    - Gromit
+    - WALL-E
+    - Apollo
+
+protect:
+  nvr_host: https://unvr.example.lan
+  # Secret values are read from these environment variables; never put credentials in YAML.
+  api_key_env: DETECTIVEPOTTY_NVR_API_KEY
+  username_env: DETECTIVEPOTTY_NVR_USERNAME
+  password_env: DETECTIVEPOTTY_NVR_PASSWORD
+  verify_tls: true
+
+cameras:
+  - id: backyard-grass
+    name: Backyard Grass
+    enabled: true
+    input:
+      kind: protect
+      source_id: unifi-protect:backyard-grass
+    substream_choice: medium
+    animal_supported: true
+    roi:
+      - name: lawn
+        points:
+          - [0.0, 0.2]
+          - [1.0, 0.2]
+          - [1.0, 1.0]
+          - [0.0, 1.0]
+    ignore_zones: []
+    detection_conf_threshold: 0.25
+    event_duration_s: 8.0
+    stationary_threshold_s: 2.0
+    squat_threshold: 0.35
+    sample_rate_fps: 5.0
+    pre_roll_s: 15.0
+    post_roll_s: 30.0
+    retention_days: 30
+    retention_max_gb: 200.0
+
+  # Offline no-NVR sample. Enable after placing the local Gromit pee clip at this path.
+  - id: backyard-grass-file-sample
+    name: Backyard Grass sample clip
+    enabled: false
+    input:
+      kind: file
+      path: data/unifi_direct_clip_downloads/Backyard Grass 6-6-2026, 09.10.47 GMT+10 - 6-6-2026, 09.11.03 GMT+10.mp4
+      source_id: file:backyard-grass-gromit-pee
+    substream_choice: high
+    animal_supported: false
+    detection_conf_threshold: 0.20
+    sample_rate_fps: 10.0
+    pre_roll_s: 0.0
+    post_roll_s: 0.0

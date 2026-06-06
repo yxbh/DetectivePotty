@@ -1,0 +1,31 @@
+# --- DetectivePotty ---
+# Captured/sample video, frames, and generated event dataset (kept local for now)
+data/
+dataset/
+outputs/
+
+# Local, secret-bearing config (NVR creds, API keys, RTSP tokens)
+*.local.yaml
+*.local.yml
+.env
+.env.*
+secrets/
+
+# --- macOS ---
+.DS_Store
+
+# --- Python / uv ---
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# --- Models / weights (downloaded at runtime) ---
+*.pt
+*.onnx
+*.engine

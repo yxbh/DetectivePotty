@@ -1,0 +1,73 @@
+global:
+  dataset_dir: dataset
+  model_name: yolo11n.pt
+  inference_long_edge_px: 1280
+  device: auto
+  log_level: INFO
+  dogs:
+    - Gromit
+    - WALL-E
+    - Apollo
+
+protect:
+  nvr_host: https://nvr.bennet.lan
+  # Secret values are read from these environment variables; never put credentials in YAML.
+  api_key_env: DETECTIVEPOTTY_NVR_API_KEY
+  username_env: DETECTIVEPOTTY_NVR_USERNAME
+  password_env: DETECTIVEPOTTY_NVR_PASSWORD
+  # nvr.bennet.lan presents a self-signed certificate, so TLS verification is disabled.
+  verify_tls: false
+
+# `id` is the real UniFi Protect camera id (from `detectivepotty list-cameras`); the
+# pipeline resolves RTSPS streams by this id, so it must match the NVR exactly.
+cameras:
+  # Backyard Grass (Protect id 6695ef21030c4603e400040d).
+  # Only the high RTSPS stream is published on the NVR, so substream_choice must be high.
+  - id: 6695ef21030c4603e400040d
+    name: Backyard Grass
+    enabled: true
+    input:
+      kind: protect
+      source_id: unifi-protect:backyard-grass
+    substream_choice: high
+    animal_supported: true
+    roi:
+      - name: lawn
+        points:
+          - [0.0, 0.2]
+          - [1.0, 0.2]
+          - [1.0, 1.0]
+          - [0.0, 1.0]
+    ignore_zones: []
+    detection_conf_threshold: 0.25
+    event_duration_s: 8.0
+    stationary_threshold_s: 2.0
+    squat_threshold: 0.35
+    sample_rate_fps: 5.0
+    pre_roll_s: 15.0
+    post_roll_s: 30.0
+    retention_days: 30
+    retention_max_gb: 200.0
+
+  # Pool (Protect id 66ff1c1a00c53803e400d2ec).
+  # No Protect Animal smart-detect on this camera, so potty events rely on the YOLO
+  # trigger. high/medium/low RTSPS are all published; medium balances quality vs cost.
+  - id: 66ff1c1a00c53803e400d2ec
+    name: Pool
+    enabled: true
+    input:
+      kind: protect
+      source_id: unifi-protect:pool
+    substream_choice: medium
+    animal_supported: false
+    roi: []
+    ignore_zones: []
+    detection_conf_threshold: 0.25
+    event_duration_s: 8.0
+    stationary_threshold_s: 2.0
+    squat_threshold: 0.35
+    sample_rate_fps: 5.0
+    pre_roll_s: 15.0
+    post_roll_s: 30.0
+    retention_days: 30
+    retention_max_gb: 200.0

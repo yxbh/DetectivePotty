@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from detectivepotty.config import CameraConfig, CameraInputConfig, Config, GlobalSettings
+from detectivepotty.events import Detection
+from detectivepotty.geometry import BBox
+from detectivepotty.pipeline import run_pipeline
+
+def make_config(dataset_dir: Path, video_path: Path | None, *, enabled: bool = True) -> Config:
+    return Config(
+        global_settings=GlobalSettings(dataset_dir=dataset_dir, model_name="fake.pt", device="cpu"),
+        cameras=[
+            CameraConfig(
+                id="cam-1",
+                name="Backyard",
+                enabled=enabled,
+                input=CameraInputConfig(kind="file", path=video_path),
+                detection_conf_threshold=0.25,
+                event_duration_s=1.0,
+                stationary_threshold_s=1.0,
+                squat_threshold=0.3,
+                sample_rate_fps=1.0,
+                pre_roll_s=1.0,
+                post_roll_s=1.0,
+                retention_days=30,
+            ),
+        ],
+    )
+
+
+def write_synthetic_video(path: Path, *, frames: int = 6, fps: float = 1.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (160, 120))
+    assert writer.isOpened()
+    try:
+        for frame_idx in range(frames):
+            image = np.zeros((120, 160, 3), dtype=np.uint8)
+            image[:, :, 1] = 20
+            x1 = 40 if frame_idx < 2 else 25
+            y1 = 20 if frame_idx < 2 else 35
+            x2 = 80 if frame_idx < 2 else 95
+            y2 = 100 if frame_idx < 2 else 85
+            cv2.rectangle(image, (x1, y1), (x2, y2), (40, 180, 240), -1)
+            writer.write(image)
+    finally:
+        writer.release()
+    assert path.exists() and path.stat().st_size > 0
+
+
+class FakeDogDetector:
+    device = "cpu"
+    model_name = "fake.pt"
+    last_inference = None
+
+    def detect(self, frame_bgr, *, frame_idx: int, mono_ts: float, wall_ts):  # noqa: ANN001
+        del frame_bgr
+        if frame_idx < 2:
+            bbox = BBox(40, 20, 80, 100)
+        elif frame_idx <= 4:
+            bbox = BBox(25, 35, 95, 85)
+        else:
+            return []
+        return [
+            Detection(
+                bbox=bbox,
+                confidence=0.9,
+                class_name="dog",
+                frame_idx=frame_idx,
+                mono_ts=mono_ts,
+                wall_ts=wall_ts,
+            ),
+        ]
+
+
+def fake_detector_factory(_camera_config):  # noqa: ANN001
+    return FakeDogDetector()
+
+
+def test_run_pipeline_records_file_event_with_injected_detector(tmp_path) -> None:
+    video_path = tmp_path / "sample.mp4"
+    dataset_dir = tmp_path / "dataset"
+    write_synthetic_video(video_path)
+    config = make_config(dataset_dir, video_path)
+
+    event_dirs = run_pipeline(config, detector_factory=fake_detector_factory)
+
+    assert len(event_dirs) == 1
+    event_dir = event_dirs[0]
+    assert event_dir.is_dir()
+    clip_path = event_dir / "clip.mp4"
+    metadata_path = event_dir / "metadata.json"
+    assert clip_path.exists() and clip_path.stat().st_size > 0
+    assert metadata_path.exists()
+    assert sorted((event_dir / "frames").glob("*.jpg"))
+    assert sorted((event_dir / "crops").glob("*.jpg"))
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["camera_id"] == "cam-1"
+    assert metadata["camera_name"] == "Backyard"
+    assert metadata["trigger_reason"] == "yolo"
+    assert metadata["classifier_guess"] == "pee"
+    assert metadata["extra"]["primary_track_id"] == "1"
+    assert len(metadata["frame_records"]) >= 4
+    assert len(metadata["crop_boxes"]) >= 3
+
+
+def test_run_pipeline_no_enabled_cameras_returns_cleanly(tmp_path) -> None:
+    config = make_config(tmp_path / "dataset", None, enabled=False)
+
+    assert run_pipeline(config, detector_factory=fake_detector_factory) == []
+
+
+def make_multi_camera_config(dataset_dir: Path, cameras: list[tuple[str, str, Path]]) -> Config:
+    return Config(
+        global_settings=GlobalSettings(dataset_dir=dataset_dir, model_name="fake.pt", device="cpu"),
+        cameras=[
+            CameraConfig(
+                id=cam_id,
+                name=cam_name,
+                enabled=True,
+                input=CameraInputConfig(kind="file", path=video_path),
+                detection_conf_threshold=0.25,
+                event_duration_s=1.0,
+                stationary_threshold_s=1.0,
+                squat_threshold=0.3,
+                sample_rate_fps=1.0,
+                pre_roll_s=1.0,
+                post_roll_s=1.0,
+                retention_days=30,
+            )
+            for cam_id, cam_name, video_path in cameras
+        ],
+    )
+
+
+def test_run_pipeline_processes_multiple_cameras_concurrently(tmp_path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    cameras = []
+    for idx in range(3):
+        video_path = tmp_path / f"sample-{idx}.mp4"
+        write_synthetic_video(video_path)
+        cameras.append((f"cam-{idx}", f"Camera {idx}", video_path))
+    config = make_multi_camera_config(dataset_dir, cameras)
+
+    event_dirs = run_pipeline(config, detector_factory=fake_detector_factory)
+
+    # One event per camera, results flattened in selected-camera order.
+    assert len(event_dirs) == 3
+    camera_components = [event_dir.parent.parent.parent.name for event_dir in event_dirs]
+    assert camera_components == ["Camera_0", "Camera_1", "Camera_2"]
+
+
+def test_run_pipeline_isolates_failing_camera(tmp_path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    cameras = []
+    for idx in range(2):
+        video_path = tmp_path / f"sample-{idx}.mp4"
+        write_synthetic_video(video_path)
+        cameras.append((f"cam-{idx}", f"Camera {idx}", video_path))
+    config = make_multi_camera_config(dataset_dir, cameras)
+
+    def flaky_detector_factory(camera_config):  # noqa: ANN001
+        if camera_config.id == "cam-0":
+            raise RuntimeError("boom")
+        return FakeDogDetector()
+
+    # Default continue_on_camera_error=True: cam-0 fails, cam-1 still records.
+    event_dirs = run_pipeline(config, detector_factory=flaky_detector_factory)
+
+    assert len(event_dirs) == 1
+    assert event_dirs[0].parent.parent.parent.name == "Camera_1"
+
+
+def test_run_pipeline_max_workers_one_forces_sequential(tmp_path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    cameras = []
+    for idx in range(2):
+        video_path = tmp_path / f"sample-{idx}.mp4"
+        write_synthetic_video(video_path)
+        cameras.append((f"cam-{idx}", f"Camera {idx}", video_path))
+    config = make_multi_camera_config(dataset_dir, cameras)
+
+    event_dirs = run_pipeline(config, detector_factory=fake_detector_factory, max_workers=1)
+
+    assert len(event_dirs) == 2
+    camera_components = [event_dir.parent.parent.parent.name for event_dir in event_dirs]
+    assert camera_components == ["Camera_0", "Camera_1"]
+
+
+def _make_camera(cam_id: str, kind: str) -> CameraConfig:
+    return CameraConfig(id=cam_id, name=cam_id, input=CameraInputConfig(kind=kind))
+
+
+def test_resolve_max_workers_defaults_to_one_thread_per_camera() -> None:
+    from detectivepotty.pipeline import PottyPipeline
+
+    config = Config(
+        global_settings=GlobalSettings(model_name="fake.pt", device="cpu"),
+        cameras=[_make_camera("a", "protect"), _make_camera("b", "protect"), _make_camera("c", "file")],
+    )
+    pipeline = PottyPipeline(config, detector_factory=fake_detector_factory)
+
+    assert pipeline._resolve_max_workers(config.cameras) == 3
+
+
+def test_resolve_max_workers_raises_floor_for_live_cameras() -> None:
+    from detectivepotty.pipeline import PottyPipeline
+
+    config = Config(
+        global_settings=GlobalSettings(model_name="fake.pt", device="cpu"),
+        cameras=[_make_camera("a", "protect"), _make_camera("b", "protect"), _make_camera("c", "protect")],
+    )
+    # Three live cameras each need a dedicated thread; an explicit cap of 1 is
+    # raised back up so none are starved.
+    pipeline = PottyPipeline(config, detector_factory=fake_detector_factory, max_workers=1)
+
+    assert pipeline._resolve_max_workers(config.cameras) == 3
+
+
+def test_resolve_max_workers_reserves_extra_slot_for_file_cameras() -> None:
+    from detectivepotty.pipeline import PottyPipeline
+
+    config = Config(
+        global_settings=GlobalSettings(model_name="fake.pt", device="cpu"),
+        cameras=[_make_camera("a", "protect"), _make_camera("b", "file"), _make_camera("c", "file")],
+    )
+    # 1 live + file cameras: explicit cap of 1 is raised to live(1)+1 shared file slot.
+    pipeline = PottyPipeline(config, detector_factory=fake_detector_factory, max_workers=1)
+
+    assert pipeline._resolve_max_workers(config.cameras) == 2

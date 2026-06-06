@@ -1,0 +1,537 @@
+"""Trigger-agnostic potty-candidate state machine."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, fields, is_dataclass
+from datetime import datetime, timezone
+from enum import Enum
+import math
+from pathlib import Path
+from typing import Any
+
+from detectivepotty.config import CameraConfig, ZoneConfig
+from detectivepotty.events import Detection, Track, TriggerReason
+from detectivepotty.sources.base import Frame
+from detectivepotty.tracking import Tracker, iou
+
+# Float/sampling tolerance for the "covered long enough" comparison against
+# ``stationary_threshold_s``. The trailing posture window is defined as detections
+# newer than ``current - threshold``, so its span is structurally capped at the
+# threshold and -- with discrete sampling and intermittent (e.g. night-time)
+# detections -- routinely lands up to a sample interval (or a dropped boundary
+# detection) below it. A strict ``span >= threshold`` check therefore almost never
+# fired on real footage. The effective tolerance is sized per camera (see
+# ``_posture_stats``); this constant is only the float-noise floor.
+_DURATION_TOLERANCE_S = 1e-3
+
+
+class PottyLifecycle(str, Enum):
+    """Lifecycle value carried by emitted potty candidates."""
+
+    CANDIDATE = "candidate"
+    EMITTED = "emitted"
+    NEAR_MISS = "near_miss"
+
+
+class _DetectorState(str, Enum):
+    IDLE = "idle"
+    WATCHING = "watching"
+    CANDIDATE = "candidate"
+
+
+@dataclass(slots=True)
+class PottyCandidate:
+    """Camera/time-window-centric generic potty candidate.
+
+    ``tracks`` are the contributing track histories clipped to this event window;
+    ``detections`` contains every in-window dog detection that survived config
+    filtering. ``ambiguous`` is true when more than one dog/track contributed or
+    boxes overlapped enough that ID swaps are plausible.
+    """
+
+    camera_id: str
+    primary_track_id: str
+    start_ts: datetime
+    end_ts: datetime
+    tracks: list[Track]
+    detections: list[Detection]
+    trigger_reason: TriggerReason
+    multi_dog: bool
+    ambiguous: bool
+    lifecycle: PottyLifecycle
+    stationary_duration_s: float
+    squat_metric: float
+    posture_summary: dict[str, Any] = field(default_factory=dict)
+    near_miss: bool = False
+    confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.start_ts = _ensure_aware_utc(self.start_ts)
+        self.end_ts = _ensure_aware_utc(self.end_ts)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation for recorder metadata."""
+
+        return _jsonify(self)
+
+
+@dataclass(slots=True)
+class _PostureStats:
+    track_id: str
+    stationary_duration_s: float
+    max_centroid_motion_px: float
+    centroid_motion_threshold_px: float
+    squat_metric: float
+    height_drop: float
+    aspect_ratio_increase: float
+    is_stationary: bool
+    is_squat: bool
+    window_start_mono: float
+    window_end_mono: float
+
+
+class PottyEventDetector:
+    """State machine that emits generic potty candidates for one camera.
+
+    Stationary metric: over the trailing ``stationary_threshold_s`` window the dog's
+    detections must cover most of that window (within a per-camera sampling
+    tolerance, so intermittent night-time detections still qualify) and the maximum
+    center displacement from the first center must be no more than
+    ``max(10px, 20% of the median bbox diagonal)``. Squat metric: the max of
+    relative bbox height drop and relative width/height aspect-ratio increase
+    compared with the track's standing-looking history. It must exceed
+    ``CameraConfig.squat_threshold``.
+    """
+
+    def __init__(
+        self,
+        camera_config: CameraConfig,
+        tracker: Tracker | None = None,
+        emit_near_misses: bool = False,
+    ) -> None:
+        self.camera_config = camera_config
+        self.camera_id = camera_config.id
+        max_age_frames = max(1, round(camera_config.sample_rate_fps))
+        self.tracker = tracker or Tracker(max_age_frames=max_age_frames)
+        self.emit_near_misses = emit_near_misses
+        self._state = _DetectorState.IDLE
+        self._window_start_mono: float | None = None
+        self._window_start_ts: datetime | None = None
+        self._window_detections: list[Detection] = []
+        self._window_track_ids: set[str] = set()
+        self._multi_dog = False
+        self._ambiguous = False
+        self._primary_track_id: str | None = None
+        self._candidate_start_mono: float | None = None
+        self._event_due_mono: float | None = None
+        self._best_stats: _PostureStats | None = None
+        self._near_miss_stats: _PostureStats | None = None
+        self._suppressed_track_ids: set[str] = set()
+        self._last_frame: Frame | None = None
+        self._last_trigger_reason = TriggerReason.YOLO
+
+    def process(
+        self,
+        frame: Frame,
+        detections: Sequence[Detection],
+        trigger_reason: TriggerReason = TriggerReason.YOLO,
+    ) -> list[PottyCandidate]:
+        """Consume one frame's detections and return newly completed events."""
+
+        self._last_frame = frame
+        self._last_trigger_reason = trigger_reason
+        filtered = self._filter_detections(detections)
+        active_tracks = self.tracker.update(list(filtered))
+        current_tracks = [
+            track
+            for track in active_tracks
+            if track.detections and track.detections[-1].frame_idx == frame.frame_idx
+        ]
+        emitted: list[PottyCandidate] = []
+
+        if current_tracks:
+            if self._state == _DetectorState.IDLE:
+                self._start_window(frame)
+            self._append_window(filtered, current_tracks)
+            self._update_ambiguity(filtered, current_tracks)
+            self._update_posture_state(frame, current_tracks)
+
+        if self._state == _DetectorState.CANDIDATE and self._event_due_mono is not None:
+            if frame.mono_ts >= self._event_due_mono:
+                emitted.append(self._finish_event(frame, near_miss=False))
+                self._suppress_tracks(emitted[-1])
+                self._reset_window()
+
+        if not active_tracks:
+            if self._state == _DetectorState.CANDIDATE:
+                emitted.append(self._finish_event(frame, near_miss=False))
+                self._suppress_tracks(emitted[-1])
+            elif self._state == _DetectorState.WATCHING and self.emit_near_misses:
+                if self._near_miss_stats is not None:
+                    emitted.append(self._finish_event(frame, near_miss=True))
+            self._reset_window(clear_suppressed=True)
+
+        return emitted
+
+    def flush(self) -> list[PottyCandidate]:
+        """Emit any open candidate at stream end, including optional near-miss."""
+
+        if self._last_frame is None:
+            return []
+        emitted: list[PottyCandidate] = []
+        if self._state == _DetectorState.CANDIDATE:
+            emitted.append(self._finish_event(self._last_frame, near_miss=False))
+            self._suppress_tracks(emitted[-1])
+        elif self._state == _DetectorState.WATCHING and self.emit_near_misses:
+            if self._near_miss_stats is not None:
+                emitted.append(self._finish_event(self._last_frame, near_miss=True))
+        self._reset_window(clear_suppressed=True)
+        return emitted
+
+    def _filter_detections(self, detections: Sequence[Detection]) -> list[Detection]:
+        return [
+            detection
+            for detection in detections
+            if detection.confidence >= self.camera_config.detection_conf_threshold
+            and self._point_allowed(detection.bbox.center)
+        ]
+
+    def _point_allowed(self, point: tuple[float, float]) -> bool:
+        roi_zones = [zone for zone in self.camera_config.roi if len(zone.points) >= 3]
+        if roi_zones and not any(_point_in_zone(point, zone) for zone in roi_zones):
+            return False
+        ignore_zones = [
+            zone for zone in self.camera_config.ignore_zones if len(zone.points) >= 3
+        ]
+        return not any(_point_in_zone(point, zone) for zone in ignore_zones)
+
+    def _start_window(self, frame: Frame) -> None:
+        self._state = _DetectorState.WATCHING
+        self._window_start_mono = frame.mono_ts
+        self._window_start_ts = frame.wall_ts
+        self._window_detections = []
+        self._window_track_ids = set()
+        self._multi_dog = False
+        self._ambiguous = False
+        self._primary_track_id = None
+        self._candidate_start_mono = None
+        self._event_due_mono = None
+        self._best_stats = None
+        self._near_miss_stats = None
+
+    def _append_window(
+        self,
+        detections: Sequence[Detection],
+        current_tracks: Sequence[Track],
+    ) -> None:
+        self._window_detections.extend(detections)
+        current_ids = {track.track_id for track in current_tracks}
+        self._window_track_ids.update(current_ids)
+        if len(current_ids) > 1 or len(self._window_track_ids) > 1:
+            self._multi_dog = True
+            self._ambiguous = True
+
+    def _update_ambiguity(
+        self,
+        detections: Sequence[Detection],
+        current_tracks: Sequence[Track],
+    ) -> None:
+        if len(current_tracks) > 1:
+            self._multi_dog = True
+            self._ambiguous = True
+        for left_idx, left in enumerate(detections):
+            for right in detections[left_idx + 1 :]:
+                if iou(left.bbox, right.bbox) >= 0.2:
+                    self._ambiguous = True
+
+    def _update_posture_state(
+        self,
+        frame: Frame,
+        current_tracks: Sequence[Track],
+    ) -> None:
+        stats = [self._posture_stats(track, frame.mono_ts) for track in current_tracks]
+        stationary = [item for item in stats if item.is_stationary]
+        for item in stationary:
+            if self._near_miss_stats is None or _posture_rank(item) > _posture_rank(
+                self._near_miss_stats,
+            ):
+                self._near_miss_stats = item
+        candidates = [
+            item
+            for item in stationary
+            if item.is_squat and item.track_id not in self._suppressed_track_ids
+        ]
+        if not candidates:
+            return
+        best = max(candidates, key=_posture_rank)
+        self._best_stats = best
+        if self._state != _DetectorState.CANDIDATE:
+            self._state = _DetectorState.CANDIDATE
+            self._primary_track_id = best.track_id
+            self._candidate_start_mono = best.window_start_mono
+            self._event_due_mono = frame.mono_ts + self.camera_config.event_duration_s
+        elif self._primary_track_id == best.track_id:
+            self._best_stats = best
+
+    def _posture_stats(self, track: Track, current_mono: float) -> _PostureStats:
+        threshold_s = self.camera_config.stationary_threshold_s
+        cutoff = current_mono - threshold_s
+        recent = [detection for detection in track.detections if detection.mono_ts >= cutoff]
+        if not recent and track.detections:
+            recent = [track.detections[-1]]
+        duration_s = max(0.0, recent[-1].mono_ts - recent[0].mono_ts) if recent else 0.0
+        centers = [detection.bbox.center for detection in recent]
+        first_center = centers[0] if centers else (0.0, 0.0)
+        max_motion = max(
+            (
+                math.hypot(center[0] - first_center[0], center[1] - first_center[1])
+                for center in centers
+            ),
+            default=math.inf,
+        )
+        diagonals = [
+            math.hypot(detection.bbox.width, detection.bbox.height)
+            for detection in recent
+        ]
+        median_diag = sorted(diagonals)[len(diagonals) // 2] if diagonals else 0.0
+        motion_threshold = max(10.0, 0.2 * median_diag)
+        height_drop, aspect_increase = self._squat_components(track, recent)
+        squat_metric = max(height_drop, aspect_increase)
+        # The trailing window must *cover* most of ``stationary_threshold_s`` rather
+        # than span it exactly. Allow it to fall short by the larger of ~15% of the
+        # threshold or two sample intervals (capped at half the threshold): discrete
+        # sampling and intermittent (e.g. night) detections leave the in-window span
+        # structurally below the threshold even when the dog stood still and squatted
+        # for many seconds. Requiring real coverage (not merely an old track) still
+        # rejects a near-empty window, and the motion check enforces localization.
+        sample_fps = self.camera_config.sample_rate_fps
+        sample_interval_s = (1.0 / sample_fps) if sample_fps > 0 else 0.0
+        coverage_tolerance_s = min(
+            max(_DURATION_TOLERANCE_S, 0.15 * threshold_s, 2.0 * sample_interval_s),
+            0.5 * threshold_s,
+        )
+        covered_long_enough = (
+            duration_s >= threshold_s - coverage_tolerance_s and len(recent) >= 2
+        )
+        return _PostureStats(
+            track_id=track.track_id,
+            stationary_duration_s=duration_s,
+            max_centroid_motion_px=max_motion,
+            centroid_motion_threshold_px=motion_threshold,
+            squat_metric=squat_metric,
+            height_drop=height_drop,
+            aspect_ratio_increase=aspect_increase,
+            is_stationary=covered_long_enough and max_motion <= motion_threshold,
+            is_squat=squat_metric >= self.camera_config.squat_threshold,
+            window_start_mono=recent[0].mono_ts if recent else current_mono,
+            window_end_mono=recent[-1].mono_ts if recent else current_mono,
+        )
+
+    @staticmethod
+    def _squat_components(
+        track: Track,
+        recent: Sequence[Detection],
+    ) -> tuple[float, float]:
+        if not recent:
+            return 0.0, 0.0
+        heights = [detection.bbox.height for detection in track.detections]
+        recent_heights = [detection.bbox.height for detection in recent]
+        max_height = max(heights, default=0.0)
+        min_recent_height = min(recent_heights, default=0.0)
+        height_drop = 0.0
+        if max_height > 0.0:
+            height_drop = max(0.0, (max_height - min_recent_height) / max_height)
+
+        aspects = [
+            detection.bbox.width / detection.bbox.height
+            for detection in track.detections
+            if detection.bbox.height > 0.0
+        ]
+        recent_aspects = [
+            detection.bbox.width / detection.bbox.height
+            for detection in recent
+            if detection.bbox.height > 0.0
+        ]
+        aspect_increase = 0.0
+        if aspects and recent_aspects and min(aspects) > 0.0:
+            aspect_increase = max(0.0, (max(recent_aspects) - min(aspects)) / min(aspects))
+        return height_drop, aspect_increase
+
+    def _finish_event(self, frame: Frame, near_miss: bool) -> PottyCandidate:
+        if self._window_start_mono is None or self._window_start_ts is None:
+            self._start_window(frame)
+        assert self._window_start_mono is not None
+        assert self._window_start_ts is not None
+        start_mono = self._window_start_mono
+        end_mono = frame.mono_ts
+        tracks = self._window_tracks(start_mono, end_mono)
+        primary_track_id = self._primary_track_id or _first_track_id(tracks)
+        if primary_track_id is None:
+            primary_track_id = "unknown"
+        stats = self._near_miss_stats if near_miss else self._best_stats
+        posture_summary = self._posture_summary(stats)
+        detections = [
+            detection
+            for detection in self._window_detections
+            if start_mono <= detection.mono_ts <= end_mono
+        ]
+        multi_dog = self._multi_dog or len(tracks) > 1
+        ambiguous = self._ambiguous or multi_dog
+        lifecycle = PottyLifecycle.NEAR_MISS if near_miss else PottyLifecycle.EMITTED
+        confidence = self._confidence(stats, near_miss)
+        return PottyCandidate(
+            camera_id=self.camera_id,
+            primary_track_id=primary_track_id,
+            start_ts=self._window_start_ts,
+            end_ts=frame.wall_ts,
+            tracks=tracks,
+            detections=detections,
+            trigger_reason=self._last_trigger_reason,
+            multi_dog=multi_dog,
+            ambiguous=ambiguous,
+            lifecycle=lifecycle,
+            stationary_duration_s=stats.stationary_duration_s if stats else 0.0,
+            squat_metric=stats.squat_metric if stats else 0.0,
+            posture_summary=posture_summary,
+            near_miss=near_miss,
+            confidence=confidence,
+        )
+
+    def _window_tracks(self, start_mono: float, end_mono: float) -> list[Track]:
+        tracks: list[Track] = []
+        for track_id in sorted(self._window_track_ids, key=_track_sort_key):
+            history = self.tracker.get_track(track_id)
+            if history is None:
+                continue
+            detections = [
+                detection
+                for detection in history.detections
+                if start_mono <= detection.mono_ts <= end_mono
+            ]
+            if detections:
+                tracks.append(Track(track_id=track_id, detections=detections))
+        return tracks
+
+    def _posture_summary(self, stats: _PostureStats | None) -> dict[str, Any]:
+        if stats is None:
+            return {
+                "stationary_threshold_s": self.camera_config.stationary_threshold_s,
+                "squat_threshold": self.camera_config.squat_threshold,
+            }
+        return {
+            "stationary_threshold_s": self.camera_config.stationary_threshold_s,
+            "stationary_duration_s": stats.stationary_duration_s,
+            "max_centroid_motion_px": stats.max_centroid_motion_px,
+            "centroid_motion_threshold_px": stats.centroid_motion_threshold_px,
+            "squat_threshold": self.camera_config.squat_threshold,
+            "squat_metric": stats.squat_metric,
+            "height_drop": stats.height_drop,
+            "aspect_ratio_increase": stats.aspect_ratio_increase,
+            "posture_window_start_mono": stats.window_start_mono,
+            "posture_window_end_mono": stats.window_end_mono,
+        }
+
+    @staticmethod
+    def _confidence(stats: _PostureStats | None, near_miss: bool) -> float:
+        if stats is None:
+            return 0.25 if near_miss else 0.5
+        if near_miss:
+            return min(0.45, 0.25 + 0.05 * stats.stationary_duration_s)
+        return min(0.9, 0.55 + 0.2 * stats.squat_metric)
+
+    def _suppress_tracks(self, candidate: PottyCandidate) -> None:
+        self._suppressed_track_ids.update(track.track_id for track in candidate.tracks)
+
+    def _reset_window(self, clear_suppressed: bool = False) -> None:
+        self._state = _DetectorState.IDLE
+        self._window_start_mono = None
+        self._window_start_ts = None
+        self._window_detections = []
+        self._window_track_ids = set()
+        self._multi_dog = False
+        self._ambiguous = False
+        self._primary_track_id = None
+        self._candidate_start_mono = None
+        self._event_due_mono = None
+        self._best_stats = None
+        self._near_miss_stats = None
+        if clear_suppressed:
+            self._suppressed_track_ids = set()
+
+
+def _posture_rank(stats: _PostureStats) -> tuple[float, float]:
+    return (stats.squat_metric, stats.stationary_duration_s)
+
+
+def _first_track_id(tracks: Sequence[Track]) -> str | None:
+    return tracks[0].track_id if tracks else None
+
+
+def _track_sort_key(track_id: str) -> tuple[int, str]:
+    try:
+        return (int(track_id), track_id)
+    except ValueError:
+        return (0, track_id)
+
+
+def _point_in_zone(point: tuple[float, float], zone: ZoneConfig) -> bool:
+    return _point_in_polygon(point, zone.points)
+
+
+def _point_in_polygon(
+    point: tuple[float, float],
+    polygon: Sequence[tuple[float, float]],
+) -> bool:
+    x, y = point
+    inside = False
+    previous = polygon[-1]
+    for current in polygon:
+        if _point_on_segment(point, previous, current):
+            return True
+        xi, yi = current
+        xj, yj = previous
+        intersects = (yi > y) != (yj > y)
+        if intersects:
+            slope_x = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < slope_x:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _point_on_segment(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> bool:
+    px, py = point
+    x1, y1 = start
+    x2, y2 = end
+    cross = (py - y1) * (x2 - x1) - (px - x1) * (y2 - y1)
+    if abs(cross) > 1e-9:
+        return False
+    dot = (px - x1) * (px - x2) + (py - y1) * (py - y2)
+    return dot <= 1e-9
+
+
+def _ensure_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _jsonify(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return {item.name: _jsonify(getattr(value, item.name)) for item in fields(value)}
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return _ensure_aware_utc(value).isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _jsonify(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonify(item) for item in value]
+    return value

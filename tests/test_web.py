@@ -171,6 +171,33 @@ def test_event_detail_and_media_serving_block_traversal(tmp_path: Path) -> None:
     assert client.get("/api/events/missing").status_code == 404
 
 
+def test_event_detail_exposes_pose_overlay_media(tmp_path: Path) -> None:
+    event_dir = make_event(
+        tmp_path,
+        event_id="event-pose",
+        camera="Backyard",
+        utc_ts=BASE_TS,
+    )
+    overlay_dir = event_dir / "crops_overlay"
+    overlay_dir.mkdir()
+    overlay_bytes = write_image(overlay_dir / "000.jpg", (10, 200, 255))
+    client = make_client(tmp_path)
+
+    detail = client.get("/api/events/event-pose").json()
+    assert [item["name"] for item in detail["media"]["crops_overlay"]] == ["000.jpg"]
+    assert (
+        detail["media"]["crops_overlay"][0]["url"]
+        == "/api/events/event-pose/crops_overlay/000.jpg"
+    )
+
+    overlay_response = client.get("/api/events/event-pose/crops_overlay/000.jpg")
+    assert overlay_response.status_code == 200
+    assert overlay_response.content == overlay_bytes
+
+    traversal = client.get("/api/events/event-pose/crops_overlay/..%2f..%2fmetadata.json")
+    assert traversal.status_code in {400, 404}
+
+
 def test_label_update_validates_and_writes_metadata_atomically(tmp_path: Path) -> None:
     event_dir = make_event(
         tmp_path,

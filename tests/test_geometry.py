@@ -5,6 +5,18 @@ import numpy as np
 from detectivepotty.geometry import BBox, crop_from_frame, map_bbox_to_original
 
 
+def test_bbox_union_encloses_both_boxes() -> None:
+    left = BBox(10, 20, 40, 60)
+    right = BBox(30, 5, 50, 45)
+
+    merged = left.union(right)
+
+    assert merged == BBox(10, 5, 50, 60)
+    # Union is commutative and idempotent.
+    assert right.union(left) == merged
+    assert left.union(left) == left
+
+
 def test_map_bbox_to_original_scales_from_inference_to_original() -> None:
     bbox = BBox(100, 50, 300, 200)
 

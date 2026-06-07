@@ -10,6 +10,8 @@ same ``Tracker.update`` surface.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from typing import Sequence
 
 from detectivepotty.events import Detection, Track
 from detectivepotty.geometry import BBox
@@ -29,6 +31,66 @@ def iou(left: BBox, right: BBox) -> float:
     if union <= 0.0:
         return 0.0
     return intersection / union
+
+
+# Window boxes whose center has drifted more than this many reference-diagonals
+# away are treated as a moving/other dog and excluded, so a trailing union over a
+# walking dog cannot elongate the crop along its path.
+_UNION_MAX_CENTER_SHIFT_FRAC = 1.0
+# A single anomalously large box must not poison the union into a giant crop: if
+# the union would exceed this multiple of the reference area, keep the raw box.
+_UNION_MAX_GROWTH_RATIO = 4.0
+
+
+def temporal_box_union(
+    detections: Sequence[Detection],
+    reference: Detection,
+    window_s: float,
+    *,
+    max_center_shift_frac: float = _UNION_MAX_CENTER_SHIFT_FRAC,
+    max_growth_ratio: float = _UNION_MAX_GROWTH_RATIO,
+) -> BBox:
+    """Union ``reference``'s box with same-track boxes in a short trailing window.
+
+    Recovers full dog extent and stabilizes tiny boxes when a single frame's
+    detector under-segments (e.g. low-contrast IR that boxes only a bright
+    sub-region), which otherwise feeds pose a partial crop. The window is the
+    ``mono_ts`` interval ``[reference.mono_ts - window_s, reference.mono_ts]``
+    (trailing, inclusive of the reference), so it is robust to variable night fps.
+
+    Two guards keep the union from becoming a worse crop than the raw box: window
+    boxes whose center drifts more than ``max_center_shift_frac`` reference
+    diagonals away are skipped (a moving/other dog), and if the resulting union
+    still exceeds ``max_growth_ratio`` times the reference area the raw box is
+    returned unchanged. Returns ``reference.bbox`` unchanged when ``window_s <= 0``
+    or no in-window neighbor survives the guards.
+    """
+
+    if window_s <= 0.0:
+        return reference.bbox
+
+    ref = reference.bbox
+    ref_cx, ref_cy = ref.center
+    ref_diag = math.hypot(ref.width, ref.height)
+    lo = reference.mono_ts - window_s
+
+    box = ref
+    for detection in detections:
+        if detection is reference:
+            continue
+        if not (lo <= detection.mono_ts <= reference.mono_ts):
+            continue
+        candidate = detection.bbox
+        cx, cy = candidate.center
+        if ref_diag > 0.0:
+            shift = math.hypot(cx - ref_cx, cy - ref_cy)
+            if shift > max_center_shift_frac * ref_diag:
+                continue
+        box = box.union(candidate)
+
+    if ref.area > 0.0 and box.area > max_growth_ratio * ref.area:
+        return ref
+    return box
 
 
 @dataclass(slots=True)

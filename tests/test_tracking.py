@@ -6,7 +6,7 @@ import pytest
 
 from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox
-from detectivepotty.tracking import Tracker, iou
+from detectivepotty.tracking import Tracker, iou, temporal_box_union
 
 
 def make_detection(frame_idx: int, bbox: BBox, confidence: float = 0.9) -> Detection:
@@ -24,6 +24,71 @@ def test_iou_correctness() -> None:
     assert iou(BBox(0, 0, 10, 10), BBox(5, 5, 15, 15)) == pytest.approx(1 / 7)
     assert iou(BBox(0, 0, 10, 10), BBox(20, 20, 30, 30)) == 0.0
     assert iou(BBox(0, 0, 0, 10), BBox(0, 0, 10, 10)) == 0.0
+
+
+def test_temporal_box_union_disabled_returns_reference_box() -> None:
+    dets = [make_detection(0, BBox(0, 0, 10, 10)), make_detection(1, BBox(0, 0, 40, 40))]
+
+    out = temporal_box_union(dets, dets[1], window_s=0.0)
+
+    # Disabled path must return the exact same box object (byte-identical crop).
+    assert out is dets[1].bbox
+
+
+def test_temporal_box_union_recovers_extent_within_window() -> None:
+    # The reference frame (f2) under-segmented; earlier in-window frames caught
+    # slightly more of the dog, so the union recovers the fuller extent.
+    dets = [
+        make_detection(0, BBox(8, 8, 36, 36)),
+        make_detection(1, BBox(10, 10, 34, 34)),
+        make_detection(2, BBox(12, 12, 32, 32)),
+    ]
+
+    out = temporal_box_union(dets, dets[2], window_s=5.0)
+
+    assert out == BBox(8, 8, 36, 36)
+
+
+def test_temporal_box_union_respects_trailing_window() -> None:
+    # f2 is a huge box but falls OUTSIDE the trailing window, so it must not leak
+    # into the union; only f3/f4/f5 contribute.
+    dets = [
+        make_detection(2, BBox(0, 0, 100, 100)),
+        make_detection(3, BBox(40, 40, 60, 60)),
+        make_detection(4, BBox(42, 42, 62, 62)),
+        make_detection(5, BBox(44, 44, 64, 64)),
+    ]
+
+    out = temporal_box_union(dets, dets[3], window_s=2.0)
+
+    assert out == BBox(40, 40, 64, 64)
+
+
+def test_temporal_box_union_skips_far_drifted_boxes() -> None:
+    # A faraway box (a moving/other dog) within the window is excluded so the crop
+    # is not elongated along the path; a nearby box is still merged.
+    dets = [
+        make_detection(0, BBox(100, 100, 120, 120)),
+        make_detection(1, BBox(2, 2, 30, 30)),
+        make_detection(2, BBox(0, 0, 20, 20)),
+    ]
+
+    out = temporal_box_union(dets, dets[2], window_s=10.0)
+
+    assert out == BBox(0, 0, 30, 30)
+
+
+def test_temporal_box_union_growth_cap_rejects_ballooning() -> None:
+    # A concentric but enormous box passes the center-shift guard; the final area
+    # cap then rejects the poisoned union and keeps the raw reference box.
+    dets = [
+        make_detection(0, BBox(-20, -20, 50, 50)),
+        make_detection(1, BBox(10, 10, 20, 20)),
+    ]
+
+    out = temporal_box_union(dets, dets[1], window_s=10.0)
+
+    assert out == BBox(10, 10, 20, 20)
 
 
 def test_stable_ids_across_moving_boxes() -> None:

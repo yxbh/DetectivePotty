@@ -65,6 +65,16 @@ class BBox:
             y2=min(max(y2, 0.0), float(h)),
         )
 
+    def union(self, other: "BBox") -> "BBox":
+        """Return the smallest box enclosing both ``self`` and ``other``."""
+
+        return BBox(
+            x1=min(self.x1, other.x1),
+            y1=min(self.y1, other.y1),
+            x2=max(self.x2, other.x2),
+            y2=max(self.y2, other.y2),
+        )
+
     def expand(
         self,
         margin_frac: float,

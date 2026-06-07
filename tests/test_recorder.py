@@ -12,6 +12,8 @@ from detectivepotty.config import CameraConfig, Config, GlobalSettings
 from detectivepotty.events import ClassifierGuess, Detection, Track, TriggerReason
 from detectivepotty.geometry import BBox
 from detectivepotty.potty_event import PottyCandidate, PottyLifecycle
+from detectivepotty.pose.features import PoseFeatures
+from detectivepotty.pose.keypoints import Keypoint, PoseKeypoints
 from detectivepotty.recording.recorder import EventRecorder
 from detectivepotty.sources.base import Frame
 
@@ -137,6 +139,79 @@ def test_event_recorder_writes_dataset_event_and_metadata(tmp_path) -> None:
 
     for secret in ("user", "pass", "token", "secret"):
         assert secret not in raw_json
+
+
+def _pose_for_detection(detection: Detection) -> PoseKeypoints:
+    bbox = detection.bbox
+    cx = (bbox.x1 + bbox.x2) / 2
+    cy = (bbox.y1 + bbox.y2) / 2
+    points = {
+        "nose": Keypoint(cx, cy - 4, 0.9),
+        "neck_base": Keypoint(cx, cy, 0.9),
+        "back_base": Keypoint(cx + 2, cy + 2, 0.9),
+    }
+    return PoseKeypoints(
+        points=points,
+        frame_idx=detection.frame_idx,
+        mono_ts=float(detection.frame_idx),
+    )
+
+
+def test_event_recorder_persists_pose_and_writes_overlays(tmp_path) -> None:
+    camera = camera_config()
+    recorder = EventRecorder(config(tmp_path, camera), git_commit="abc123")
+    frames = [make_frame(idx) for idx in range(5)]
+    potty_candidate = candidate()
+    poses = [_pose_for_detection(det) for det in potty_candidate.detections]
+    features = PoseFeatures(
+        n_frames_total=2,
+        n_frames_valid=2,
+        coverage=1.0,
+        dwell_duration_s=2.5,
+        body_scale_px=24.0,
+        body_scale_quality="torso",
+        spine_angle_deg=140.0,
+        fallback_recommended=False,
+    )
+
+    target = recorder.record(
+        potty_candidate,
+        frames,
+        camera,
+        classifier_result=ClassifierResult(
+            ClassifierGuess.POOP,
+            0.6,
+            poses=poses,
+            pose_features=features,
+        ),
+    )
+
+    metadata = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
+    pose_extra = metadata["extra"]["pose"]
+    assert pose_extra["features"]["spine_angle_deg"] == 140.0
+    assert len(pose_extra["keypoints"]) == 2
+    assert {kp["frame_idx"] for kp in pose_extra["keypoints"]} == {1, 2}
+
+    overlay_dir = target / "crops_overlay"
+    assert overlay_dir.is_dir()
+    assert sorted(p.name for p in overlay_dir.iterdir()) == ["000.jpg", "001.jpg"]
+
+
+def test_event_recorder_without_pose_skips_pose_extra_and_overlays(tmp_path) -> None:
+    camera = camera_config()
+    recorder = EventRecorder(config(tmp_path, camera), git_commit="abc123")
+    frames = [make_frame(idx) for idx in range(5)]
+
+    target = recorder.record(
+        candidate(),
+        frames,
+        camera,
+        classifier_result=ClassifierResult(ClassifierGuess.PEE, 0.42),
+    )
+
+    metadata = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
+    assert "pose" not in metadata["extra"]
+    assert not (target / "crops_overlay").exists()
 
 
 def test_maybe_download_protect_recording_awaits_client_with_preroll(tmp_path) -> None:

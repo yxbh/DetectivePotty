@@ -170,12 +170,20 @@ def detect_file(
     ] = None,
     long_edge: Annotated[
         int,
-        typer.Option("--long-edge", min=1, help="Inference long edge in pixels."),
-    ] = 1280,
+        typer.Option(
+            "--long-edge",
+            min=1,
+            help="YOLO inference long edge (ultralytics imgsz). Default 640 (model-native).",
+        ),
+    ] = 640,
     every_n: Annotated[
         int,
         typer.Option("--every-n", min=1, help="Run detection every N frames."),
     ] = 1,
+    model: Annotated[
+        str,
+        typer.Option("--model", help="YOLO model name/path."),
+    ] = "yolo11m.pt",
 ) -> None:
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -202,7 +210,7 @@ def detect_file(
     if save_crops is not None:
         save_crops.mkdir(parents=True, exist_ok=True)
 
-    detector = DogDetector(long_edge=long_edge, device="auto")
+    detector = DogDetector(model_name=model, long_edge=long_edge, device="auto")
     frame_idx = 0
     detection_frames = 0
     dogs_detected = 0

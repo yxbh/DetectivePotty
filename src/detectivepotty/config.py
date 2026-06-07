@@ -14,9 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
 
-Device = Literal["auto", "mps", "cpu"]
+Device = Literal["auto", "cuda", "mps", "cpu"]
 SubstreamChoice = Literal["low", "medium", "high"]
 SourceKind = Literal["protect", "file"]
+PoseBackend = Literal["superanimal", "mock"]
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -32,8 +33,8 @@ class GlobalSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dataset_dir: Path = Path("dataset")
-    model_name: str = "yolo11n.pt"
-    inference_long_edge_px: int = Field(default=1280, gt=0)
+    model_name: str = "yolo11m.pt"
+    inference_long_edge_px: int = Field(default=640, gt=0)
     device: Device = "auto"
     log_level: str = "INFO"
     dogs: list[str] = Field(default_factory=list)
@@ -47,6 +48,42 @@ class GlobalSettings(BaseModel):
             if stripped and stripped not in cleaned:
                 cleaned.append(stripped)
         return cleaned
+
+
+class PoseConfig(BaseModel):
+    """Keypoint-pose settings.
+
+    Pose is additive and OFF by default until validated end-to-end. Quality
+    thresholds (how much pose is trustworthy) are kept separate from the per-feature
+    behavior thresholds so one global confidence value does not silently do
+    everything. ``enable_pose_classifier``/``enable_pose_gate`` gate the two
+    consumers independently because the detection gate is the riskiest change.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    backend: PoseBackend = "superanimal"
+    model_name: str = "hrnet_w32"
+    device: Device = "auto"
+    crop_margin_frac: float = Field(default=0.4, ge=0.0)
+    min_keypoint_conf: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_required_frames: int = Field(default=3, ge=1)
+    min_pose_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_torso_keypoints: int = Field(default=3, ge=0)
+    max_pose_gap_s: float = Field(default=1.0, gt=0.0)
+    candidate_only: bool = True
+    # Temporal box union: pose crops are built from the union of a dog's detector
+    # boxes over this trailing ``mono_ts`` window (seconds) to recover full extent
+    # when a single frame under-segments on low-contrast IR. 0.0 disables it (the
+    # pose crop is then byte-identical to the raw detector box). Only affects pose;
+    # tracking/posture/recorder boxes are untouched.
+    box_union_window_s: float = Field(default=0.0, ge=0.0)
+    enable_pose_classifier: bool = False
+    # Experimental: additive pose augmentation of the detection gate. Validated only
+    # with the mock backend so far (wiring + gate-OFF byte-identical baseline); keep
+    # off until validated end-to-end against the real superanimal backend.
+    enable_pose_gate: bool = False
 
 
 class ProtectConfig(BaseModel):
@@ -118,6 +155,7 @@ class Config(BaseModel):
 
     global_settings: GlobalSettings = Field(default_factory=GlobalSettings, alias="global")
     protect: ProtectConfig = Field(default_factory=ProtectConfig)
+    pose: PoseConfig = Field(default_factory=PoseConfig)
     cameras: list[CameraConfig] = Field(default_factory=list)
     runtime_secrets: RuntimeSecrets = Field(
         default_factory=RuntimeSecrets,

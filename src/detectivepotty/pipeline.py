@@ -16,9 +16,14 @@ from typing import Any, Protocol
 
 from detectivepotty.classify.base import ClassifierResult, PottyClassifier
 from detectivepotty.classify.heuristic import HeuristicPottyClassifier
+from detectivepotty.classify.pose import PosePottyClassifier
 from detectivepotty.config import CameraConfig, Config
 from detectivepotty.detect.yolo import DogDetector
 from detectivepotty.events import Detection, Track
+from detectivepotty.pose.base import PoseEstimator
+from detectivepotty.pose.factory import build_pose_estimator
+from detectivepotty.pose.gate import PoseGate
+from detectivepotty.pose.keypoints import PoseKeypoints
 from detectivepotty.potty_event import PottyCandidate, PottyEventDetector
 from detectivepotty.recording.dataset import camera_dataset_dir
 from detectivepotty.recording.recorder import EventRecorder
@@ -110,6 +115,10 @@ class PottyPipeline:
         # Cameras run on their own threads; this gates GPU inference because the
         # MPS/torch backend is not reliably safe for concurrent model execution.
         self._inference_lock = threading.Lock()
+        # One pose estimator shared across cameras (mirrors the shared detector):
+        # None when pose is disabled, in which case the default classifier stays the
+        # bbox heuristic. Built once so the heavy model loads at most once per run.
+        self._pose_estimator: PoseEstimator | None = build_pose_estimator(config.pose)
         # Cooperative stop flag so live camera loops can be interrupted (Ctrl-C).
         self._stop_event = threading.Event()
         self._configure_logging(config.global_settings.log_level)
@@ -260,7 +269,7 @@ class PottyPipeline:
 
         detector = self._new_detector(camera_config)
         classifier = self._new_classifier(camera_config)
-        state_machine = self.state_machine_factory(camera_config)
+        state_machine = self._new_state_machine(camera_config)
         recorder = self.recorder_factory(self.config, None)
         buffer_window_s = _buffer_window_s(camera_config)
         buffer = RollingBuffer(buffer_window_s)
@@ -395,7 +404,7 @@ class PottyPipeline:
     ) -> list[Path]:
         detector = self._new_detector(camera_config)
         classifier = self._new_classifier(camera_config)
-        state_machine = self.state_machine_factory(camera_config)
+        state_machine = self._new_state_machine(camera_config)
         recorder = self.recorder_factory(self.config, protect_client)
         history = _FrameHistory(buffer_window_s, max_frames=_live_buffer_max_frames(buffer_window_s))
         pending: list[_PendingCandidate] = []
@@ -585,6 +594,41 @@ class PottyPipeline:
     def _new_classifier(self, camera_config: CameraConfig) -> PottyClassifier:
         return _call_camera_factory(self.classifier_factory, camera_config, self.config)
 
+    def _new_state_machine(self, camera_config: CameraConfig) -> PottyEventDetector:
+        state_machine = self.state_machine_factory(camera_config)
+        pose_gate = self._new_pose_gate(camera_config)
+        if pose_gate is not None and hasattr(state_machine, "pose_gate"):
+            state_machine.pose_gate = pose_gate
+        return state_machine
+
+    def _new_pose_gate(self, _camera_config: CameraConfig) -> PoseGate | None:
+        pose_cfg = self.config.pose
+        if not (pose_cfg.enabled and pose_cfg.enable_pose_gate):
+            return None
+        estimator = self._pose_estimator
+        if estimator is None:
+            return None
+        lock = self._inference_lock
+
+        def _estimate(frame: Frame, detection: Detection) -> PoseKeypoints | None:
+            with lock:
+                return estimator.estimate(
+                    frame.bgr,
+                    detection.bbox,
+                    frame_idx=detection.frame_idx,
+                    mono_ts=detection.mono_ts,
+                    wall_ts=detection.wall_ts,
+                    source_id=frame.source_id,
+                )
+
+        return PoseGate(
+            _estimate,
+            min_keypoint_conf=pose_cfg.min_keypoint_conf,
+            min_required_frames=pose_cfg.min_required_frames,
+            min_pose_coverage=pose_cfg.min_pose_coverage,
+            min_torso_keypoints=pose_cfg.min_torso_keypoints,
+        )
+
     def _selected_cameras(self, camera_ids: Sequence[str] | None) -> list[CameraConfig]:
         requested = set(camera_ids or [])
         selected = [camera for camera in self.config.cameras if camera.enabled]
@@ -604,12 +648,24 @@ class PottyPipeline:
             device=config.global_settings.device,
         )
 
-    @staticmethod
     def _default_classifier_factory(
+        self,
         _camera_config: CameraConfig,
-        _config: Config,
+        config: Config,
     ) -> PottyClassifier:
-        return HeuristicPottyClassifier()
+        heuristic = HeuristicPottyClassifier()
+        if (
+            config.pose.enabled
+            and config.pose.enable_pose_classifier
+            and self._pose_estimator is not None
+        ):
+            return PosePottyClassifier(
+                self._pose_estimator,
+                config.pose,
+                heuristic,
+                inference_lock=self._inference_lock,
+            )
+        return heuristic
 
     @staticmethod
     def _default_file_source_factory(camera_config: CameraConfig) -> VideoSource:

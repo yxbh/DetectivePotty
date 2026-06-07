@@ -136,6 +136,7 @@ class DatasetIndex:
     def detail(self, record: EventRecord) -> dict[str, Any]:
         frames = media_names(record, "frames")
         crops = media_names(record, "crops")
+        crops_overlay = media_names(record, "crops_overlay")
         clip = fixed_media_path(record, "clip.mp4", missing_ok=True)
         protect = fixed_media_path(record, "protect_recording.mp4", missing_ok=True)
 
@@ -154,6 +155,13 @@ class DatasetIndex:
                 "crops": [
                     {"name": name, "url": media_url(record.event_id, "crops", name)}
                     for name in crops
+                ],
+                "crops_overlay": [
+                    {
+                        "name": name,
+                        "url": media_url(record.event_id, "crops_overlay", name),
+                    }
+                    for name in crops_overlay
                 ],
             },
         }
@@ -239,7 +247,7 @@ def media_names(record: EventRecord, kind: str) -> list[str]:
 
 
 def media_path(record: EventRecord, kind: str, name: str) -> Path | None:
-    if kind not in {"frames", "crops"}:
+    if kind not in {"frames", "crops", "crops_overlay"}:
         raise ValueError("unsupported media collection")
     _validate_media_name(name)
     event_real = record.dir_path.resolve(strict=True)
@@ -278,7 +286,7 @@ def fixed_media_path(
 
 
 def media_url(event_id: str, kind: str, name: str) -> str:
-    path_kind = "frames" if kind == "frames" else "crops"
+    path_kind = kind if kind in {"frames", "crops", "crops_overlay"} else "crops"
     return f"/api/events/{quote(event_id, safe='')}/{path_kind}/{quote(name, safe='')}"
 
 

@@ -1,13 +1,33 @@
 global:
   dataset_dir: dataset
-  model_name: yolo11n.pt
-  inference_long_edge_px: 1280
+  model_name: yolo11m.pt
+  inference_long_edge_px: 640
   device: auto
   log_level: INFO
   dogs:
     - Gromit
     - WALL-E
     - Apollo
+
+# Keypoint-pose pee/poop classifier (additive). Requires `uv sync --extra pose`.
+# When enabled, PosePottyClassifier replaces the bbox squat heuristic for the weak
+# guess, deriving squat/arched-back/stationary signals from real keypoints instead
+# of bbox height/aspect jitter. It falls back to the bbox heuristic automatically
+# whenever pose is missing or low-quality, so it can never do worse than bbox alone.
+# The guess is still a weak prefill: every event stays needs_label/unlabeled.
+pose:
+  enabled: true
+  backend: superanimal
+  enable_pose_classifier: true
+  # Pose runs only on recorded candidate windows, not every dog on every frame.
+  candidate_only: true
+  # Detection-gate augmentation stays OFF: experimental and not yet validated
+  # against the real superanimal backend.
+  enable_pose_gate: false
+  # Optional night/IR aid: build the pose crop from the union of detector boxes
+  # over this trailing window so an under-segmented IR box doesn't feed pose a
+  # partial crop. 0.0 disables it; raise (e.g. 0.5) if night crops look clipped.
+  box_union_window_s: 0.0
 
 protect:
   nvr_host: https://nvr.bennet.lan
@@ -71,6 +91,34 @@ cameras:
       kind: file
       path: data/unifi_direct_clip_downloads/Backyard Grass 6-6-2026, 22.40.02 GMT+10 - 6-6-2026, 22.41.12 GMT+10.mp4
       source_id: file:backyard-grass-2240
+    substream_choice: high
+    animal_supported: false
+    detection_conf_threshold: 0.20
+    sample_rate_fps: 10.0
+    pre_roll_s: 0.0
+    post_roll_s: 0.0
+
+  - id: backyard-grass-file-0903
+    name: Backyard Grass 09:03 clip
+    enabled: true
+    input:
+      kind: file
+      path: data/unifi_direct_clip_downloads/Backyard Grass 6-7-2026, 09.03.51 GMT+10 - 6-7-2026, 09.04.34 GMT+10.mp4
+      source_id: file:backyard-grass-0903
+    substream_choice: high
+    animal_supported: false
+    detection_conf_threshold: 0.20
+    sample_rate_fps: 10.0
+    pre_roll_s: 0.0
+    post_roll_s: 0.0
+
+  - id: backyard-grass-file-0908
+    name: Backyard Grass 09:08 clip
+    enabled: true
+    input:
+      kind: file
+      path: data/unifi_direct_clip_downloads/Backyard Grass 6-7-2026, 09.08.21 GMT+10 - 6-7-2026, 09.09.08 GMT+10.mp4
+      source_id: file:backyard-grass-0908
     substream_choice: high
     animal_supported: false
     detection_conf_threshold: 0.20

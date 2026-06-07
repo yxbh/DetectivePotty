@@ -196,6 +196,41 @@ def _make_camera(cam_id: str, kind: str) -> CameraConfig:
     return CameraConfig(id=cam_id, name=cam_id, input=CameraInputConfig(kind=kind))
 
 
+def test_default_classifier_factory_uses_pose_when_enabled() -> None:
+    from detectivepotty.classify.heuristic import HeuristicPottyClassifier
+    from detectivepotty.classify.pose import PosePottyClassifier
+    from detectivepotty.config import PoseConfig
+    from detectivepotty.pipeline import PottyPipeline
+
+    camera = _make_camera("a", "file")
+    enabled = Config(
+        global_settings=GlobalSettings(model_name="fake.pt", device="cpu"),
+        pose=PoseConfig(enabled=True, backend="mock", enable_pose_classifier=True),
+        cameras=[camera],
+    )
+    pipeline = PottyPipeline(enabled, detector_factory=fake_detector_factory)
+    assert isinstance(pipeline._new_classifier(camera), PosePottyClassifier)
+
+    # Pose enabled but classifier consumer gate off -> heuristic.
+    gate_off = Config(
+        global_settings=GlobalSettings(model_name="fake.pt", device="cpu"),
+        pose=PoseConfig(enabled=True, backend="mock", enable_pose_classifier=False),
+        cameras=[camera],
+    )
+    pipeline_off = PottyPipeline(gate_off, detector_factory=fake_detector_factory)
+    assert isinstance(pipeline_off._new_classifier(camera), HeuristicPottyClassifier)
+
+    # Pose disabled entirely -> heuristic and no estimator built.
+    disabled = Config(
+        global_settings=GlobalSettings(model_name="fake.pt", device="cpu"),
+        cameras=[camera],
+    )
+    pipeline_disabled = PottyPipeline(disabled, detector_factory=fake_detector_factory)
+    assert pipeline_disabled._pose_estimator is None
+    assert isinstance(pipeline_disabled._new_classifier(camera), HeuristicPottyClassifier)
+
+
+
 def test_resolve_max_workers_defaults_to_one_thread_per_camera() -> None:
     from detectivepotty.pipeline import PottyPipeline
 

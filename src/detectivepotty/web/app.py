@@ -114,6 +114,10 @@ def create_app(config: Config) -> FastAPI:
     def get_crop(event_id: str, name: str) -> FileResponse:
         return _serve_image(dataset_index, event_id, "crops", name)
 
+    @app.get("/api/events/{event_id}/crops_overlay/{name:path}")
+    def get_crop_overlay(event_id: str, name: str) -> FileResponse:
+        return _serve_image(dataset_index, event_id, "crops_overlay", name)
+
     @app.post("/api/events/{event_id}/label")
     def label_event(event_id: str, update: LabelUpdate) -> dict:
         record = _event_or_404(dataset_index, event_id)

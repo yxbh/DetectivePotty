@@ -12,6 +12,7 @@ from typing import Any
 
 from detectivepotty.config import CameraConfig, ZoneConfig
 from detectivepotty.events import Detection, Track, TriggerReason
+from detectivepotty.pose.gate import PoseGate
 from detectivepotty.sources.base import Frame
 from detectivepotty.tracking import Tracker, iou
 
@@ -89,6 +90,7 @@ class _PostureStats:
     is_squat: bool
     window_start_mono: float
     window_end_mono: float
+    pose_summary: dict[str, Any] | None = None
 
 
 class PottyEventDetector:
@@ -109,12 +111,15 @@ class PottyEventDetector:
         camera_config: CameraConfig,
         tracker: Tracker | None = None,
         emit_near_misses: bool = False,
+        pose_gate: PoseGate | None = None,
     ) -> None:
         self.camera_config = camera_config
         self.camera_id = camera_config.id
         max_age_frames = max(1, round(camera_config.sample_rate_fps))
         self.tracker = tracker or Tracker(max_age_frames=max_age_frames)
         self.emit_near_misses = emit_near_misses
+        # Optional pose-aware gate (Phase 4). None → bbox-only (default, unchanged).
+        self.pose_gate = pose_gate
         self._state = _DetectorState.IDLE
         self._window_start_mono: float | None = None
         self._window_start_ts: datetime | None = None
@@ -142,12 +147,16 @@ class PottyEventDetector:
         self._last_frame = frame
         self._last_trigger_reason = trigger_reason
         filtered = self._filter_detections(detections)
+        if self.pose_gate is not None:
+            self.pose_gate.observe(frame, filtered)
         active_tracks = self.tracker.update(list(filtered))
         current_tracks = [
             track
             for track in active_tracks
             if track.detections and track.detections[-1].frame_idx == frame.frame_idx
         ]
+        if self.pose_gate is not None:
+            self.pose_gate.prune(self._pose_keep_ids(active_tracks, frame.mono_ts))
         emitted: list[PottyCandidate] = []
 
         if current_tracks:
@@ -314,6 +323,30 @@ class PottyEventDetector:
         covered_long_enough = (
             duration_s >= threshold_s - coverage_tolerance_s and len(recent) >= 2
         )
+
+        bbox_motion_ok = max_motion <= motion_threshold
+        bbox_is_stationary = covered_long_enough and bbox_motion_ok
+        bbox_is_squat = squat_metric >= self.camera_config.squat_threshold
+
+        # Pose is additive: it may flip squat to True and relax the motion-jitter
+        # check, but it never removes the bbox coverage requirement, so the
+        # candidate-window timing structure (and the recall fix) is preserved. When
+        # the gate is off or pose is too sparse/low-quality, this leaves the bbox
+        # result and posture_summary byte-for-byte unchanged.
+        is_stationary = bbox_is_stationary
+        is_squat = bbox_is_squat
+        pose_summary: dict[str, Any] | None = None
+        if self.pose_gate is not None:
+            gate_result = self.pose_gate.posture(recent)
+            if gate_result is not None:
+                pose_summary = gate_result.summary()
+                if gate_result.pose_squat:
+                    is_squat = True
+                if gate_result.pose_stationary:
+                    is_stationary = covered_long_enough and (
+                        bbox_motion_ok or gate_result.pose_stationary
+                    )
+
         return _PostureStats(
             track_id=track.track_id,
             stationary_duration_s=duration_s,
@@ -322,11 +355,35 @@ class PottyEventDetector:
             squat_metric=squat_metric,
             height_drop=height_drop,
             aspect_ratio_increase=aspect_increase,
-            is_stationary=covered_long_enough and max_motion <= motion_threshold,
-            is_squat=squat_metric >= self.camera_config.squat_threshold,
+            is_stationary=is_stationary,
+            is_squat=is_squat,
             window_start_mono=recent[0].mono_ts if recent else current_mono,
             window_end_mono=recent[-1].mono_ts if recent else current_mono,
+            pose_summary=pose_summary,
         )
+
+    def _pose_keep_ids(
+        self,
+        active_tracks: Sequence[Track],
+        current_mono: float,
+    ) -> set[int]:
+        """Identities of detections still inside any trailing posture window.
+
+        Bounds the pose cache to the windows that ``_posture_stats`` can read
+        (detections newer than ``current - stationary_threshold_s``, plus each
+        track's latest detection as that is the single-frame fallback window).
+        """
+
+        cutoff = current_mono - self.camera_config.stationary_threshold_s
+        keep: set[int] = set()
+        for track in active_tracks:
+            if not track.detections:
+                continue
+            keep.add(id(track.detections[-1]))
+            for detection in track.detections:
+                if detection.mono_ts >= cutoff:
+                    keep.add(id(detection))
+        return keep
 
     @staticmethod
     def _squat_components(
@@ -419,7 +476,7 @@ class PottyEventDetector:
                 "stationary_threshold_s": self.camera_config.stationary_threshold_s,
                 "squat_threshold": self.camera_config.squat_threshold,
             }
-        return {
+        summary = {
             "stationary_threshold_s": self.camera_config.stationary_threshold_s,
             "stationary_duration_s": stats.stationary_duration_s,
             "max_centroid_motion_px": stats.max_centroid_motion_px,
@@ -431,6 +488,11 @@ class PottyEventDetector:
             "posture_window_start_mono": stats.window_start_mono,
             "posture_window_end_mono": stats.window_end_mono,
         }
+        # Additive: pose keys appear only when the gate actually contributed, so
+        # gate-off output is unchanged.
+        if stats.pose_summary is not None:
+            summary["pose"] = stats.pose_summary
+        return summary
 
     @staticmethod
     def _confidence(stats: _PostureStats | None, near_miss: bool) -> float:

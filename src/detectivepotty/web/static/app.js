@@ -193,7 +193,9 @@ function renderDetail(detail) {
       <p id="save-status" class="muted"></p>
     </section>
     ${mediaStrip("Crops", media.crops)}
+    ${mediaStrip("Pose overlay", media.crops_overlay || [])}
     ${mediaStrip("Frames", media.frames)}
+    ${poseSection(meta)}
     <section class="metadata-panel">
       <h3>Metadata</h3>
       <pre>${escapeHtml(JSON.stringify(meta, null, 2))}</pre>
@@ -274,6 +276,31 @@ function mediaStrip(title, items) {
     .map((item) => `<img src="${item.url}" alt="${escapeHtml(item.name)}" loading="lazy" />`)
     .join("");
   return `<section class="media-strip"><h3>${title}</h3><div class="strip-grid">${images}</div></section>`;
+}
+
+function poseSection(meta) {
+  const pose = meta.extra && meta.extra.pose;
+  const features = pose && pose.features;
+  if (!features) {
+    return "";
+  }
+  const rows = [
+    ["Spine angle", features.spine_angle_deg, "°"],
+    ["Hip offset", features.hip_offset_ratio, ""],
+    ["Tail angle", features.tail_angle_deg, "°"],
+    ["Centroid motion", features.centroid_motion_ratio, ""],
+    ["Dwell", features.dwell_duration_s, "s"],
+    ["Coverage", features.coverage, ""],
+  ];
+  const cells = rows
+    .filter(([, value]) => value != null)
+    .map(([name, value, unit]) => summaryCard(name, `${Number(value).toFixed(2)}${unit}`))
+    .join("");
+  if (!cells) {
+    return "";
+  }
+  const kpCount = pose.keypoints ? pose.keypoints.length : 0;
+  return `<section class="pose-panel"><h3>Pose features <span class="muted">(${kpCount} posed frames)</span></h3><div class="summary-grid">${cells}</div></section>`;
 }
 
 function labelButton(value, text) {

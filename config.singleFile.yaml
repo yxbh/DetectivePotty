@@ -1,7 +1,7 @@
 global:
   dataset_dir: dataset
-  model_name: yolo11n.pt
-  inference_long_edge_px: 1280
+  model_name: yolo11m.pt
+  inference_long_edge_px: 640
   device: auto
   log_level: INFO
   dogs:

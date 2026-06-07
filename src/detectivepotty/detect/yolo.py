@@ -4,16 +4,34 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
+import threading
 import time
 from typing import Iterable
 
-import cv2
 import numpy as np
 
+from detectivepotty.device import resolve_device
 from detectivepotty.events import Detection
-from detectivepotty.geometry import BBox, map_bbox_to_original
+from detectivepotty.geometry import BBox
 
 DOG_CLASS_NAME = "dog"
+
+logger = logging.getLogger(__name__)
+
+# Process-wide cache of loaded ultralytics models, keyed by (requested model name,
+# resolved device). Multiple ``DogDetector`` instances (e.g. one per camera) share a
+# single loaded model: the pipeline serializes all inference behind a global lock, so
+# concurrent use is never an issue, and this avoids N-fold model load time and memory.
+_MODEL_CACHE: dict[tuple[str, str], tuple[object, str]] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def clear_model_cache() -> None:
+    """Drop all cached shared models (test hygiene / explicit reload)."""
+
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,19 +49,38 @@ class DogDetector:
 
     def __init__(
         self,
-        model_name: str = "yolo11n.pt",
-        long_edge: int = 1280,
+        model_name: str = "yolo11m.pt",
+        long_edge: int = 640,
         conf_threshold: float = 0.25,
         device: str = "auto",
+        use_shared_model: bool = True,
     ) -> None:
         if long_edge <= 0:
             raise ValueError("long_edge must be positive")
         self.long_edge = long_edge
         self.conf_threshold = conf_threshold
-        self.device = self._resolve_device(device)
+        self.device = resolve_device(device)
         self.model_name = model_name
-        self.model = self._load_model((model_name, "yolov8n.pt"))
+        self._use_shared_model = use_shared_model
+        self._candidates: tuple[str, ...] = (model_name, "yolov8n.pt")
+        self.model = self._acquire_model(self.device)
         self.last_inference: InferenceInfo | None = None
+
+    def _acquire_model(self, device: str):
+        """Return a model for ``device``, sharing one cached instance when enabled."""
+
+        if not self._use_shared_model:
+            return self._load_model(self._candidates)
+        key = (self._candidates[0], device)
+        with _MODEL_CACHE_LOCK:
+            cached = _MODEL_CACHE.get(key)
+            if cached is not None:
+                model, resolved_name = cached
+                self.model_name = resolved_name
+                return model
+            model = self._load_model(self._candidates)
+            _MODEL_CACHE[key] = (model, self.model_name)
+            return model
 
     def detect(
         self,
@@ -58,12 +95,18 @@ class DogDetector:
         mono_ts = time.monotonic() if mono_ts is None else mono_ts
         wall_ts = datetime.now(timezone.utc) if wall_ts is None else wall_ts
         original_h, original_w = frame_bgr_original.shape[:2]
-        inference_frame = self._resize_for_inference(frame_bgr_original)
-        inference_h, inference_w = inference_frame.shape[:2]
 
         started = time.perf_counter()
-        results = self._predict(inference_frame)
+        results = self._predict(frame_bgr_original)
         latency_ms = (time.perf_counter() - started) * 1000.0
+
+        # Ultralytics letterboxes the frame to ``imgsz`` (``self.long_edge``)
+        # internally and returns boxes already in original-image coordinates, so
+        # no manual rescale is needed. ``inference_wh`` is the effective network
+        # resolution (long edge = imgsz, aspect preserved) recorded for telemetry.
+        scale = self.long_edge / max(original_w, original_h)
+        inference_w = max(1, round(original_w * scale))
+        inference_h = max(1, round(original_h * scale))
         self.last_inference = InferenceInfo(
             original_wh=(original_w, original_h),
             inference_wh=(inference_w, inference_h),
@@ -85,12 +128,7 @@ class DogDetector:
                 continue
             if confidence < self.conf_threshold:
                 continue
-            inference_bbox = BBox(*xyxy)
-            original_bbox = map_bbox_to_original(
-                inference_bbox,
-                (inference_w, inference_h),
-                (original_w, original_h),
-            )
+            original_bbox = BBox(*xyxy).clip_to(original_w, original_h)
             detections.append(
                 Detection(
                     bbox=original_bbox,
@@ -103,29 +141,29 @@ class DogDetector:
             )
         return sorted(detections, key=lambda item: item.confidence, reverse=True)
 
-    def _resize_for_inference(self, frame_bgr: np.ndarray) -> np.ndarray:
-        height, width = frame_bgr.shape[:2]
-        long_edge = max(width, height)
-        if long_edge <= self.long_edge:
-            return frame_bgr
-        scale = self.long_edge / long_edge
-        resized_wh = (round(width * scale), round(height * scale))
-        return cv2.resize(frame_bgr, resized_wh, interpolation=cv2.INTER_AREA)
-
     def _predict(self, inference_frame: np.ndarray):
         try:
             return self.model.predict(
                 inference_frame,
+                imgsz=self.long_edge,
                 conf=self.conf_threshold,
                 device=self.device,
                 verbose=False,
             )
         except Exception:
-            if self.device != "mps":
+            if self.device == "cpu":
                 raise
+            logger.warning(
+                "YOLO inference failed on device %s; falling back to CPU.",
+                self.device,
+            )
             self.device = "cpu"
+            # Swap to a CPU-keyed model so we never move a shared accelerator model
+            # between devices (which would thrash other cameras using it).
+            self.model = self._acquire_model("cpu")
             return self.model.predict(
                 inference_frame,
+                imgsz=self.long_edge,
                 conf=self.conf_threshold,
                 device=self.device,
                 verbose=False,
@@ -163,20 +201,3 @@ class DogDetector:
             except Exception as exc:  # pragma: no cover - depends on network/cache.
                 errors.append(exc)
         raise RuntimeError(f"Unable to load YOLO model: {errors!r}")
-
-    @staticmethod
-    def _resolve_device(requested: str) -> str:
-        if requested not in {"auto", "mps", "cpu"}:
-            raise ValueError("device must be one of: auto, mps, cpu")
-        if requested == "cpu":
-            return "cpu"
-        try:
-            import torch
-
-            if torch.backends.mps.is_available():
-                return "mps"
-        except Exception:
-            pass
-        if requested == "mps":
-            return "cpu"
-        return "cpu"

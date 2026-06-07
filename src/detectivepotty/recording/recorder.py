@@ -20,6 +20,7 @@ from detectivepotty.recording.dataset import (
     sanitize_path_component,
     write_event_images,
 )
+from detectivepotty.recording.pose_overlay import write_pose_overlays
 from detectivepotty.sources.base import Frame, sanitize_source_id
 from detectivepotty.sources.rolling_buffer import RollingBuffer
 
@@ -94,8 +95,32 @@ class EventRecorder:
         )
         metadata.frame_records = frame_records
         metadata.crop_boxes = crop_records
+        self._write_pose_overlays(target_dir, crop_records, frame_records, classifier_result)
         metadata.write_json(target_dir)
         return target_dir
+
+    def _write_pose_overlays(
+        self,
+        target_dir: Path,
+        crop_records: Sequence[Any],
+        frame_records: Sequence[Any],
+        classifier_result: Any | None,
+    ) -> None:
+        poses = _value_from_obj(classifier_result, "poses")
+        if not poses:
+            return
+        try:
+            write_pose_overlays(
+                target_dir,
+                crop_records,
+                frame_records,
+                poses,
+                min_conf=self.config.pose.min_keypoint_conf,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Pose overlay generation failed for event %s", target_dir.name
+            )
 
     async def maybe_download_protect_recording(
         self,
@@ -194,7 +219,27 @@ def _candidate_extra(
     needs_label = _value_from_obj(classifier_result, "needs_label")
     if needs_label is not None:
         extra["classifier_needs_label"] = bool(needs_label)
+    pose = _pose_extra(classifier_result)
+    if pose is not None:
+        extra["pose"] = pose
     return extra
+
+
+def _pose_extra(classifier_result: Any | None) -> dict[str, Any] | None:
+    """Serialize pose keypoints + features carried on the classifier result."""
+
+    poses = _value_from_obj(classifier_result, "poses")
+    features = _value_from_obj(classifier_result, "pose_features")
+    if not poses and features is None:
+        return None
+    pose: dict[str, Any] = {}
+    if features is not None and hasattr(features, "to_dict"):
+        pose["features"] = features.to_dict()
+    if poses:
+        pose["keypoints"] = [
+            keypoints.to_dict() for keypoints in poses if hasattr(keypoints, "to_dict")
+        ]
+    return pose or None
 
 
 def _classifier_fields(

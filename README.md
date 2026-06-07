@@ -32,12 +32,13 @@ For more detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Requirements
 
-- macOS / Apple Silicon is the target prototype environment.
+- macOS / Apple Silicon is the target prototype/dev environment; a Windows + NVIDIA GPU (CUDA) box is the semi-permanent runtime target.
 - Python **3.12** (`pyproject.toml` pins `>=3.12,<3.13`). Avoid Python 3.13/3.14 for now because the torch/Ultralytics stack may lag.
 - [`uv`](https://docs.astral.sh/uv/) for environment and command execution.
 - `ffmpeg` available on the system for video workflows (`brew install ffmpeg`). OpenCV writes the test/demo MP4s.
 - Optional for live mode: UniFi Protect NVR / UNVR Pro with RTSP enabled and Animal smart-detect enabled on supported cameras.
-- MPS acceleration is used when available (`device: auto` or `mps`); the detector falls back to CPU when needed.
+- GPU acceleration is selected automatically (`device: auto` resolves CUDA → MPS → CPU); the detector and pose backend fall back to CPU when no accelerator is available.
+- The project runs on **numpy 1.x / OpenCV 4.11** (pinned `numpy>=1.23,<2`, `opencv-python>=4.6,<4.12`) so the optional pose backend (DeepLabCut 3.x, which caps `numpy<2`) can share a single environment. Nothing in the core app needs numpy 2.
 
 ## Setup
 
@@ -45,7 +46,17 @@ For more detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 uv sync
 ```
 
-`uv sync` creates/updates `.venv` from `pyproject.toml` and `uv.lock`. YOLO weights such as `yolo11n.pt` are loaded by Ultralytics on first detector use and may be downloaded into its normal cache if not already present. Model weight files are ignored by git.
+`uv sync` creates/updates `.venv` from `pyproject.toml` and `uv.lock`. YOLO weights such as `yolo11m.pt` are loaded by Ultralytics on first detector use and may be downloaded into its normal cache if not already present. Model weight files are ignored by git.
+
+### Optional: keypoint-pose backend (DeepLabCut)
+
+The pose backend (SuperAnimal-Quadruped via DeepLabCut 3.x) is an **optional extra** — it is heavy and not required for detection, and the unit tests never need it. Install it only when you want pose:
+
+```bash
+uv sync --extra pose
+```
+
+This shares the base environment (numpy 1.x / OpenCV 4.11); DeepLabCut runs in-process on the same torch as the detector. On the Windows + NVIDIA runtime, the same command installs the CUDA-enabled wheels and `device: auto` resolves to CUDA.
 
 ## Configuration
 
@@ -69,9 +80,9 @@ Important fields:
 ### `global`
 
 - `dataset_dir`: root directory for recorded events.
-- `model_name`: YOLO model name/path, e.g. `yolo11n.pt`.
-- `inference_long_edge_px`: long edge used for downscaled inference.
-- `device`: `auto`, `mps`, or `cpu`.
+- `model_name`: YOLO model name/path. Default `yolo11m.pt`, chosen after sweeping the yolo11/12/26 families (n→x): it was the only off-the-shelf model consistently top-tier across day and night clips, roughly doubling night dog-detection recall over `yolo11n.pt` at negligible extra latency on MPS. Use `yolo11n.pt` for a lighter/faster model if needed.
+- `inference_long_edge_px`: YOLO network input long edge, passed to ultralytics as `imgsz` (rounded/padded to a stride multiple internally). Default `640`, the model's native training size, which gives the best accuracy on our footage and the lowest latency. Raising it does **not** improve recall — it is slower and can actually *reduce* detection of small/distant dogs (the network is optimised for ~640). The frame is letterboxed by ultralytics directly; we no longer pre-resize, which previously dominated per-frame cost.
+- `device`: `auto`, `cuda`, `mps`, or `cpu`. `auto` resolves CUDA → MPS → CPU; an explicitly requested accelerator that is unavailable warns and falls back to CPU.
 - `log_level`: Python logging level.
 - `dogs`: optional roster of dog names (e.g. `[Gromit, WALL-E, Apollo]`) offered as manual identity labels in the review portal. Leave empty to allow free-form dog names.
 
@@ -100,7 +111,34 @@ Important fields:
 
 `config.example.yaml` includes a disabled `file` sample camera for the Gromit pee clip. Enable it and adjust thresholds if you want a no-NVR end-to-end run against that local file.
 
-## Usage
+### `pose` (optional, additive)
+
+Keypoint pose is **off by default** and additive: when disabled, or when keypoints are
+missing/low-confidence/too-sparse for a window, the system falls back to the existing bbox
+heuristics, so enabling pose never removes the bbox coverage/recall behavior. Requires the
+`pose` extra (`uv sync --extra pose`) for the real `superanimal` backend.
+
+- `enabled`: master switch for the shared pose estimator. Default `false`.
+- `backend`: `superanimal` (DeepLabCut, real) or `mock` (deterministic, no model — for tests/wiring).
+- `model_name`, `device`, `crop_margin_frac`: pose head, device, and bbox-expansion margin (the under-bound-crop rescue).
+- `min_keypoint_conf`, `min_required_frames`, `min_pose_coverage`, `min_torso_keypoints`: pose-quality
+  gates separate from feature thresholds — how much pose must be present before it is trusted.
+- `box_union_window_s`: temporal box union. Pose crops are built from the union of a dog's detector
+  boxes over this trailing window (seconds) to recover full extent when a single IR frame under-segments
+  (the "detection bounds pose" night failure). `0.0` (default) disables it — the pose crop is then the raw
+  detector box. Guarded against ballooning (center-drift + max-growth caps); only affects pose, never the
+  tracking/posture/recorder boxes. Currently wired into the pose classifier crop only (the per-frame gate
+  observes before tracking, so it uses raw boxes).
+- `candidate_only`: when set, the classifier only runs pose on candidate windows (not every dog every frame).
+- `enable_pose_classifier`: let `PosePottyClassifier` use pose for the pee/poop guess (still `needs_label=true`).
+- `enable_pose_gate`: **experimental — not yet validated with the real pose backend.** Lets pose augment
+  the detection gate's squat/stationary signals. It is strictly additive (it can flip a frame's squat to
+  true and relax the motion-jitter check via OR, but never removes the bbox `covered_long_enough`
+  requirement). The gate-OFF path is byte-for-byte identical to the bbox baseline (verified: the 4-clip
+  regression stays 1/1/1/2 with the gate off). Keep it `false` until it has been validated end-to-end
+  against the real `superanimal` backend on the night/IR clips; the mock backend only proves wiring.
+
+
 
 ### Offline single-clip detection demo
 

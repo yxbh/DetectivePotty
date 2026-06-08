@@ -2,6 +2,7 @@
 # Captured/sample video, frames, and generated event dataset (kept local for now)
 data/
 dataset/
+dataset.pre-reset-*/
 outputs/
 
 # Local, secret-bearing config (NVR creds, API keys, RTSP tokens)
@@ -29,3 +30,7 @@ dist/
 *.pt
 *.onnx
 *.engine
+
+# Frontend build artifacts (built on demand, not committed)
+src/detectivepotty/web/frontend/node_modules/
+src/detectivepotty/web/frontend/dist/

@@ -59,3 +59,22 @@ cameras:
     sample_rate_fps: 10.0
     pre_roll_s: 0.0
     post_roll_s: 0.0
+
+  # Direct-RTSP sample for a third-party/ONVIF camera (e.g. a Dahua camera adopted into the
+  # UniFi NVR whose Protect RTSPS re-stream is broken). Stream straight from the camera and
+  # bypass UniFi. The full rtsp://user:pass@host:554/path URL lives in the env var named by
+  # url_env (credentials never go in YAML); export it before running.
+  - id: pool-onvif
+    name: Pool (ONVIF direct)
+    enabled: false
+    input:
+      kind: rtsp
+      url_env: DETECTIVEPOTTY_POOL_RTSP_URL
+      source_id: dahua-onvif:pool
+    animal_supported: false
+    detection_conf_threshold: 0.25
+    sample_rate_fps: 5.0
+    pre_roll_s: 15.0
+    post_roll_s: 30.0
+    retention_days: 30
+    retention_max_gb: 200.0

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
@@ -10,6 +12,7 @@ from detectivepotty.config import CameraConfig, CameraInputConfig, Config, Globa
 from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox
 from detectivepotty.pipeline import run_pipeline
+from detectivepotty.sources.base import Frame, VideoSource
 
 def make_config(dataset_dir: Path, video_path: Path | None, *, enabled: bool = True) -> Config:
     return Config(
@@ -268,3 +271,110 @@ def test_resolve_max_workers_reserves_extra_slot_for_file_cameras() -> None:
     pipeline = PottyPipeline(config, detector_factory=fake_detector_factory, max_workers=1)
 
     assert pipeline._resolve_max_workers(config.cameras) == 2
+
+class _NoDetector:
+    device = "cpu"
+    model_name = "fake.pt"
+
+    def detect(self, frame_bgr, *, frame_idx, mono_ts, wall_ts):  # noqa: ANN001
+        del frame_bgr, frame_idx, mono_ts, wall_ts
+        return []
+
+
+def _no_detector_factory(_camera_config):  # noqa: ANN001
+    return _NoDetector()
+
+
+class _FakeLiveSource(VideoSource):
+    """Endless synthetic live source for routing tests (no network/cv2)."""
+
+    def __init__(self, url: str) -> None:
+        self._url = url
+        self._idx = 0
+
+    def open(self):
+        return self
+
+    def read(self):
+        image = np.zeros((120, 160, 3), dtype=np.uint8)
+        frame = Frame(
+            bgr=image,
+            frame_idx=self._idx,
+            mono_ts=float(self._idx),
+            wall_ts=datetime.now(timezone.utc),
+            source_id="pool-rtsp",
+        )
+        self._idx += 1
+        time.sleep(0.001)
+        return frame
+
+    def close(self) -> None:
+        return None
+
+    @property
+    def fps(self):
+        return 10.0
+
+    @property
+    def resolution(self):
+        return (160, 120)
+
+    @property
+    def is_live(self):
+        return True
+
+
+def _rtsp_config(dataset_dir: Path, url_env: str) -> Config:
+    return Config(
+        global_settings=GlobalSettings(dataset_dir=dataset_dir, model_name="fake.pt", device="cpu"),
+        cameras=[
+            CameraConfig(
+                id="cam-pool",
+                name="Pool",
+                input=CameraInputConfig(kind="rtsp", url_env=url_env),
+                sample_rate_fps=1.0,
+            ),
+        ],
+    )
+
+
+def test_rtsp_camera_routes_to_live_path_with_resolved_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("POOL_RTSP_URL", "rtsp://user:pass@192.168.1.37:554/cam")
+    captured: dict[str, str] = {}
+
+    def factory(url: str) -> VideoSource:
+        captured["url"] = url
+        return _FakeLiveSource(url)
+
+    config = _rtsp_config(tmp_path / "dataset", "POOL_RTSP_URL")
+    result = run_pipeline(
+        config,
+        detector_factory=_no_detector_factory,
+        rtsp_source_factory=factory,
+        max_live_frames=2,
+    )
+
+    assert result == []
+    assert captured["url"] == "rtsp://user:pass@192.168.1.37:554/cam"
+
+
+def test_rtsp_camera_missing_env_warns_and_skips(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.delenv("POOL_RTSP_URL", raising=False)
+    config = _rtsp_config(tmp_path / "dataset", "POOL_RTSP_URL")
+
+    with caplog.at_level("WARNING"):
+        result = run_pipeline(config, detector_factory=_no_detector_factory)
+
+    assert result == []
+    assert "has no URL" in caplog.text
+
+
+def test_rtsp_camera_invalid_url_warns_and_skips(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("POOL_RTSP_URL", "http://not-rtsp/stream")
+    config = _rtsp_config(tmp_path / "dataset", "POOL_RTSP_URL")
+
+    with caplog.at_level("WARNING"):
+        result = run_pipeline(config, detector_factory=_no_detector_factory)
+
+    assert result == []
+    assert "invalid URL" in caplog.text

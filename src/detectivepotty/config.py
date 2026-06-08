@@ -7,16 +7,16 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
 
 Device = Literal["auto", "cuda", "mps", "cpu"]
 SubstreamChoice = Literal["low", "medium", "high"]
-SourceKind = Literal["protect", "file"]
+SourceKind = Literal["protect", "file", "rtsp"]
 PoseBackend = Literal["superanimal", "mock"]
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -38,6 +38,8 @@ class GlobalSettings(BaseModel):
     device: Device = "auto"
     log_level: str = "INFO"
     dogs: list[str] = Field(default_factory=list)
+    dedupe_reruns: bool = True
+    rerun_match_tolerance_s: float = Field(default=5.0, ge=0)
 
     @field_validator("dogs")
     @classmethod
@@ -126,6 +128,37 @@ class CameraInputConfig(BaseModel):
     kind: SourceKind = "protect"
     path: Path | None = None
     source_id: str | None = None
+    url_env: str | None = None
+
+    @field_validator("url_env")
+    @classmethod
+    def url_env_name_only(cls, value: str | None) -> str | None:
+        if value is not None and not ENV_NAME_RE.fullmatch(value):
+            raise ValueError("url_env must be an environment variable name")
+        return value
+
+    @model_validator(mode="after")
+    def validate_kind_fields(self) -> Self:
+        if self.kind == "rtsp":
+            if not self.url_env:
+                raise ValueError("rtsp input requires 'url_env'")
+            if self.path is not None:
+                raise ValueError("rtsp input must not set 'path'")
+        elif self.url_env is not None:
+            raise ValueError("'url_env' is only valid when kind == 'rtsp'")
+        return self
+
+    def resolve_url(self) -> str | None:
+        """Return the direct RTSP URL from the configured env var, if set.
+
+        The full ``rtsp://user:pass@host/path`` (credentials included) lives in
+        an environment variable so secrets never touch YAML, mirroring
+        ``ProtectConfig`` secret handling.
+        """
+
+        if not self.url_env:
+            return None
+        return os.environ.get(self.url_env)
 
 
 class CameraConfig(BaseModel):

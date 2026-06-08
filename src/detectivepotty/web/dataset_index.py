@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -29,44 +30,31 @@ class EventRecord:
 class DatasetIndex:
     def __init__(self, dataset_dir: str | Path) -> None:
         self.dataset_dir = Path(dataset_dir).expanduser().resolve()
+        self._lock = threading.Lock()
+        self._event_dirs: dict[str, Path] = {}
 
     def scan(self) -> list[EventRecord]:
         if not self.dataset_dir.exists():
+            with self._lock:
+                self._event_dirs = {}
             return []
 
+        # Events live at a fixed depth (<camera>/<date>/events/<event>/), so a
+        # depth-bounded glob avoids descending into the large frames/crops dirs
+        # that rglob would walk on every request.
+        root = self.dataset_dir
         records: list[EventRecord] = []
-        root = self.dataset_dir.resolve()
-        for metadata_path in root.rglob("metadata.json"):
-            event_dir = metadata_path.parent
-            if event_dir.parent.name != "events":
-                continue
-            try:
-                metadata_real = metadata_path.resolve(strict=True)
-                metadata_real.relative_to(root)
-                with metadata_real.open("r", encoding="utf-8") as fh:
-                    metadata = json.load(fh)
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if not isinstance(metadata, dict):
-                continue
-
-            event_id = str(metadata.get("event_id") or event_dir.name)
-            relative = event_dir.relative_to(root)
-            parts = relative.parts
-            camera_dir = parts[0] if len(parts) >= 4 else None
-            date_dir = parts[1] if len(parts) >= 4 else None
-            records.append(
-                EventRecord(
-                    event_id=event_id,
-                    dir_path=event_dir,
-                    metadata=metadata,
-                    relative_dir=relative.as_posix(),
-                    camera_dir=camera_dir,
-                    date_dir=date_dir,
-                )
-            )
+        for metadata_path in root.glob("*/*/events/*/metadata.json"):
+            record = _record_from_event_dir(metadata_path.parent, root)
+            if record is not None:
+                records.append(record)
 
         records.sort(key=_record_sort_key, reverse=True)
+        event_dirs: dict[str, Path] = {}
+        for record in records:
+            event_dirs.setdefault(record.event_id, record.dir_path)
+        with self._lock:
+            self._event_dirs = event_dirs
         return records
 
     def list_summaries(
@@ -75,9 +63,12 @@ class DatasetIndex:
         camera: str | None = None,
         label_status: LabelStatus | None = None,
         date: str | None = None,
+        records: list[EventRecord] | None = None,
     ) -> list[dict[str, Any]]:
+        if records is None:
+            records = self.scan()
         summaries: list[dict[str, Any]] = []
-        for record in self.scan():
+        for record in records:
             summary = self.summary(record)
             if not _matches_camera(camera, record, summary):
                 continue
@@ -89,6 +80,12 @@ class DatasetIndex:
         return summaries
 
     def get_event(self, event_id: str) -> EventRecord | None:
+        with self._lock:
+            event_dir = self._event_dirs.get(event_id)
+        if event_dir is not None:
+            record = _record_from_event_dir(event_dir, self.dataset_dir)
+            if record is not None and record.event_id == event_id:
+                return record
         for record in self.scan():
             if record.event_id == event_id:
                 return record
@@ -96,13 +93,13 @@ class DatasetIndex:
 
     def summary(self, record: EventRecord) -> dict[str, Any]:
         metadata = record.metadata
-        frames = media_names(record, "frames")
-        crops = media_names(record, "crops")
+        frames_count, first_frame = _count_and_first(record, "frames")
+        crops_count, first_crop = _count_and_first(record, "crops")
         thumbnail_url = None
-        if crops:
-            thumbnail_url = media_url(record.event_id, "crops", crops[0])
-        elif frames:
-            thumbnail_url = media_url(record.event_id, "frames", frames[0])
+        if first_crop is not None:
+            thumbnail_url = media_url(record.event_id, "crops", first_crop)
+        elif first_frame is not None:
+            thumbnail_url = media_url(record.event_id, "frames", first_frame)
 
         camera_name = _optional_str(metadata.get("camera_name"))
         camera_id = _optional_str(metadata.get("camera_id"))
@@ -115,6 +112,11 @@ class DatasetIndex:
             "camera_id": camera_id,
             "camera_name": camera_name,
             "utc_ts": metadata.get("utc_ts"),
+            "end_ts": metadata.get("end_ts"),
+            "recorded_at": metadata.get("recorded_at"),
+            "source_start_s": metadata.get("source_start_s"),
+            "source_end_s": metadata.get("source_end_s"),
+            "time_basis": metadata.get("time_basis"),
             "trigger_reason": metadata.get("trigger_reason"),
             "classifier_guess": metadata.get("classifier_guess"),
             "classifier_confidence": metadata.get("classifier_confidence"),
@@ -127,10 +129,11 @@ class DatasetIndex:
             "ambiguous": bool(metadata.get("ambiguous", False)),
             "dog": _optional_str(metadata.get("dog")),
             "thumbnail_url": thumbnail_url,
-            "frames_count": len(frames),
-            "crops_count": len(crops),
+            "frames_count": frames_count,
+            "crops_count": crops_count,
             "protect_recording_exists": protect_path is not None,
             "relative_dir": record.relative_dir,
+            "media_version": _media_version(record),
         }
 
     def detail(self, record: EventRecord) -> dict[str, Any]:
@@ -223,6 +226,96 @@ class DatasetIndex:
         return self.summary(updated)
 
 
+def _record_from_event_dir(event_dir: Path, root: Path) -> EventRecord | None:
+    """Build a validated :class:`EventRecord` from a single event directory.
+
+    Shared by :meth:`DatasetIndex.scan` (full walk) and the
+    :meth:`DatasetIndex.get_event` fast path so both apply the same
+    metadata/path-containment validation.
+    """
+
+    if event_dir.parent.name != "events":
+        return None
+    metadata_path = event_dir / "metadata.json"
+    try:
+        metadata_real = metadata_path.resolve(strict=True)
+        metadata_real.relative_to(root)
+        with metadata_real.open("r", encoding="utf-8") as fh:
+            metadata = json.load(fh)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        relative = event_dir.resolve(strict=True).relative_to(root)
+    except (OSError, ValueError):
+        return None
+
+    parts = relative.parts
+    camera_dir = parts[0] if len(parts) >= 4 else None
+    date_dir = parts[1] if len(parts) >= 4 else None
+    event_id = str(metadata.get("event_id") or event_dir.name)
+    return EventRecord(
+        event_id=event_id,
+        dir_path=event_dir,
+        metadata=metadata,
+        relative_dir=relative.as_posix(),
+        camera_dir=camera_dir,
+        date_dir=date_dir,
+    )
+
+
+def _media_version(record: EventRecord) -> int:
+    """Cache-busting token that changes whenever an event's media is rewritten.
+
+    Reruns supersede media under a reused event_id, so a fixed per-event cache
+    key would serve stale clips/crops. metadata.json is rewritten on every
+    (re)record, so its mtime is a cheap, monotonic-enough freshness token the
+    frontend appends as ``?v=`` to media URLs.
+    """
+
+    try:
+        return (record.dir_path / "metadata.json").stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _count_and_first(record: EventRecord, kind: str) -> tuple[int, str | None]:
+    """Return (file count, lexicographically-first name) for a media subdir.
+
+    Cheap variant of :func:`media_names` for the list view: a single
+    ``os.scandir`` with no per-file ``resolve`` so counting hundreds of frames
+    across every event stays fast.
+    """
+
+    base = record.dir_path / kind
+    try:
+        event_real = record.dir_path.resolve(strict=True)
+        base_real = base.resolve(strict=True)
+        base_real.relative_to(event_real)
+    except (OSError, ValueError):
+        return (0, None)
+    if not base_real.is_dir():
+        return (0, None)
+
+    count = 0
+    first: str | None = None
+    try:
+        with os.scandir(base_real) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                count += 1
+                if first is None or entry.name < first:
+                    first = entry.name
+    except OSError:
+        return (0, None)
+    return (count, first)
+
+
 def media_names(record: EventRecord, kind: str) -> list[str]:
     base = record.dir_path / kind
     try:
@@ -235,14 +328,16 @@ def media_names(record: EventRecord, kind: str) -> list[str]:
         return []
 
     names: list[str] = []
-    for path in base_real.iterdir():
-        try:
-            real_path = path.resolve(strict=True)
-            real_path.relative_to(base_real)
-        except (OSError, ValueError):
-            continue
-        if real_path.is_file():
-            names.append(path.name)
+    try:
+        with os.scandir(base_real) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        names.append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        return []
     return sorted(names)
 
 

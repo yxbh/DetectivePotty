@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import threading
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from detectivepotty.classify.base import ClassifierResult, PottyClassifier
 from detectivepotty.classify.heuristic import HeuristicPottyClassifier
@@ -52,8 +53,26 @@ class Detector(Protocol):
 DetectorFactory = Callable[..., Detector]
 ClassifierFactory = Callable[..., PottyClassifier]
 FileSourceFactory = Callable[[CameraConfig], VideoSource]
+RTSPSourceFactory = Callable[[str], VideoSource]
 StateMachineFactory = Callable[[CameraConfig], PottyEventDetector]
 RecorderFactory = Callable[[Config, Any | None], EventRecorder]
+
+
+def _is_live_kind(kind: str) -> bool:
+    """Live cameras stream forever; file cameras are finite."""
+
+    return kind in ("protect", "rtsp")
+
+
+def _is_valid_rtsp_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme in ("rtsp", "rtsps") and bool(parts.hostname)
+
+
+def _redact_url(message: str, url: str) -> str:
+    """Keep a resolved RTSP URL (which embeds credentials) out of log text."""
+
+    return message.replace(url, "<rtsp-url>") if url else message
 
 
 @dataclass(slots=True)
@@ -99,6 +118,7 @@ class PottyPipeline:
         file_source_factory: FileSourceFactory | None = None,
         state_machine_factory: StateMachineFactory | None = None,
         recorder_factory: RecorderFactory | None = None,
+        rtsp_source_factory: RTSPSourceFactory | None = None,
         max_live_frames: int | None = None,
         max_workers: int | None = None,
         continue_on_camera_error: bool = True,
@@ -109,6 +129,7 @@ class PottyPipeline:
         self.file_source_factory = file_source_factory or self._default_file_source_factory
         self.state_machine_factory = state_machine_factory or PottyEventDetector
         self.recorder_factory = recorder_factory or self._default_recorder_factory
+        self.rtsp_source_factory = rtsp_source_factory
         self.max_live_frames = max_live_frames
         self.max_workers = max_workers
         self.continue_on_camera_error = continue_on_camera_error
@@ -162,11 +183,12 @@ class PottyPipeline:
     def _run_concurrent(self, selected: Sequence[CameraConfig], workers: int) -> list[Path]:
         LOGGER.info("Processing %d cameras concurrently with %d worker(s)", len(selected), workers)
         results: dict[int, list[Path]] = {}
-        # Submit live (protect) cameras first so their never-ending loops claim
-        # worker slots immediately instead of waiting behind finite file cameras.
+        # Submit live (protect/rtsp) cameras first so their never-ending loops
+        # claim worker slots immediately instead of waiting behind finite file
+        # cameras.
         order = sorted(
             range(len(selected)),
-            key=lambda i: 0 if selected[i].input.kind == "protect" else 1,
+            key=lambda i: 0 if _is_live_kind(selected[i].input.kind) else 1,
         )
         executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="potty-cam")
         try:
@@ -211,8 +233,8 @@ class PottyPipeline:
     def _min_safe_workers(self, selected: Sequence[CameraConfig]) -> int:
         # Each live camera needs its own thread because its loop never returns;
         # finite file cameras can share one additional slot.
-        live = sum(1 for camera in selected if camera.input.kind == "protect")
-        has_file = any(camera.input.kind != "protect" for camera in selected)
+        live = sum(1 for camera in selected if _is_live_kind(camera.input.kind))
+        has_file = any(camera.input.kind == "file" for camera in selected)
         return max(1, live + (1 if has_file else 0))
 
     def _resolve_max_workers(self, selected: Sequence[CameraConfig]) -> int:
@@ -259,6 +281,8 @@ class PottyPipeline:
             return self.process_file_camera(camera_config)
         if camera_config.input.kind == "protect":
             return self.process_protect_camera(camera_config)
+        if camera_config.input.kind == "rtsp":
+            return self.process_rtsp_camera(camera_config)
         LOGGER.warning("Unsupported input kind for camera %s", sanitize_source_id(camera_config.id))
         return []
 
@@ -354,10 +378,35 @@ class PottyPipeline:
             )
             return []
 
+    def process_rtsp_camera(self, camera_config: CameraConfig) -> list[Path]:
+        url = camera_config.input.resolve_url()
+        if not url:
+            LOGGER.warning(
+                "RTSP camera %s has no URL (env var %s is unset or empty)",
+                sanitize_source_id(camera_config.id),
+                camera_config.input.url_env,
+            )
+            return []
+        if not _is_valid_rtsp_url(url):
+            LOGGER.warning(
+                "RTSP camera %s has an invalid URL in env var %s (expected rtsp:// or rtsps://)",
+                sanitize_source_id(camera_config.id),
+                camera_config.input.url_env,
+            )
+            return []
+        try:
+            return asyncio.run(self._run_live_camera_async(camera_config, url, None))
+        except Exception as exc:
+            LOGGER.warning(
+                "RTSP camera %s skipped: %s",
+                sanitize_source_id(camera_config.id),
+                _redact_url(str(exc), url),
+            )
+            return []
+
     async def _process_protect_camera_async(self, camera_config: CameraConfig) -> list[Path]:
         try:
             from detectivepotty.protect.client import ProtectClient
-            from detectivepotty.sources.rtsp import RTSPSource
         except Exception as exc:  # pragma: no cover - environment dependent.
             raise RuntimeError("Protect dependencies are unavailable") from exc
 
@@ -372,40 +421,56 @@ class PottyPipeline:
                     camera_config.substream_choice,
                 )
                 return []
-
-            source = RTSPSource(url)
-            buffer_window_s = _buffer_window_s(camera_config)
-            buffer_max_frames = _live_buffer_max_frames(buffer_window_s)
-            buffer = RollingBuffer(buffer_window_s, max_frames=buffer_max_frames)
-            worker = BufferedSourceWorker(
-                source,
-                buffer,
-                name=f"buffer-{sanitize_source_id(camera_config.id)}",
-            )
-            worker.start()
-            try:
-                return await self._run_live_detection_loop(
-                    camera_config,
-                    buffer,
-                    protect_client,
-                    buffer_window_s,
-                )
-            finally:
-                worker.stop()
+            return await self._run_live_camera_async(camera_config, url, protect_client)
         finally:
             await protect_client.close()
+
+    def _make_live_source(self, url: str) -> VideoSource:
+        if self.rtsp_source_factory is not None:
+            return self.rtsp_source_factory(url)
+        try:
+            from detectivepotty.sources.rtsp import RTSPSource
+        except Exception as exc:  # pragma: no cover - environment dependent.
+            raise RuntimeError("RTSP dependencies are unavailable") from exc
+        return RTSPSource(url)
+
+    async def _run_live_camera_async(
+        self,
+        camera_config: CameraConfig,
+        url: str,
+        recorder_client: Any | None,
+    ) -> list[Path]:
+        source = self._make_live_source(url)
+        buffer_window_s = _buffer_window_s(camera_config)
+        buffer_max_frames = _live_buffer_max_frames(buffer_window_s)
+        buffer = RollingBuffer(buffer_window_s, max_frames=buffer_max_frames)
+        worker = BufferedSourceWorker(
+            source,
+            buffer,
+            name=f"buffer-{sanitize_source_id(camera_config.id)}",
+        )
+        worker.start()
+        try:
+            return await self._run_live_detection_loop(
+                camera_config,
+                buffer,
+                recorder_client,
+                buffer_window_s,
+            )
+        finally:
+            worker.stop()
 
     async def _run_live_detection_loop(
         self,
         camera_config: CameraConfig,
         buffer: RollingBuffer,
-        protect_client: Any,
+        recorder_client: Any,
         buffer_window_s: float,
     ) -> list[Path]:
         detector = self._new_detector(camera_config)
         classifier = self._new_classifier(camera_config)
         state_machine = self._new_state_machine(camera_config)
-        recorder = self.recorder_factory(self.config, protect_client)
+        recorder = self.recorder_factory(self.config, recorder_client)
         history = _FrameHistory(buffer_window_s, max_frames=_live_buffer_max_frames(buffer_window_s))
         pending: list[_PendingCandidate] = []
         event_dirs: list[Path] = []
@@ -695,6 +760,7 @@ def run_pipeline(
     file_source_factory: FileSourceFactory | None = None,
     state_machine_factory: StateMachineFactory | None = None,
     recorder_factory: RecorderFactory | None = None,
+    rtsp_source_factory: RTSPSourceFactory | None = None,
     max_live_frames: int | None = None,
     max_workers: int | None = None,
     continue_on_camera_error: bool = True,
@@ -714,6 +780,7 @@ def run_pipeline(
         file_source_factory=file_source_factory,
         state_machine_factory=state_machine_factory,
         recorder_factory=recorder_factory,
+        rtsp_source_factory=rtsp_source_factory,
         max_live_frames=max_live_frames,
         max_workers=max_workers,
         continue_on_camera_error=continue_on_camera_error,

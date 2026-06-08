@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from datetime import datetime, timezone
 import math
+import os
 import threading
 import time
 from typing import Any, Callable, Self
@@ -11,6 +13,23 @@ from typing import Any, Callable, Self
 import cv2
 
 from detectivepotty.sources.base import Frame, VideoSource, sanitize_source_id
+
+_DEFAULT_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;tcp"
+
+
+def _configure_ffmpeg_transport(env: MutableMapping[str, str]) -> None:
+    """Default OpenCV's FFmpeg backend to TCP RTSP transport, respecting a user value.
+
+    UniFi RTSPS over UDP drops packets, which floods stderr with
+    "Empty H.264 RTP packet" and can stall decoding; TCP is reliable. OpenCV
+    reads ``OPENCV_FFMPEG_CAPTURE_OPTIONS`` when a capture is opened, so setting
+    it at import time (before any :class:`RTSPSource` opens a stream) is enough.
+    """
+
+    env.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", _DEFAULT_FFMPEG_CAPTURE_OPTIONS)
+
+
+_configure_ffmpeg_transport(os.environ)
 
 
 class RTSPSource(VideoSource):

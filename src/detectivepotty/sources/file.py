@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Self
 
@@ -11,13 +12,90 @@ import cv2
 
 from detectivepotty.sources.base import Frame, VideoSource
 
+# UniFi Protect exports embed the real recording time in the filename, e.g.
+# ``Backyard Grass 6-6-2026, 19.46.40 GMT+10 - 6-6-2026, 19.47.05 GMT+10.mp4``.
+# The first timestamp is the recording start. Dates are US ``M-D-YYYY``.
+_FILENAME_TS_RE = re.compile(
+    r"(\d{1,2})-(\d{1,2})-(\d{4}),\s*"
+    r"(\d{1,2})\.(\d{2})\.(\d{2})\s*"
+    r"GMT([+-]\d{1,2})(?::?(\d{2}))?"
+)
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def parse_filename_start_ts(name: str) -> datetime | None:
+    """Parse the real recording-start UTC time from a UniFi export filename.
+
+    Returns ``None`` when the filename does not contain a recognizable,
+    in-range timestamp so the caller can fall back to a different anchor.
+    """
+
+    match = _FILENAME_TS_RE.search(name)
+    if match is None:
+        return None
+    month, day, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    hour, minute, second = int(match.group(4)), int(match.group(5)), int(match.group(6))
+    gmt_hours = int(match.group(7))
+    gmt_minutes = int(match.group(8)) if match.group(8) else 0
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return None
+    signed_minutes = gmt_hours * 60 + (gmt_minutes if gmt_hours >= 0 else -gmt_minutes)
+    try:
+        tz = timezone(timedelta(minutes=signed_minutes))
+        local = datetime(year, month, day, hour, minute, second, tzinfo=tz)
+    except ValueError:
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def derive_base_wall_ts(
+    path: str | Path,
+    *,
+    override: datetime | None = None,
+) -> tuple[datetime, str]:
+    """Derive a deterministic UTC anchor for a file's synthetic timeline.
+
+    Priority (first that succeeds wins), with the chosen ``time_basis`` returned
+    alongside the timestamp so callers can convey confidence to the UI:
+
+    0. ``override`` -> ``"config"`` (an explicit recording-start the operator set)
+    1. the recording time parsed from the filename -> ``"filename"``
+    2. the file's modification time -> ``"file_mtime"`` (stable across reruns of
+       an untouched file; lower confidence — not necessarily the recording time)
+    3. ``datetime.now`` -> ``"runtime_now"`` (last resort; the only
+       non-deterministic basis, used when the path cannot be stat-ed)
+    """
+
+    if override is not None:
+        return _ensure_utc(override), "config"
+    candidate = Path(path)
+    parsed = parse_filename_start_ts(candidate.name)
+    if parsed is not None:
+        return parsed, "filename"
+    try:
+        mtime = candidate.stat().st_mtime
+    except OSError:
+        return datetime.now(timezone.utc), "runtime_now"
+    return datetime.fromtimestamp(mtime, tz=timezone.utc), "file_mtime"
+
 
 class FileSource(VideoSource):
     """Decode a local video file into ``Frame`` objects.
 
-    File frames use a synthetic stable UTC wall-clock timeline: ``open()`` records
-    a base UTC wall time, then each emitted frame is timestamped as
-    ``base_wall_ts + frame_idx / fps`` when the file FPS is known.
+    File frames use a deterministic, real-recording-time UTC timeline: ``open()``
+    derives a base UTC wall time from the source (filename recording time -> file
+    mtime -> now; see :func:`derive_base_wall_ts`), then each emitted frame is
+    timestamped as ``base_wall_ts + frame_idx / fps`` when the file FPS is known.
+    Because the anchor is derived deterministically from the source, re-running
+    detection over the same clip reproduces identical frame timestamps — which is
+    what lets reruns be deduplicated instead of piling up.
     """
 
     def __init__(
@@ -25,6 +103,7 @@ class FileSource(VideoSource):
         path: str | Path,
         *,
         target_fps: float | None = None,
+        base_wall_ts: datetime | None = None,
         capture_factory: Callable[[str], Any] = cv2.VideoCapture,
     ) -> None:
         if target_fps is not None and target_fps <= 0:
@@ -32,11 +111,13 @@ class FileSource(VideoSource):
         self.path = Path(path)
         self.source_id = str(self.path)
         self.target_fps = target_fps
+        self._explicit_base = base_wall_ts
         self._capture_factory = capture_factory
         self._capture: Any | None = None
         self._fps: float | None = None
         self._resolution: tuple[int, int] | None = None
         self._base_wall_ts: datetime | None = None
+        self._time_basis: str | None = None
         self._frame_idx = 0
         self._decoded_idx = 0
         self._next_emit_s = 0.0
@@ -57,7 +138,11 @@ class FileSource(VideoSource):
         self._resolution = (
             (int(width), int(height)) if width is not None and height is not None else None
         )
-        self._base_wall_ts = datetime.now(timezone.utc)
+        if self._explicit_base is not None:
+            self._base_wall_ts = _ensure_utc(self._explicit_base)
+            self._time_basis = "explicit"
+        else:
+            self._base_wall_ts, self._time_basis = derive_base_wall_ts(self.path)
         self._frame_idx = 0
         self._decoded_idx = 0
         self._next_emit_s = 0.0
@@ -101,6 +186,18 @@ class FileSource(VideoSource):
     @property
     def resolution(self) -> tuple[int, int] | None:
         return self._resolution
+
+    @property
+    def base_wall_ts(self) -> datetime | None:
+        """The deterministic UTC anchor chosen for this source's timeline."""
+
+        return self._base_wall_ts
+
+    @property
+    def time_basis(self) -> str | None:
+        """How ``base_wall_ts`` was derived (``filename``/``file_mtime``/...)."""
+
+        return self._time_basis
 
     @property
     def is_live(self) -> bool:

@@ -73,6 +73,123 @@ def run_command(
         typer.echo(f"  {event_dir}")
 
 
+@app.command("dedupe-events")
+def dedupe_events_command(
+    config_path: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to DetectivePotty YAML config.",
+        ),
+    ],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Report the plan without deleting anything."),
+    ] = False,
+) -> None:
+    """Collapse existing duplicate events left behind by earlier reruns.
+
+    Groups events by camera + source, keeps the newest-media copy of each
+    duplicate cluster, carries human labels forward, and deletes the rest.
+    Clusters whose human labels disagree are left untouched.
+    """
+
+    from detectivepotty.recording.reconcile import dedupe_dataset
+
+    config = load_config(config_path)
+    actions = dedupe_dataset(
+        config.global_settings.dataset_dir,
+        tolerance_s=config.global_settings.rerun_match_tolerance_s,
+        dry_run=dry_run,
+    )
+
+    removed = 0
+    conflicts = 0
+    for action in actions:
+        if action.conflict:
+            conflicts += 1
+            typer.echo(f"CONFLICT (kept all {len(action.cluster)}):")
+            for path in action.cluster:
+                typer.echo(f"    {path}")
+            continue
+        removed += len(action.removed)
+        verb = "would keep" if dry_run else "kept"
+        typer.echo(f"{verb} {action.keeper}")
+        for path in action.removed:
+            verb = "would remove" if dry_run else "removed"
+            typer.echo(f"    {verb} {path}")
+
+    prefix = "Dry run: " if dry_run else ""
+    typer.echo(
+        f"{prefix}{removed} duplicate event(s) "
+        f"{'to remove' if dry_run else 'removed'}, {conflicts} conflict(s)."
+    )
+
+
+@app.command("cleanup-legacy")
+def cleanup_legacy_command(
+    config_path: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to DetectivePotty YAML config.",
+        ),
+    ],
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Actually quarantine removable events. Omit for a dry run.",
+        ),
+    ] = False,
+) -> None:
+    """Quarantine legacy duplicate events left by the pre-determinism timeline.
+
+    Conservatively removes only unlabeled, pre-determinism events whose source
+    video still exists (so a clean re-run can regenerate them), moving them into
+    ``<dataset>/.trash/`` so the operation is reversible. Every reviewed event and
+    every deterministic-era event is preserved. Runs as a dry run unless
+    ``--apply`` is given.
+    """
+
+    from detectivepotty.recording.cleanup import cleanup_legacy_events
+
+    config = load_config(config_path)
+    report = cleanup_legacy_events(
+        config.global_settings.dataset_dir,
+        dry_run=not apply,
+    )
+
+    for item in report.removable:
+        if apply and item.moved_to is not None:
+            typer.echo(f"quarantined {item.event_dir} -> {item.moved_to}")
+        elif apply:
+            typer.echo(f"FAILED to quarantine {item.event_dir}")
+        else:
+            typer.echo(f"would quarantine {item.event_dir}")
+    for item in report.skipped_source_missing:
+        typer.echo(f"skipped (source missing) {item.event_dir}")
+
+    prefix = "" if apply else "Dry run: "
+    verb = "quarantined" if apply else "to quarantine"
+    typer.echo(
+        f"{prefix}{len(report.removable)} legacy duplicate(s) {verb}; "
+        f"kept {len(report.kept_labeled)} labeled, "
+        f"{len(report.kept_deterministic)} deterministic, "
+        f"{len(report.skipped_source_missing)} with missing source."
+    )
+    if apply and report.trash_dir is not None and report.removable:
+        typer.echo(f"Quarantine dir: {report.trash_dir}")
+
+
 @app.command("serve")
 def serve_command(
     config_path: Annotated[
@@ -88,6 +205,13 @@ def serve_command(
     ],
     host: Annotated[str, typer.Option("--host", help="Bind host.")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", min=1, max=65535, help="Bind port.")] = 8000,
+    reload: Annotated[
+        bool,
+        typer.Option(
+            "--reload",
+            help="Auto-reload the server when source files change (development only).",
+        ),
+    ] = False,
 ) -> None:
     """Launch the local review web app."""
 
@@ -97,7 +221,7 @@ def serve_command(
     except Exception as exc:
         typer.echo(f"Web app is unavailable: {exc}", err=True)
         raise typer.Exit(1) from exc
-    run_server(config, host=host, port=port)
+    run_server(config, host=host, port=port, reload=reload, config_path=config_path)
 
 
 @app.command("list-cameras")

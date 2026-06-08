@@ -84,12 +84,17 @@ class CropRecord:
 
 @dataclass(slots=True)
 class EventMetadata:
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     event_id: str = field(default_factory=lambda: str(uuid4()))
     camera_id: str = ""
     camera_name: str = ""
     sanitized_source_id: str = ""
     utc_ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    end_ts: datetime | None = None
+    recorded_at: datetime | None = None
+    source_start_s: float | None = None
+    source_end_s: float | None = None
+    time_basis: str | None = None
     local_tz_offset: str = field(default_factory=lambda: _local_tz_offset())
     protect_event_id: str | None = None
     smartdetect_score: float | None = None
@@ -119,6 +124,10 @@ class EventMetadata:
 
     def __post_init__(self) -> None:
         self.utc_ts = _ensure_aware_utc(self.utc_ts)
+        if self.end_ts is not None:
+            self.end_ts = _ensure_aware_utc(self.end_ts)
+        if self.recorded_at is not None:
+            self.recorded_at = _ensure_aware_utc(self.recorded_at)
         if self.detection_ts is not None:
             self.detection_ts = _ensure_aware_utc(self.detection_ts)
         if self.notification_ts is not None:

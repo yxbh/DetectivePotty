@@ -248,6 +248,37 @@ def test_root_serves_html(tmp_path: Path) -> None:
     assert "DetectivePotty Review" in response.text
 
 
+def test_root_serves_build_missing_fallback(tmp_path: Path, monkeypatch) -> None:
+    from detectivepotty.web import app as app_module
+
+    monkeypatch.setattr(app_module, "FRONTEND_DIST", tmp_path / "no-build")
+    client = make_client(tmp_path)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "DetectivePotty Review" in response.text
+    assert "npm run build" in response.text
+
+
+def test_root_serves_built_index(tmp_path: Path, monkeypatch) -> None:
+    from detectivepotty.web import app as app_module
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text(
+        "<!doctype html><title>DetectivePotty Review</title><div id=app></div>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "FRONTEND_DIST", dist)
+    client = make_client(tmp_path)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "id=app" in response.text
+
+
 def test_dogs_roster_endpoint(tmp_path: Path) -> None:
     client = make_client(tmp_path, dogs=["Gromit", "WALL-E", "Apollo"])
 
@@ -313,3 +344,45 @@ def test_label_update_allows_freeform_dog_without_roster(tmp_path: Path) -> None
 
     assert response.status_code == 200
     assert response.json()["dog"] == "Anything"
+
+
+def test_stream_pushes_new_events(tmp_path: Path) -> None:
+    import asyncio
+
+    from detectivepotty.web.app import _event_stream
+    from detectivepotty.web.dataset_index import DatasetIndex
+
+    make_event(tmp_path, event_id="seed", camera="Backyard", utc_ts=BASE_TS)
+    index = DatasetIndex(tmp_path)
+
+    state = {"checks": 0}
+
+    async def is_disconnected() -> bool:
+        state["checks"] += 1
+        # Create a brand-new event only after the stream has connected and
+        # seeded, so it must arrive via a diff (not the initial backfill).
+        if state["checks"] == 1:
+            make_event(
+                tmp_path,
+                event_id="fresh",
+                camera="Sideyard",
+                utc_ts=BASE_TS + timedelta(hours=2),
+            )
+        return state["checks"] >= 3
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    async def drive() -> list[str]:
+        return [
+            chunk async for chunk in _event_stream(index, is_disconnected, sleep=no_sleep)
+        ]
+
+    text = "".join(asyncio.run(drive()))
+
+    assert "event: ready" in text
+    assert text.count("event: new") == 1
+    assert '"event_id": "fresh"' in text
+    assert '"camera": "Sideyard"' in text
+    # The pre-existing event was seeded as known and must not be re-emitted.
+    assert '"event_id": "seed"' not in text

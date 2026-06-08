@@ -1,0 +1,285 @@
+/* ----------------------------------------------------------------------------
+   DetectivePotty — "Forensic Review Console"
+   A noir surveillance aesthetic: warm near-black charcoal, sodium-vapor amber as
+   the evidence/selection accent, a cold teal for interaction, and a mono face
+   carrying every timestamp / id / metric like a case file. Keyboard-first.
+---------------------------------------------------------------------------- */
+
+@import url("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+:root {
+  /* surfaces — warm charcoal, almost black */
+  --bg: #0b0c0e;
+  --bg-1: #111316;
+  --bg-2: #16181d;
+  --bg-3: #1c1f25;
+  --bg-inset: #050607;
+
+  /* hairlines */
+  --line: rgba(236, 233, 227, 0.08);
+  --line-strong: rgba(236, 233, 227, 0.16);
+
+  /* ink — warm off-white, like paper under a desk lamp */
+  --text: #ece9e3;
+  --text-dim: #9b988f;
+  --text-faint: #6b6960;
+
+  /* accents */
+  --amber: #f5a524;
+  --amber-bright: #ffbb3d;
+  --amber-soft: rgba(245, 165, 36, 0.13);
+  --teal: #54d2c4;
+  --teal-soft: rgba(84, 210, 196, 0.12);
+
+  /* semantics */
+  --green: #4fc480;
+  --green-soft: rgba(79, 196, 128, 0.14);
+  --red: #e5544b;
+  --red-soft: rgba(229, 84, 75, 0.14);
+  --slate: #8290a8;
+
+  --radius: 0.7rem;
+  --radius-sm: 0.45rem;
+  --shadow: 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+
+  --font-display: "Bricolage Grotesque", "Archivo", ui-sans-serif, system-ui, sans-serif;
+  --font-ui: "Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code", monospace;
+
+  color-scheme: dark;
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(120% 80% at 80% -10%, rgba(245, 165, 36, 0.06), transparent 60%),
+    radial-gradient(120% 90% at -10% 110%, rgba(84, 210, 196, 0.05), transparent 55%),
+    var(--bg);
+}
+
+#app {
+  height: 100dvh;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+::selection {
+  background: var(--amber-soft);
+  color: var(--text);
+}
+
+/* --- form primitives ------------------------------------------------------ */
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+select,
+input,
+textarea,
+button {
+  font: inherit;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.65rem;
+  color: var(--text);
+  background: var(--bg-inset);
+  transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+}
+
+select,
+input,
+textarea {
+  width: 100%;
+}
+
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+  outline: none;
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px var(--teal-soft);
+}
+
+textarea {
+  min-height: 3rem;
+  resize: vertical;
+  font-family: var(--font-ui);
+}
+
+button {
+  cursor: pointer;
+  background: var(--bg-3);
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+button:hover {
+  border-color: var(--line-strong);
+  background: #232730;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* primary action */
+.btn-primary {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: #1a1204;
+  font-weight: 700;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--amber-bright);
+  border-color: var(--amber-bright);
+}
+
+/* --- shared atoms --------------------------------------------------------- */
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 0.2rem 0.36rem;
+  border-radius: 0.32rem;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  background: var(--bg-2);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--text-dim);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border-radius: 999px;
+  padding: 0.16rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  border: 1px solid var(--line-strong);
+  color: var(--text-dim);
+  background: var(--bg-2);
+  white-space: nowrap;
+}
+
+/* status chips */
+.chip.status-labeled {
+  color: var(--green);
+  border-color: rgba(79, 196, 128, 0.4);
+  background: var(--green-soft);
+}
+.chip.status-rejected {
+  color: var(--red);
+  border-color: rgba(229, 84, 75, 0.4);
+  background: var(--red-soft);
+}
+.chip.status-uncertain {
+  color: var(--amber);
+  border-color: rgba(245, 165, 36, 0.4);
+  background: var(--amber-soft);
+}
+.chip.status-unlabeled {
+  color: var(--text-faint);
+}
+
+/* label chips */
+.chip.label-pee {
+  color: #f1cf5b;
+  border-color: rgba(241, 207, 91, 0.35);
+}
+.chip.label-poop {
+  color: #c08a55;
+  border-color: rgba(192, 138, 85, 0.35);
+}
+.chip.label-not_potty {
+  color: var(--slate);
+  border-color: rgba(130, 144, 168, 0.35);
+}
+
+.empty-state,
+.error-state {
+  color: var(--text-dim);
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  font-size: 0.92rem;
+}
+
+.error-state {
+  color: #ff9c93;
+}
+
+/* scrollbars — thin and recessive */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(236, 233, 227, 0.28);
+  background-clip: padding-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

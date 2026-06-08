@@ -9,6 +9,26 @@ global:
     - WALL-E
     - Apollo
 
+# Keypoint-pose pee/poop classifier (additive). Requires `uv sync --extra pose`.
+# When enabled, PosePottyClassifier replaces the bbox squat heuristic for the weak
+# guess, deriving squat/arched-back/stationary signals from real keypoints instead
+# of bbox height/aspect jitter. It falls back to the bbox heuristic automatically
+# whenever pose is missing or low-quality, so it can never do worse than bbox alone.
+# The guess is still a weak prefill: every event stays needs_label/unlabeled.
+pose:
+  enabled: true
+  backend: superanimal
+  enable_pose_classifier: true
+  # Pose runs only on recorded candidate windows, not every dog on every frame.
+  candidate_only: true
+  # Detection-gate augmentation stays OFF: experimental and not yet validated
+  # against the real superanimal backend.
+  enable_pose_gate: false
+  # Optional night/IR aid: build the pose crop from the union of detector boxes
+  # over this trailing window so an under-segmented IR box doesn't feed pose a
+  # partial crop. 0.0 disables it; raise (e.g. 0.5) if night crops look clipped.
+  box_union_window_s: 0.0
+
 protect:
   nvr_host: https://nvr.bennet.lan
   # Secret values are read from these environment variables; never put credentials in YAML.
@@ -50,15 +70,19 @@ cameras:
     retention_max_gb: 200.0
 
   # Pool (Protect id 66ff1c1a00c53803e400d2ec).
-  # No Protect Animal smart-detect on this camera, so potty events rely on the YOLO
-  # trigger. high/medium/low RTSPS are all published; medium balances quality vs cost.
+  # This is a third-party Dahua ONVIF camera adopted into the NVR. UniFi Protect's
+  # RTSPS re-stream of it is broken (empty H.264 RTP / TLS "session invalidated"
+  # flood, 0 frames decoded), so we bypass UniFi and stream directly from the
+  # camera's native RTSP. The full rtsp://user:pass@host:554/path URL (credentials
+  # included) lives in the env var below; never put it in YAML.
+  # No Protect Animal smart-detect on this camera, so potty events rely on the YOLO trigger.
   - id: 66ff1c1a00c53803e400d2ec
     name: Pool
     enabled: true
     input:
-      kind: protect
-      source_id: unifi-protect:pool
-    substream_choice: medium
+      kind: rtsp
+      url_env: DETECTIVEPOTTY_POOL_RTSP_URL
+      source_id: dahua-onvif:pool
     animal_supported: false
     roi: []
     ignore_zones: []

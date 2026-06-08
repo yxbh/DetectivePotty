@@ -9,6 +9,26 @@ global:
     - WALL-E
     - Apollo
 
+# Keypoint-pose pee/poop classifier (additive). Requires `uv sync --extra pose`.
+# When enabled, PosePottyClassifier replaces the bbox squat heuristic for the weak
+# guess, deriving squat/arched-back/stationary signals from real keypoints instead
+# of bbox height/aspect jitter. It falls back to the bbox heuristic automatically
+# whenever pose is missing or low-quality, so it can never do worse than bbox alone.
+# The guess is still a weak prefill: every event stays needs_label/unlabeled.
+pose:
+  enabled: true
+  backend: superanimal
+  enable_pose_classifier: true
+  # Pose runs only on recorded candidate windows, not every dog on every frame.
+  candidate_only: true
+  # Detection-gate augmentation stays OFF: experimental and not yet validated
+  # against the real superanimal backend.
+  enable_pose_gate: false
+  # Optional night/IR aid: build the pose crop from the union of detector boxes
+  # over this trailing window so an under-segmented IR box doesn't feed pose a
+  # partial crop. 0.0 disables it; raise (e.g. 0.5) if night crops look clipped.
+  box_union_window_s: 0.0
+
 protect:
   nvr_host: https://nvr.bennet.lan
   # Secret values are read from these environment variables; never put credentials in YAML.

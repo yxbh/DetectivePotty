@@ -2,19 +2,49 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 from pathlib import Path
+import threading
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import aiohttp
 from uiprotect import ProtectApiClient
+from uiprotect.exceptions import BadRequest, ClientError, NotAuthorized, NvrError
 
 from detectivepotty.config import Config
 from detectivepotty.sources.base import sanitize_source_id
 
+LOGGER = logging.getLogger(__name__)
+
 Substream = Literal["low", "medium", "high"]
+
+# Auth/transport failures that should trigger a fall back to the public API
+# (when an API key is configured) rather than crash. Deliberately scoped: this
+# excludes programming/validation errors so genuine bugs still surface.
+_PRIVATE_CONNECT_ERRORS: tuple[type[BaseException], ...] = (
+    NotAuthorized,
+    NvrError,
+    BadRequest,
+    ClientError,
+    aiohttp.ClientError,
+    OSError,
+    asyncio.TimeoutError,
+)
+
+# The public Integration API bootstrap is heavy (it fans out to every
+# integration endpoint and then caches RTSPS streams for every camera). The
+# pipeline runs one ProtectClient per camera thread, so when several cameras
+# fall back to the public API at once they stampede UniFi's per-endpoint rate
+# limit (HTTP 429). Serialize the public bootstrap across threads so only one
+# runs at a time. Each ProtectClient runs in its own event loop (via
+# asyncio.run in a worker thread), so a threading.Lock is the correct
+# cross-thread primitive and is only held briefly during startup.
+_PUBLIC_BOOTSTRAP_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +103,15 @@ class ProtectClient:
         await self.close()
 
     async def connect(self) -> None:
-        """Populate uiprotect bootstrap data while honoring TLS verification."""
+        """Populate uiprotect bootstrap data while honoring TLS verification.
+
+        Private auth is preferred. When it succeeds the public Integration API
+        bootstrap is skipped entirely: ``rtsps_url``/``snapshot``/
+        ``download_recording`` all use the private bootstrap, so re-running the
+        heavy public bootstrap per camera is pure waste and trips UniFi's rate
+        limit. The public API is only used as a fallback when private auth is
+        unavailable or fails (e.g. a transient ``401`` or a revoked password).
+        """
 
         if self._connected:
             return
@@ -82,15 +120,68 @@ class ProtectClient:
         api_key = self.config.resolve_secret("api_key")
         username = self.config.resolve_secret("username")
         password = self.config.resolve_secret("password")
-        self._private_enabled = bool(username and password) or self._is_injected_client()
-        self._public_enabled = bool(api_key)
+        want_private = bool(username and password) or self._is_injected_client()
+        want_public = bool(api_key)
 
-        if self._private_enabled and hasattr(api, "update"):
-            await api.update()
-        if self._public_enabled and hasattr(api, "update_public"):
-            await api.update_public()
-            await self._cache_public_rtsps_streams()
+        private_error: Exception | None = None
+        if want_private and hasattr(api, "update"):
+            try:
+                await self._connect_private(api)
+                self._private_enabled = True
+            except _PRIVATE_CONNECT_ERRORS as exc:
+                private_error = exc
+
+        # Only bootstrap the public API when private auth is not available or
+        # failed. Serialize it so concurrent fallbacks don't re-stampede.
+        if want_public and not self._private_enabled and hasattr(api, "update_public"):
+            try:
+                with _PUBLIC_BOOTSTRAP_LOCK:
+                    await api.update_public()
+                    # ``_cache_public_rtsps_streams`` reads the public bootstrap,
+                    # which is gated on ``_public_enabled``; flip it first.
+                    self._public_enabled = True
+                    await self._cache_public_rtsps_streams()
+            except _PRIVATE_CONNECT_ERRORS as exc:
+                self._public_enabled = False
+                if private_error is not None:
+                    raise RuntimeError(
+                        "Protect connect failed: private auth error "
+                        f"({private_error!r}) and public API error ({exc!r})"
+                    ) from exc
+                raise
+
+        if private_error is not None and self._public_enabled:
+            LOGGER.warning(
+                "Protect private auth failed (%s); continuing with the public "
+                "Integration API. Recording downloads and private websocket "
+                "triggers are unavailable.",
+                private_error,
+            )
+        elif private_error is not None and not self._public_enabled:
+            raise private_error
+
         self._connected = True
+
+    async def _connect_private(self, api: Any) -> None:
+        """Run the private bootstrap, refreshing the session once on a 401.
+
+        A persisted ``rememberMe`` session token can be accepted locally yet
+        rejected by the NVR (stale/rotated), and uiprotect does not refresh on a
+        ``401``. So on :class:`NotAuthorized` we force exactly one fresh login
+        and retry the bootstrap once.
+        """
+
+        try:
+            await api.update()
+            return
+        except NotAuthorized:
+            if not hasattr(api, "authenticate"):
+                raise
+            LOGGER.warning(
+                "Protect private session rejected (401); forcing a fresh login and retrying once.",
+            )
+        await api.authenticate()
+        await api.update()
 
     async def close(self) -> None:
         """Close websocket and HTTP sessions owned by uiprotect."""

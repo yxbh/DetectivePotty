@@ -68,3 +68,87 @@ export interface LabelDraft {
   dog: string;
   note: string;
 }
+
+// --- Detection tuner (/tune) ---------------------------------------------
+
+export interface TuneEntry {
+  name: string;
+  kind: "dir" | "video";
+  path: string;
+  size?: number;
+}
+
+export interface TuneListing {
+  /** "" at the synthetic top level (the list of roots). */
+  path: string;
+  /** "" = go to root list, a dir path = parent dir, null = no parent (top). */
+  parent: string | null;
+  entries: TuneEntry[];
+}
+
+export interface TuneDetection {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  confidence: number;
+  class_name: string;
+}
+
+export interface TuneKeypoint {
+  name: string;
+  x: number;
+  y: number;
+  confidence: number;
+}
+
+export interface TunePose {
+  bbox: number[];
+  keypoints: TuneKeypoint[];
+}
+
+export interface TuneFrame {
+  path: string;
+  index: number;
+  total_frames: number | null;
+  fps: number;
+  width: number;
+  height: number;
+  detection_floor: number;
+  image: string;
+  detections: TuneDetection[];
+  pose: TunePose[];
+  pose_available: boolean;
+}
+
+/** Allow-list of selectable YOLO weights for the model picker. */
+export interface TuneModelList {
+  models: string[];
+  default: string;
+}
+
+/** Clip properties for index<->time mapping (no inference). */
+export interface TuneMeta {
+  path: string;
+  total_frames: number | null;
+  fps: number;
+  width: number;
+  height: number;
+  duration: number;
+}
+
+/** Detections (+optional pose) for one frame — the async overlay buffer's
+ *  payload. Shaped like {@link TuneFrame} but with no `image` field. */
+export interface TuneDetectResult {
+  path: string;
+  index: number;
+  total_frames: number | null;
+  fps: number;
+  width: number;
+  height: number;
+  model: string;
+  detection_floor: number;
+  detections: TuneDetection[];
+  pose: TunePose[];
+  pose_available: boolean;
+}

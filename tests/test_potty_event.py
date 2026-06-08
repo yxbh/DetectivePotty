@@ -131,10 +131,14 @@ def test_two_dogs_sets_multi_dog_and_ambiguous_flags() -> None:
 
 
 def test_roi_and_ignore_zone_filtering() -> None:
-    roi = ZoneConfig(points=[(0, 0), (120, 0), (120, 120), (0, 120)])
-    ignore = ZoneConfig(points=[(30, 20), (90, 20), (90, 100), (30, 100)])
+    # Zones are normalized [0.0, 1.0] image coordinates; the test frame is 160x120,
+    # so a detection's pixel center is normalized before the polygon test. ROI keeps
+    # the left ~3/4 of the frame; the ignore box carves out the middle.
+    roi = ZoneConfig(points=[(0.0, 0.0), (0.75, 0.0), (0.75, 1.0), (0.0, 1.0)])
+    ignore = ZoneConfig(points=[(0.2, 0.1), (0.6, 0.1), (0.6, 0.9), (0.2, 0.9)])
     config = camera_config(roi=[roi], ignore_zones=[ignore])
 
+    # Center (60, 60) -> (0.375, 0.5): inside ROI but inside the ignore box.
     ignored_detector = PottyEventDetector(config)
     ignored = run_sequence(
         ignored_detector,
@@ -142,6 +146,7 @@ def test_roi_and_ignore_zone_filtering() -> None:
     )
     assert ignored == []
 
+    # Center (150, 60) -> (0.9375, 0.5): outside the ROI.
     outside_detector = PottyEventDetector(config)
     outside = run_sequence(
         outside_detector,
@@ -149,6 +154,7 @@ def test_roi_and_ignore_zone_filtering() -> None:
     )
     assert outside == []
 
+    # Center (20, 60) -> (0.125, 0.5): inside ROI, left of the ignore box.
     allowed_detector = PottyEventDetector(config)
     allowed = run_sequence(
         allowed_detector,

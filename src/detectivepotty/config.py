@@ -33,7 +33,7 @@ class GlobalSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dataset_dir: Path = Path("dataset")
-    model_name: str = "yolo11m.pt"
+    model_name: str = "models/yolo11m.pt"
     inference_long_edge_px: int = Field(default=640, gt=0)
     device: Device = "auto"
     log_level: str = "INFO"
@@ -120,6 +120,23 @@ class ZoneConfig(BaseModel):
 
     name: str | None = None
     points: list[tuple[float, float]] = Field(default_factory=list)
+
+    @field_validator("points")
+    @classmethod
+    def _validate_normalized(
+        cls, value: list[tuple[float, float]]
+    ) -> list[tuple[float, float]]:
+        # Zone points are normalized [0.0, 1.0] image coordinates (see README), so
+        # they are resolution-independent and can be compared against normalized
+        # detection centers. Pixel coordinates here silently filtered out every
+        # detection, so reject them up front instead of failing open at runtime.
+        for x, y in value:
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                raise ValueError(
+                    "zone points must be normalized to [0.0, 1.0] image "
+                    f"coordinates; got ({x}, {y})"
+                )
+        return value
 
 
 class CameraInputConfig(BaseModel):

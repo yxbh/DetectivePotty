@@ -49,7 +49,7 @@ class DogDetector:
 
     def __init__(
         self,
-        model_name: str = "yolo11m.pt",
+        model_name: str = "models/yolo11m.pt",
         long_edge: int = 640,
         conf_threshold: float = 0.25,
         device: str = "auto",

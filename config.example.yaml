@@ -1,32 +1,86 @@
+# DetectivePotty configuration — canonical, fully-commented reference.
+# Copy this to config.yaml and edit. Secrets are NEVER stored here; they are read from
+# environment variables named below. Zone coordinates are normalized [0.0, 1.0].
+
 global:
+  # Root directory for recorded events (clips, frames, crops, metadata.json). Gitignored.
   dataset_dir: dataset
-  model_name: yolo11m.pt
+  # Ultralytics YOLO weights used for dog detection. A path (weights live in
+  # models/, gitignored) or a bare Ultralytics name (auto-downloaded on first use).
+  model_name: models/yolo11m.pt
+  # Detection runs on frames downscaled so their long edge is this many pixels (YOLO
+  # imgsz). Boxes are mapped back to full resolution before crops/frames are saved.
   inference_long_edge_px: 640
+  # Inference device: auto | cpu | mps | cuda. 'auto' picks the best available.
   device: auto
+  # Logging verbosity: DEBUG | INFO | WARNING | ERROR.
   log_level: INFO
   # Roster of dog identities offered as manual labels in the review portal.
   dogs:
     - Gromit
     - WALL-E
     - Apollo
+  # Optional: when a clip is re-processed, dedupe events that match an existing event
+  # within rerun_match_tolerance_s instead of writing duplicates. Defaults shown.
+  dedupe_reruns: true
+  rerun_match_tolerance_s: 5.0
 
+# UniFi Protect / NVR connection. Omit this whole block for offline (file-only) use.
 protect:
+  # NVR base URL. Must NOT embed credentials (use the *_env vars below).
   nvr_host: https://unvr.example.lan
-  # Secret values are read from these environment variables; never put credentials in YAML.
+  # Names of environment variables holding secrets. Provide EITHER an API key OR a
+  # username+password. Never put the secret values themselves in YAML.
   api_key_env: DETECTIVEPOTTY_NVR_API_KEY
   username_env: DETECTIVEPOTTY_NVR_USERNAME
   password_env: DETECTIVEPOTTY_NVR_PASSWORD
+  # Verify the NVR's TLS certificate. Set false only for self-signed dev NVRs.
   verify_tls: true
 
+# Keypoint-pose subsystem. Opt-in extra (`uv sync --extra pose`), OFF by default and
+# experimental. The whole block may be omitted — these are the documented defaults.
+pose:
+  # Master switch for pose. When false, detection/recording are heuristic-only.
+  enabled: false
+  # Pose backend and model (SuperAnimal-Quadruped / DeepLabCut HRNet-W32).
+  backend: superanimal
+  model_name: hrnet_w32
+  # Pose inference device: auto | cpu | mps | cuda.
+  device: auto
+  # Expand the detector box by this fraction before cropping for pose estimation.
+  crop_margin_frac: 0.4
+  # Per-keypoint confidence (0..1) below which a keypoint is ignored.
+  min_keypoint_conf: 0.5
+  # Minimum number of good pose frames required before pose is trusted for an event.
+  min_required_frames: 3
+  # Minimum fraction of expected keypoints that must be present (0..1).
+  min_pose_coverage: 0.5
+  # Minimum number of torso keypoints needed to consider a pose usable.
+  min_torso_keypoints: 3
+  # Max gap (seconds) allowed between consecutive pose observations in a window.
+  max_pose_gap_s: 1.0
+  # When true, pose only proposes candidate windows; it never suppresses recall.
+  candidate_only: true
+  # Build pose crops from the union of detector boxes over this trailing window
+  # (seconds) to recover full extent on low-contrast IR. 0.0 disables (crop == box).
+  box_union_window_s: 0.0
+  # Use pose to refine the weak pee/poop classifier guess.
+  enable_pose_classifier: false
+  # Experimental: let pose ADD detection candidate windows. Keep off until validated.
+  enable_pose_gate: false
+
 cameras:
-  - id: backyard-grass
-    name: Backyard Grass
-    enabled: true
+  # --- Native UniFi Protect camera ---
+  - id: backyard-grass            # Stable unique id (used in dataset paths).
+    name: Backyard Grass          # Human-friendly name shown in the review portal.
+    enabled: true                 # Set false to skip this camera on a run.
     input:
-      kind: protect
-      source_id: unifi-protect:backyard-grass
-    substream_choice: medium
-    animal_supported: true
+      kind: protect               # protect | file | rtsp.
+      source_id: unifi-protect:backyard-grass  # Optional label recorded in metadata.
+    substream_choice: medium      # RTSPS channel: low | medium | high (protect only).
+    animal_supported: true        # True if the camera emits UniFi animal smart-detects.
+    # roi: only detections whose center falls inside ANY roi polygon are kept. Empty =
+    # whole frame. Points are normalized [0.0, 1.0] image coordinates.
     roi:
       - name: lawn
         points:
@@ -34,18 +88,22 @@ cameras:
           - [1.0, 0.2]
           - [1.0, 1.0]
           - [0.0, 1.0]
+    # ignore_zones: detections whose center falls inside any of these are dropped.
     ignore_zones: []
+    # Minimum YOLO confidence (0..1) for a detected dog to count. Higher = stricter
+    # (fewer false positives), lower = more permissive. Tune with `tune-detect`.
     detection_conf_threshold: 0.25
-    event_duration_s: 8.0
-    stationary_threshold_s: 2.0
-    squat_threshold: 0.35
-    sample_rate_fps: 5.0
-    pre_roll_s: 15.0
-    post_roll_s: 30.0
-    retention_days: 30
-    retention_max_gb: 200.0
+    event_duration_s: 8.0         # Target length of a recorded event window (seconds).
+    stationary_threshold_s: 2.0   # Dog must hold still this long to start a candidate.
+    squat_threshold: 0.35         # Posture "squatness" (0..1) that flags a potty pose.
+    sample_rate_fps: 5.0          # Frames per second sampled for detection.
+    pre_roll_s: 15.0              # Seconds of footage kept before the event start.
+    post_roll_s: 30.0             # Seconds of footage kept after the event end.
+    retention_days: 30            # Delete events older than this many days.
+    retention_max_gb: 200.0       # Cap on this camera's on-disk events (GB); null = no cap.
 
-  # Offline no-NVR sample. Enable after placing the local Gromit pee clip at this path.
+  # --- Offline file clip (no NVR) ---
+  # Enable after placing the local Gromit pee clip at this path.
   - id: backyard-grass-file-sample
     name: Backyard Grass sample clip
     enabled: false
@@ -54,22 +112,23 @@ cameras:
       path: data/unifi_direct_clip_downloads/Backyard Grass 6-6-2026, 09.10.47 GMT+10 - 6-6-2026, 09.11.03 GMT+10.mp4
       source_id: file:backyard-grass-gromit-pee
     substream_choice: high
-    animal_supported: false
+    animal_supported: false       # File clips have no live smart-detect feed.
     detection_conf_threshold: 0.20
     sample_rate_fps: 10.0
-    pre_roll_s: 0.0
+    pre_roll_s: 0.0               # Files have no live pre-roll buffer.
     post_roll_s: 0.0
 
-  # Direct-RTSP sample for a third-party/ONVIF camera (e.g. a Dahua camera adopted into the
-  # UniFi NVR whose Protect RTSPS re-stream is broken). Stream straight from the camera and
-  # bypass UniFi. The full rtsp://user:pass@host:554/path URL lives in the env var named by
-  # url_env (credentials never go in YAML); export it before running.
+  # --- Direct RTSP for a third-party / ONVIF camera ---
+  # For a third-party camera (e.g. a Dahua adopted into the UniFi NVR) whose Protect
+  # RTSPS re-stream is broken: stream straight from the camera and bypass UniFi. The
+  # full rtsp://user:pass@host:554/path URL lives in the env var named by url_env
+  # (credentials never go in YAML); export it before running.
   - id: pool-onvif
     name: Pool (ONVIF direct)
     enabled: false
     input:
       kind: rtsp
-      url_env: DETECTIVEPOTTY_POOL_RTSP_URL
+      url_env: DETECTIVEPOTTY_POOL_RTSP_URL  # Env var holding the full RTSP URL.
       source_id: dahua-onvif:pool
     animal_supported: false
     detection_conf_threshold: 0.25

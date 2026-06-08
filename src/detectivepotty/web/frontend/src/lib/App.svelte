@@ -17,7 +17,9 @@
   import EventList from "./EventList.svelte";
   import EventDetailView from "./EventDetail.svelte";
   import LiveFeed from "./LiveFeed.svelte";
+  import TuneDetect from "./TuneDetect.svelte";
   import HelpOverlay from "./HelpOverlay.svelte";
+  import { navigate, route, routeToView } from "./router";
 
   const STATUS_FILTERS: Array<[string, string]> = [
     ["", "All"],
@@ -47,9 +49,9 @@
   let saving = $state(false);
   let saveStatus = $state("");
 
-  // 'review' is the labelling console; 'live' is the real-time feed. A tiny
-  // view flag (no router) keeps both on the same page/SSE connection.
-  let view = $state<"review" | "live">("review");
+  // The active view is derived from the URL so a refresh restores it (and deep
+  // links work). `?event=<id>` on the review route restores the open event.
+  let view = $derived(routeToView($route.path));
   let toasts = $state<Array<{ id: string; summary: EventSummary }>>([]);
 
   // Single source of truth for the label editor (lifted out of EventDetail so a
@@ -88,6 +90,20 @@
     };
   });
 
+  // Reconcile selection FROM the route: opening `/?event=<id>` (deep link, back/
+  // forward, or refresh) selects that event. No-ops once it matches the current
+  // selection, so it cannot loop with selectEvent's URL write-back.
+  $effect(() => {
+    const current = $route;
+    if (routeToView(current.path) !== "review") {
+      return;
+    }
+    const ev = current.query.get("event");
+    if (ev && ev !== selectedId) {
+      void selectEvent(ev);
+    }
+  });
+
   function handleLiveEvent(summary: EventSummary): void {
     pushToast(summary);
     if (get(liveNotifications)) {
@@ -113,7 +129,7 @@
   // Open a live/banner event in the Review console: refresh the list (which also
   // acknowledges the new arrivals and clears the banner), then select it.
   async function openLiveEvent(eventId: string): Promise<void> {
-    view = "review";
+    navigate("/");
     await loadEvents();
     await selectEvent(eventId);
   }
@@ -142,7 +158,10 @@
         selectedId = null;
         detail = null;
       }
-      if (events.length > 0 && !selectedId) {
+      // Don't auto-select the first event when the URL deep-links a specific one
+      // (?event=…) — the route-reconciliation effect will open it instead.
+      const deepLinked = get(route).query.get("event");
+      if (events.length > 0 && !selectedId && !deepLinked) {
         await selectEvent(events[0].event_id);
       }
     } catch (err) {
@@ -162,6 +181,13 @@
   async function selectEvent(eventId: string): Promise<void> {
     selectedId = eventId;
     saveStatus = "";
+    // Reflect the open event in the URL (replace, so list navigation doesn't
+    // flood history) so a refresh restores it. navigate() is a no-op when the
+    // URL already matches, which keeps the route-reconciliation effect from
+    // looping.
+    if (view === "review") {
+      navigate(`/?event=${encodeURIComponent(eventId)}`, { replace: true });
+    }
     const token = ++detailToken;
     detailLoading = true;
     detailError = null;
@@ -376,11 +402,20 @@
       }
       return;
     }
+    // The Tune page owns its own keyboard (Space, ←/→, Shift+←/→); don't let the
+    // review keymap swallow those (e.g. Space toggling a non-existent video).
+    if (view === "tune") {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        navigate("/");
+      }
+      return;
+    }
     // The Live feed has its own minimal keymap: v / Esc return to Review.
     if (view === "live") {
       if (event.key === "v" || event.key === "Escape") {
         event.preventDefault();
-        view = "review";
+        navigate("/");
       } else if (event.key === "?") {
         event.preventDefault();
         helpOpen = true;
@@ -479,7 +514,7 @@
         break;
       case "v":
         event.preventDefault();
-        view = "live";
+        navigate("/live");
         break;
       case " ":
         event.preventDefault();
@@ -506,7 +541,7 @@
         role="tab"
         aria-selected={view === "review"}
         class:active={view === "review"}
-        onclick={() => (view = "review")}
+        onclick={() => navigate("/")}
       >
         Review
       </button>
@@ -515,12 +550,22 @@
         role="tab"
         aria-selected={view === "live"}
         class:active={view === "live"}
-        onclick={() => (view = "live")}
+        onclick={() => navigate("/live")}
         title="Real-time feed of new events (v)"
       >
         Live
         <span class="live-dot" class:on={$liveConnected} aria-hidden="true"></span>
         {#if $liveNewCount > 0}<span class="live-badge">{$liveNewCount}</span>{/if}
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={view === "tune"}
+        class:active={view === "tune"}
+        onclick={() => navigate("/tune")}
+        title="Tune YOLO detection on a clip"
+      >
+        Tune
       </button>
     </div>
 
@@ -595,6 +640,10 @@
   {#if view === "live"}
     <main class="live-main">
       <LiveFeed events={$liveEvents} connected={$liveConnected} onpick={openLiveEvent} />
+    </main>
+  {:else if view === "tune"}
+    <main class="tune-main">
+      <TuneDetect />
     </main>
   {:else}
     <main class="layout">

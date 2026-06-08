@@ -307,7 +307,7 @@ def detect_file(
     model: Annotated[
         str,
         typer.Option("--model", help="YOLO model name/path."),
-    ] = "yolo11m.pt",
+    ] = "models/yolo11m.pt",
 ) -> None:
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -396,6 +396,176 @@ def detect_file(
         device=detector.device,
         model_name=detector.model_name,
     )
+
+
+@app.command("tune-detect")
+def tune_detect(
+    input_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--input",
+            help="Local video file to tune against. Mutually exclusive with --config/--camera.",
+        ),
+    ] = None,
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Config supplying a camera to stream (use with --camera).",
+        ),
+    ] = None,
+    camera_id: Annotated[
+        str | None,
+        typer.Option("--camera", "-C", help="Camera id within --config (file, rtsp, or protect)."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="YOLO model. Defaults to the config global model or models/yolo11m.pt."),
+    ] = None,
+    long_edge: Annotated[
+        int,
+        typer.Option("--long-edge", min=1, help="YOLO inference long edge (imgsz). Default 640."),
+    ] = 640,
+    floor: Annotated[
+        float,
+        typer.Option(
+            "--floor",
+            min=0.0,
+            max=1.0,
+            help="Detection floor: boxes below this are never returned. Keep low (e.g. 0.05) so "
+            "borderline boxes stay visible for the slider.",
+        ),
+    ] = 0.05,
+    conf: Annotated[
+        float | None,
+        typer.Option(
+            "--conf",
+            min=0.0,
+            max=1.0,
+            help="Initial slider threshold. Defaults to the camera's detection_conf_threshold or 0.25.",
+        ),
+    ] = None,
+    every_n: Annotated[
+        int,
+        typer.Option(
+            "--every-n",
+            min=1,
+            help="Run detection every N played frames (reuse boxes in between for smoother playback).",
+        ),
+    ] = 1,
+) -> None:
+    """Interactively tune ``detection_conf_threshold`` with live bounding boxes.
+
+    Opens an OpenCV window playing the input with every detected dog drawn. A confidence
+    slider colors boxes green (kept) vs dim red (dropped) at that threshold, so you can
+    watch playback and find the cutoff that keeps the dog but drops noise. Detection runs
+    at a low ``--floor`` so borderline boxes stay visible; the slider only changes coloring,
+    not inference. Accepts a local file (``--input``) or a config camera
+    (``--config``/``--camera``; file, rtsp, or protect). Prints the chosen threshold on exit.
+    """
+
+    from detectivepotty.preview import (
+        FileFrameProvider,
+        FrameProvider,
+        LiveFrameProvider,
+        run_interactive_preview,
+    )
+
+    provider: FrameProvider
+    if input_path is not None:
+        if config_path is not None or camera_id is not None:
+            raise typer.BadParameter("Use either --input or --config/--camera, not both.")
+        if not input_path.is_file():
+            raise typer.BadParameter(f"Input video not found: {input_path}")
+        provider = FileFrameProvider(input_path)
+        model_name = model or "models/yolo11m.pt"
+        initial_conf = conf if conf is not None else 0.25
+    else:
+        if config_path is None or camera_id is None:
+            raise typer.BadParameter("Provide --input, or both --config and --camera.")
+        config = load_config(config_path)
+        camera = next((cam for cam in config.cameras if cam.id == camera_id), None)
+        if camera is None:
+            raise typer.BadParameter(f"Camera '{camera_id}' not found in {config_path}.")
+        model_name = model or config.global_settings.model_name
+        initial_conf = conf if conf is not None else camera.detection_conf_threshold
+        provider = _build_camera_provider(config, camera, FileFrameProvider, LiveFrameProvider)
+
+    detector = DogDetector(
+        model_name=model_name,
+        long_edge=long_edge,
+        conf_threshold=floor,
+        device="auto",
+    )
+    source_desc = "live stream" if provider.is_live else "file"
+    typer.echo(
+        f"Tuning {model_name} on {source_desc} (device={detector.device}); "
+        f"floor={floor:.2f}, start threshold={initial_conf:.2f}"
+    )
+    typer.echo(
+        "Keys: space play/pause, n/p step, r restart (file only), q/Esc quit. "
+        "Drag the 'conf x100' slider to set the threshold."
+    )
+    chosen = run_interactive_preview(
+        provider,
+        detector,
+        initial_conf=initial_conf,
+        every_n=every_n,
+    )
+    typer.echo(f"Chosen detection_conf_threshold: {chosen:.2f}")
+
+
+def _build_camera_provider(config, camera, file_provider_cls, live_provider_cls):
+    kind = camera.input.kind
+    if kind == "file":
+        if camera.input.path is None:
+            raise typer.BadParameter(f"Camera '{camera.id}' has no input.path.")
+        if not camera.input.path.is_file():
+            raise typer.BadParameter(f"Camera '{camera.id}' input file not found: {camera.input.path}")
+        return file_provider_cls(camera.input.path)
+    url = _resolve_camera_url(config, camera)
+    try:
+        from detectivepotty.sources.rtsp import RTSPSource
+    except Exception as exc:  # pragma: no cover - environment dependent.
+        raise typer.BadParameter(f"RTSP support unavailable: {exc}") from exc
+    return live_provider_cls(RTSPSource(url))
+
+
+def _resolve_camera_url(config: Config, camera) -> str:
+    kind = camera.input.kind
+    if kind == "rtsp":
+        url = camera.input.resolve_url()
+        if not url:
+            raise typer.BadParameter(
+                f"rtsp camera '{camera.id}': env var {camera.input.url_env} is unset or empty."
+            )
+        return url
+    if kind == "protect":
+        return _resolve_protect_url(config, camera)
+    raise typer.BadParameter(f"Unsupported camera kind '{kind}' for tune-detect.")
+
+
+def _resolve_protect_url(config: Config, camera) -> str:
+    async def _resolve() -> str | None:
+        from detectivepotty.protect.client import ProtectClient
+
+        client = ProtectClient(config)
+        try:
+            await client.connect()
+            return client.rtsps_url(camera.id, camera.substream_choice)
+        finally:
+            await client.close()
+
+    url = asyncio.run(_resolve())
+    if not url:
+        raise typer.BadParameter(
+            f"No RTSPS URL for protect camera '{camera.id}' substream {camera.substream_choice}."
+        )
+    return url
 
 
 def _protect_configured(config: Config) -> bool:

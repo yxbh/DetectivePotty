@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import os
 from pathlib import Path
+import threading
+import time
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -61,6 +64,26 @@ npm run build</pre>
   </body>
 </html>
 """
+
+
+# Detection floor for the in-browser tuner. The detector runs at this low
+# confidence so borderline boxes are still returned; the client-side slider
+# (whose minimum is this floor) decides green-kept vs red-dropped without any
+# re-inference. Anything under the floor was never produced and cannot be
+# recovered by lowering the slider — hence the slider can't go below it.
+TUNE_DETECTION_FLOOR = 0.05
+
+# Suffix -> MIME for the tuner clip endpoint. Browsers play mp4/mov/webm
+# natively; mkv/avi are served with a correct type even if a given browser
+# can't decode them.
+_VIDEO_MIME = {
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+}
 
 
 class LabelUpdate(BaseModel):
@@ -142,12 +165,43 @@ async def _event_stream(dataset_index, is_disconnected, *, sleep=asyncio.sleep, 
         yield ": ping\n\n"
 
 
-def create_app(config: Config) -> FastAPI:
+def create_app(
+    config: Config,
+    *,
+    tune_detector: object | None = None,
+    tune_pose_estimator: object | None = None,
+) -> FastAPI:
     dataset_index = DatasetIndex(config.global_settings.dataset_dir)
     dogs = list(config.global_settings.dogs)
     app = FastAPI(title="DetectivePotty", version="0.1.0")
     app.state.dataset_index = dataset_index
     app.state.dogs = dogs
+    # Tuner state. Detector/pose are built lazily on first /api/tune/frame so app
+    # creation stays cheap and offline (tests inject fakes here instead). All
+    # inference is serialized by ``tune_infer_lock`` — torch/MPS isn't reliably
+    # safe for concurrent model execution, matching the pipeline's invariant.
+    from detectivepotty.web.tune import collect_tune_models, collect_tune_roots
+
+    app.state.config = config
+    app.state.tune_roots = collect_tune_roots(config)
+    app.state.tune_default_model = config.global_settings.model_name
+    # Per-model detector cache (model string -> DogDetector), built lazily under
+    # ``tune_detector_lock``. An injected detector (tests) seeds the cache for the
+    # default model and pins the allow-list to just that model, so no scanning or
+    # real model build happens offline.
+    if tune_detector is not None:
+        app.state.tune_detectors = {app.state.tune_default_model: tune_detector}
+        app.state.tune_models = [app.state.tune_default_model]
+    else:
+        app.state.tune_detectors = {}
+        app.state.tune_models = collect_tune_models(config)
+    app.state.tune_detector_lock = threading.Lock()
+    app.state.tune_infer_lock = threading.Lock()
+    app.state.tune_pose_lock = threading.Lock()
+    # Resolved as (estimator | None, available). Seeded when a fake is injected.
+    app.state.tune_pose_resolved = (
+        (tune_pose_estimator, True) if tune_pose_estimator is not None else None
+    )
     app.add_middleware(_ApiNoStoreMiddleware)
 
     # The built Svelte app references hashed files under /assets. Mount it only
@@ -282,6 +336,247 @@ def create_app(config: Config) -> FastAPI:
             )
         except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail="label update failed") from exc
+
+    def _get_tune_detector(model_name: str | None = None):
+        """Lazily build (and cache) a tuner YOLO detector for ``model_name``.
+
+        ``model_name`` defaults to the configured model. It must be in the
+        discovered allow-list (``app.state.tune_models``) or ``ValueError`` is
+        raised (the endpoint maps that to 400), so an arbitrary model string
+        can't trigger a download or filesystem read. Returns ``(detector, name)``.
+        """
+
+        name = model_name or app.state.tune_default_model
+        if name not in app.state.tune_models:
+            raise ValueError(f"unknown model: {name}")
+        cached = app.state.tune_detectors.get(name)
+        if cached is not None:
+            return cached, name
+        with app.state.tune_detector_lock:
+            cached = app.state.tune_detectors.get(name)
+            if cached is None:
+                from detectivepotty.detect.yolo import DogDetector
+
+                cached = DogDetector(
+                    model_name=name,
+                    long_edge=config.global_settings.inference_long_edge_px,
+                    conf_threshold=TUNE_DETECTION_FLOOR,
+                    device=config.global_settings.device,
+                )
+                app.state.tune_detectors[name] = cached
+            return cached, name
+
+    def _get_tune_pose():
+        """Resolve (estimator | None, available) once and cache it on app.state."""
+
+        if app.state.tune_pose_resolved is not None:
+            return app.state.tune_pose_resolved
+        with app.state.tune_pose_lock:
+            if app.state.tune_pose_resolved is None:
+                from detectivepotty.web.tune import build_tune_pose_estimator
+
+                app.state.tune_pose_resolved = build_tune_pose_estimator(config)
+            return app.state.tune_pose_resolved
+
+    @app.get("/api/tune/files")
+    def tune_files(path: str = "") -> dict:
+        from detectivepotty.web.tune import list_tune_dir
+
+        try:
+            return list_tune_dir(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+
+    def _resolve_tune_model(model: str | None) -> str:
+        """Default + allow-list a requested model, or raise 400."""
+
+        name = model or app.state.tune_default_model
+        if name not in app.state.tune_models:
+            raise HTTPException(status_code=400, detail="unknown model")
+        return name
+
+    def _detect_payload(
+        file_path: Path,
+        index: int,
+        model_name: str,
+        want_pose: bool,
+        want_image: bool,
+    ) -> dict:
+        """Decode a frame, run detection (+optional pose), and shape the payload.
+
+        Shared by ``/api/tune/frame`` (``want_image=True`` — server-rendered JPEG,
+        kept for back-compat) and ``/api/tune/detect`` (``want_image=False`` —
+        boxes only, the cheap payload the client buffers for the async overlay).
+        Runs inside ``run_in_threadpool``; all model inference is serialized by
+        ``tune_infer_lock`` because torch/MPS isn't reliably concurrent.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        frame, idx, total, fps, width, height = tune_mod.read_frame(file_path, index)
+        detector, model_used = _get_tune_detector(model_name)
+        estimator, pose_available = _get_tune_pose()
+        with app.state.tune_infer_lock:
+            detections = detector.detect(
+                frame,
+                frame_idx=idx,
+                mono_ts=time.monotonic(),
+                wall_ts=datetime.now(timezone.utc),
+            )
+            pose_list: list = []
+            if want_pose and estimator is not None:
+                try:
+                    pose_list = tune_mod.pose_payload(
+                        estimator, frame, detections, frame_idx=idx
+                    )
+                except Exception:
+                    # find_spec said the dep exists but inference failed (missing
+                    # model files, bad install, ...). Downgrade so the UI stops
+                    # promising pose and we don't retry the heavy path every frame.
+                    logger.warning("pose inference failed; disabling pose overlay")
+                    app.state.tune_pose_resolved = (None, False)
+                    pose_available = False
+                    pose_list = []
+        payload = {
+            "path": str(file_path),
+            "index": idx,
+            "total_frames": total or None,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "model": model_used,
+            "detection_floor": TUNE_DETECTION_FLOOR,
+            "detections": tune_mod.detections_payload(detections),
+            "pose": pose_list,
+            "pose_available": pose_available,
+        }
+        if want_image:
+            payload["image"] = tune_mod.encode_jpeg_dataurl(frame)
+        return payload
+
+    @app.get("/api/tune/models")
+    def tune_models() -> dict:
+        """The model picker's allow-list: discovered weights + the configured one."""
+
+        return {
+            "models": list(app.state.tune_models),
+            "default": app.state.tune_default_model,
+        }
+
+    @app.get("/api/tune/meta")
+    def tune_meta(path: str) -> dict:
+        """Clip fps/frame-count/dimensions for index<->time mapping (no inference)."""
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        try:
+            total, fps, width, height, duration = tune_mod.read_meta(file_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="clip not available") from exc
+        return {
+            "path": str(file_path),
+            "total_frames": total or None,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "duration": duration,
+        }
+
+    @app.get("/api/tune/clip")
+    def tune_clip(path: str) -> FileResponse:
+        """Stream the raw clip for the ``<video>`` element (Range-seekable)."""
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        # FileResponse honours the Range header (206 partial content) so the
+        # <video> element can seek; no-store avoids caching a large local clip
+        # across selections.
+        return FileResponse(
+            file_path,
+            media_type=_VIDEO_MIME.get(file_path.suffix.lower(), "video/mp4"),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/tune/frame")
+    async def tune_frame(
+        path: str,
+        index: Annotated[int, Query(ge=0)] = 0,
+        pose: Annotated[int, Query(ge=0, le=1)] = 0,
+        model: str | None = None,
+    ) -> dict:
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        model_name = _resolve_tune_model(model)
+
+        try:
+            return await run_in_threadpool(
+                _detect_payload,
+                file_path,
+                index,
+                model_name,
+                bool(pose),
+                True,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.get("/api/tune/detect")
+    async def tune_detect(
+        path: str,
+        index: Annotated[int, Query(ge=0)] = 0,
+        pose: Annotated[int, Query(ge=0, le=1)] = 0,
+        model: str | None = None,
+    ) -> dict:
+        """Detections (+optional pose) for one frame — no image. The buffer source."""
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        model_name = _resolve_tune_model(model)
+
+        try:
+            return await run_in_threadpool(
+                _detect_payload,
+                file_path,
+                index,
+                model_name,
+                bool(pose),
+                False,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str) -> Response:
+        """Serve the SPA shell for client-side routes (e.g. /tune, /live).
+
+        Real ``/api/*`` routes and the ``/assets`` mount are registered earlier
+        so they win; only unknown non-API paths fall through here so a browser
+        refresh on a client route returns index.html instead of 404. API/asset
+        paths that reach here are genuinely unknown -> 404 (never HTML).
+        """
+
+        if full_path in {"api", "assets"} or full_path.startswith(("api/", "assets/")):
+            raise HTTPException(status_code=404, detail="not found")
+        built = FRONTEND_DIST / "index.html"
+        if built.is_file():
+            return FileResponse(built, headers={"Cache-Control": "no-store"})
+        return HTMLResponse(_BUILD_MISSING_HTML)
 
     return app
 

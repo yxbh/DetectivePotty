@@ -146,7 +146,7 @@ class PottyEventDetector:
 
         self._last_frame = frame
         self._last_trigger_reason = trigger_reason
-        filtered = self._filter_detections(detections)
+        filtered = self._filter_detections(detections, frame)
         if self.pose_gate is not None:
             self.pose_gate.observe(frame, filtered)
         active_tracks = self.tracker.update(list(filtered))
@@ -198,22 +198,34 @@ class PottyEventDetector:
         self._reset_window(clear_suppressed=True)
         return emitted
 
-    def _filter_detections(self, detections: Sequence[Detection]) -> list[Detection]:
+    def _filter_detections(
+        self, detections: Sequence[Detection], frame: Frame
+    ) -> list[Detection]:
         return [
             detection
             for detection in detections
             if detection.confidence >= self.camera_config.detection_conf_threshold
-            and self._point_allowed(detection.bbox.center)
+            and self._point_allowed(detection.bbox.center, frame.width, frame.height)
         ]
 
-    def _point_allowed(self, point: tuple[float, float]) -> bool:
+    def _point_allowed(self, point: tuple[float, float], width: int, height: int) -> bool:
         roi_zones = [zone for zone in self.camera_config.roi if len(zone.points) >= 3]
-        if roi_zones and not any(_point_in_zone(point, zone) for zone in roi_zones):
-            return False
         ignore_zones = [
             zone for zone in self.camera_config.ignore_zones if len(zone.points) >= 3
         ]
-        return not any(_point_in_zone(point, zone) for zone in ignore_zones)
+        if not roi_zones and not ignore_zones:
+            return True
+        if width <= 0 or height <= 0:
+            # Zones are configured but the frame size is unknown, so we cannot
+            # normalize the detection center. Fail closed rather than letting an
+            # unmeasurable frame bypass include/exclude filtering.
+            return False
+        # ``bbox.center`` is in original-resolution pixels; zone points are
+        # normalized [0.0, 1.0], so normalize the center before testing.
+        normalized = (point[0] / width, point[1] / height)
+        if roi_zones and not any(_point_in_zone(normalized, zone) for zone in roi_zones):
+            return False
+        return not any(_point_in_zone(normalized, zone) for zone in ignore_zones)
 
     def _start_window(self, frame: Frame) -> None:
         self._state = _DetectorState.WATCHING

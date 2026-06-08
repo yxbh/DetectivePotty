@@ -1,9 +1,16 @@
 global:
+  # Root directory for recorded events (clips, frames, crops, metadata.json). Gitignored.
   dataset_dir: dataset
-  model_name: yolo11m.pt
+  # Ultralytics YOLO weights used for dog detection (path or known model name).
+  model_name: models/yolo11m.pt
+  # Detection runs on frames downscaled to this long edge (YOLO imgsz); boxes are
+  # mapped back to full resolution before crops/frames are saved.
   inference_long_edge_px: 640
+  # Inference device: auto | cpu | mps | cuda.
   device: auto
+  # Logging verbosity: DEBUG | INFO | WARNING | ERROR.
   log_level: INFO
+  # Dog identities offered as manual labels in the review portal.
   dogs:
     - Gromit
     - WALL-E
@@ -40,20 +47,33 @@ protect:
 
 # `id` is the real UniFi Protect camera id (from `detectivepotty list-cameras`); the
 # pipeline resolves RTSPS streams by this id, so it must match the NVR exactly.
+#
+# Per-camera fields (shared by every entry below):
+#   id / name              - unique id (used in dataset paths) / portal display name.
+#   enabled                - false skips the camera on a run.
+#   input.kind             - protect | file | rtsp.
+#   input.path             - clip path for kind: file.
+#   input.source_id        - optional label recorded in metadata.
+#   substream_choice       - RTSPS channel low|medium|high (protect only).
+#   animal_supported       - true if the camera emits UniFi animal smart-detects.
+#   detection_conf_threshold - min YOLO confidence (0..1) to count a dog; tune with
+#                              `tune-detect`. These clips need 0.20.
+#   sample_rate_fps        - frames per second sampled for detection.
+#   pre_roll_s/post_roll_s - footage kept before/after the event (0 for file clips).
 cameras:
   # Offline no-NVR sample. Enable after placing the local Gromit pee clip at this path.
   - id: backyard-grass-file-sample
     name: Backyard Grass sample clip
-    enabled: true
+    enabled: true                 # Set false to skip this camera on a run.
     input:
-      kind: file
+      kind: file                  # protect | file | rtsp.
       path: data/unifi_direct_clip_downloads/Backyard Grass 6-6-2026, 09.10.47 GMT+10 - 6-6-2026, 09.11.03 GMT+10.mp4
-      source_id: file:backyard-grass-gromit-pee
-    substream_choice: high
-    animal_supported: false
-    detection_conf_threshold: 0.20
-    sample_rate_fps: 10.0
-    pre_roll_s: 0.0
+      source_id: file:backyard-grass-gromit-pee  # Optional label recorded in metadata.
+    substream_choice: high        # RTSPS channel (protect only); ignored for files.
+    animal_supported: false       # File clips have no live smart-detect feed.
+    detection_conf_threshold: 0.20  # Min YOLO confidence (0..1); tune with `tune-detect`.
+    sample_rate_fps: 10.0         # Frames per second sampled for detection.
+    pre_roll_s: 0.0               # Files have no live pre-roll buffer.
     post_roll_s: 0.0
 
   - id: backyard-grass-file-1946
@@ -119,6 +139,20 @@ cameras:
       kind: file
       path: data/unifi_direct_clip_downloads/Backyard Grass 6-7-2026, 09.08.21 GMT+10 - 6-7-2026, 09.09.08 GMT+10.mp4
       source_id: file:backyard-grass-0908
+    substream_choice: high
+    animal_supported: false
+    detection_conf_threshold: 0.20
+    sample_rate_fps: 10.0
+    pre_roll_s: 0.0
+    post_roll_s: 0.0
+
+  - id: backyard-grass-file-1729
+    name: Backyard Grass 17:29 clip
+    enabled: true
+    input:
+      kind: file
+      path: data/unifi_direct_clip_downloads/Backyard Grass 6-8-2026, 17.29.38 GMT+10 - 6-8-2026, 17.29.59 GMT+10.mp4
+      source_id: file:backyard-grass-1729
     substream_choice: high
     animal_supported: false
     detection_conf_threshold: 0.20

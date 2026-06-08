@@ -1,9 +1,16 @@
 global:
+  # Root directory for recorded events (clips, frames, crops, metadata.json). Gitignored.
   dataset_dir: dataset
-  model_name: yolo11m.pt
+  # Ultralytics YOLO weights used for dog detection (path or known model name).
+  model_name: models/yolo11m.pt
+  # Detection runs on frames downscaled to this long edge (YOLO imgsz); boxes are
+  # mapped back to full resolution before crops/frames are saved.
   inference_long_edge_px: 640
+  # Inference device: auto | cpu | mps | cuda.
   device: auto
+  # Logging verbosity: DEBUG | INFO | WARNING | ERROR.
   log_level: INFO
+  # Dog identities offered as manual labels in the review portal.
   dogs:
     - Gromit
     - WALL-E
@@ -44,14 +51,16 @@ cameras:
   # Offline no-NVR sample. Enable after placing the local Gromit pee clip at this path.
   - id: backyard-grass-file-sample
     name: Backyard Grass sample clip
-    enabled: true
+    enabled: true                 # Set false to skip this camera on a run.
     input:
-      kind: file
+      kind: file                  # protect | file | rtsp.
       path: data/unifi_direct_clip_downloads/Backyard Grass 6-6-2026, 09.10.47 GMT+10 - 6-6-2026, 09.11.03 GMT+10.mp4
-      source_id: file:backyard-grass-gromit-pee
-    substream_choice: high
-    animal_supported: false
+      source_id: file:backyard-grass-gromit-pee  # Optional label recorded in metadata.
+    substream_choice: high        # RTSPS channel (protect only); ignored for files.
+    animal_supported: false       # File clips have no live smart-detect feed.
+    # Minimum YOLO confidence (0..1) to count a dog. This clip needs 0.20; tune with
+    # `tune-detect`. Higher = stricter, lower = more permissive.
     detection_conf_threshold: 0.20
-    sample_rate_fps: 10.0
-    pre_roll_s: 0.0
+    sample_rate_fps: 10.0         # Frames per second sampled for detection.
+    pre_roll_s: 0.0               # Files have no live pre-roll buffer.
     post_roll_s: 0.0

@@ -46,7 +46,7 @@ For more detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 uv sync
 ```
 
-`uv sync` creates/updates `.venv` from `pyproject.toml` and `uv.lock`. YOLO weights such as `yolo11m.pt` are loaded by Ultralytics on first detector use and may be downloaded into its normal cache if not already present. Model weight files are ignored by git.
+`uv sync` creates/updates `.venv` from `pyproject.toml` and `uv.lock`. YOLO weight files live in `models/` (e.g. `models/yolo11m.pt`) and are ignored by git. They are loaded by Ultralytics on first detector use; if a configured weight is missing, Ultralytics downloads it (a bare name like `yolo11m.pt` downloads into the working directory, so prefer a `models/…` path or pre-place the file under `models/`).
 
 ### Optional: keypoint-pose backend (DeepLabCut)
 
@@ -87,7 +87,7 @@ Important fields:
 ### `global`
 
 - `dataset_dir`: root directory for recorded events.
-- `model_name`: YOLO model name/path. Default `yolo11m.pt`, chosen after sweeping the yolo11/12/26 families (n→x): it was the only off-the-shelf model consistently top-tier across day and night clips, roughly doubling night dog-detection recall over `yolo11n.pt` at negligible extra latency on MPS. Use `yolo11n.pt` for a lighter/faster model if needed.
+- `model_name`: YOLO model name/path. Default `models/yolo11m.pt`, chosen after sweeping the yolo11/12/26 families (n→x): it was the only off-the-shelf model consistently top-tier across day and night clips, roughly doubling night dog-detection recall over `yolo11n.pt` at negligible extra latency on MPS. Weight files live in `models/` (gitignored); use `models/yolo11n.pt` for a lighter/faster model if needed.
 - `inference_long_edge_px`: YOLO network input long edge, passed to ultralytics as `imgsz` (rounded/padded to a stride multiple internally). Default `640`, the model's native training size, which gives the best accuracy on our footage and the lowest latency. Raising it does **not** improve recall — it is slower and can actually *reduce* detection of small/distant dogs (the network is optimised for ~640). The frame is letterboxed by ultralytics directly; we no longer pre-resize, which previously dominated per-frame cost.
 - `device`: `auto`, `cuda`, `mps`, or `cpu`. `auto` resolves CUDA → MPS → CPU; an explicitly requested accelerator that is unavailable warns and falls back to CPU.
 - `log_level`: Python logging level.
@@ -168,6 +168,29 @@ uv run detectivepotty detect-file \
 ```
 
 This runs YOLO on every Nth frame, writes an annotated MP4, and optionally saves high-resolution dog crops.
+
+### Tune `detection_conf_threshold` interactively
+
+```bash
+# Local clip:
+uv run detectivepotty tune-detect --input "<clip>"
+
+# A camera from a config (file, rtsp, or protect):
+uv run detectivepotty tune-detect --config config.yaml --camera backyard-grass
+```
+
+Opens an OpenCV window that plays the video with **every** detected dog drawn. A
+`conf x100` slider sets the confidence threshold live: boxes at or above it render solid
+green (kept), boxes below render dim red (dropped). Detection runs at a low `--floor`
+(default `0.05`) so borderline boxes stay visible — the slider only re-colors them, it does
+not re-run inference, so dragging it is instant. The chosen threshold is printed on exit so
+you can paste it into the camera's `detection_conf_threshold`.
+
+Keys: `space` play/pause · `n`/`→` step forward · `p`/`←` step back (file only) · `r`
+restart (file only) · `q`/`Esc` quit. Live RTSP/Protect streams are play-only (no
+step-back or restart). Useful options: `--conf` (initial slider value), `--floor`,
+`--model`, `--long-edge`, `--every-n` (run detection every N played frames for smoother
+playback). The window needs a desktop session (it uses `cv2.imshow`).
 
 ### Run the pipeline
 

@@ -4,6 +4,11 @@ import type {
   EventSummary,
   EventsPage,
   LabelPayload,
+  TuneDetectResult,
+  TuneFrame,
+  TuneListing,
+  TuneMeta,
+  TuneModelList,
 } from "./types";
 
 const EVENTS_LIMIT = 200;
@@ -96,4 +101,67 @@ export function versioned(url: string | null | undefined, version: number): stri
   }
   const separator = url.includes("?") ? "&" : "?";
   return `${url}${separator}v=${version}`;
+}
+
+// --- Detection tuner (/tune) ---------------------------------------------
+
+export async function fetchTuneFiles(path: string): Promise<TuneListing> {
+  const params = new URLSearchParams();
+  if (path) {
+    params.set("path", path);
+  }
+  const response = await fetch(`/api/tune/files?${params.toString()}`);
+  return jsonOrThrow<TuneListing>(response);
+}
+
+export async function fetchTuneFrame(
+  path: string,
+  index: number,
+  pose: boolean,
+  signal?: AbortSignal,
+): Promise<TuneFrame> {
+  const params = new URLSearchParams({
+    path,
+    index: String(index),
+    pose: pose ? "1" : "0",
+  });
+  const response = await fetch(`/api/tune/frame?${params.toString()}`, { signal });
+  return jsonOrThrow<TuneFrame>(response);
+}
+
+export async function fetchTuneModels(): Promise<TuneModelList> {
+  const response = await fetch("/api/tune/models");
+  return jsonOrThrow<TuneModelList>(response);
+}
+
+export async function fetchTuneMeta(
+  path: string,
+  signal?: AbortSignal,
+): Promise<TuneMeta> {
+  const params = new URLSearchParams({ path });
+  const response = await fetch(`/api/tune/meta?${params.toString()}`, { signal });
+  return jsonOrThrow<TuneMeta>(response);
+}
+
+export async function fetchTuneDetect(
+  path: string,
+  index: number,
+  model: string,
+  pose: boolean,
+  signal?: AbortSignal,
+): Promise<TuneDetectResult> {
+  const params = new URLSearchParams({
+    path,
+    index: String(index),
+    model,
+    pose: pose ? "1" : "0",
+  });
+  const response = await fetch(`/api/tune/detect?${params.toString()}`, { signal });
+  return jsonOrThrow<TuneDetectResult>(response);
+}
+
+/** URL for the raw clip the <video> element streams (Range-seekable). */
+export function tuneClipUrl(path: string): string {
+  const params = new URLSearchParams({ path });
+  return `/api/tune/clip?${params.toString()}`;
 }

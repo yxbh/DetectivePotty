@@ -1,9 +1,16 @@
 global:
+  # Root directory for recorded events (clips, frames, crops, metadata.json). Gitignored.
   dataset_dir: dataset
-  model_name: yolo11m.pt
+  # Ultralytics YOLO weights used for dog detection (path or known model name).
+  model_name: models/yolo11m.pt
+  # Detection runs on frames downscaled to this long edge (YOLO imgsz); boxes are
+  # mapped back to full resolution before crops/frames are saved.
   inference_long_edge_px: 640
+  # Inference device: auto | cpu | mps | cuda.
   device: auto
+  # Logging verbosity: DEBUG | INFO | WARNING | ERROR.
   log_level: INFO
+  # Dog identities offered as manual labels in the review portal.
   dogs:
     - Gromit
     - WALL-E
@@ -45,29 +52,25 @@ cameras:
   # Only the high RTSPS stream is published on the NVR, so substream_choice must be high.
   - id: 6695ef21030c4603e400040d
     name: Backyard Grass
-    enabled: true
+    enabled: true                 # Set false to skip this camera on a run.
     input:
-      kind: protect
-      source_id: unifi-protect:backyard-grass
-    substream_choice: high
-    animal_supported: true
-    roi:
-      - name: lawn
-        points:
-          - [0.0, 0.2]
-          - [1.0, 0.2]
-          - [1.0, 1.0]
-          - [0.0, 1.0]
-    ignore_zones: []
+      kind: protect               # protect | file | rtsp.
+      source_id: unifi-protect:backyard-grass  # Optional label recorded in metadata.
+    substream_choice: high        # RTSPS channel: low | medium | high (protect only).
+    animal_supported: true        # Camera emits UniFi animal smart-detects.
+    roi: []                       # Keep-only polygons (normalized [0..1]); empty = whole frame.
+    ignore_zones: []              # Drop detections centered in these (normalized [0..1]).
+    # Min YOLO confidence (0..1) to count a dog. Higher = stricter, lower = more
+    # permissive. Tune with `tune-detect`.
     detection_conf_threshold: 0.25
-    event_duration_s: 8.0
-    stationary_threshold_s: 2.0
-    squat_threshold: 0.35
-    sample_rate_fps: 5.0
-    pre_roll_s: 15.0
-    post_roll_s: 30.0
-    retention_days: 30
-    retention_max_gb: 200.0
+    event_duration_s: 8.0         # Target length of a recorded event window (seconds).
+    stationary_threshold_s: 2.0   # Dog must hold still this long to start a candidate.
+    squat_threshold: 0.35         # Posture "squatness" (0..1) that flags a potty pose.
+    sample_rate_fps: 5.0          # Frames per second sampled for detection.
+    pre_roll_s: 15.0              # Seconds of footage kept before the event start.
+    post_roll_s: 30.0             # Seconds of footage kept after the event end.
+    retention_days: 30            # Delete events older than this many days.
+    retention_max_gb: 200.0       # Cap on this camera's on-disk events (GB); null = no cap.
 
   # Pool (Protect id 66ff1c1a00c53803e400d2ec).
   # This is a third-party Dahua ONVIF camera adopted into the NVR. UniFi Protect's
@@ -81,17 +84,17 @@ cameras:
     enabled: true
     input:
       kind: rtsp
-      url_env: DETECTIVEPOTTY_POOL_RTSP_URL
-      source_id: dahua-onvif:pool
-    animal_supported: false
-    roi: []
-    ignore_zones: []
-    detection_conf_threshold: 0.25
-    event_duration_s: 8.0
-    stationary_threshold_s: 2.0
-    squat_threshold: 0.35
-    sample_rate_fps: 5.0
-    pre_roll_s: 15.0
-    post_roll_s: 30.0
-    retention_days: 30
-    retention_max_gb: 200.0
+      url_env: DETECTIVEPOTTY_POOL_RTSP_URL  # Env var holding the full RTSP URL.
+      source_id: dahua-onvif:pool            # Optional label recorded in metadata.
+    animal_supported: false       # No UniFi smart-detect; potty events rely on the YOLO trigger.
+    roi: []                       # Keep-only polygons (normalized [0..1]); empty = whole frame.
+    ignore_zones: []              # Drop detections centered in these (normalized [0..1]).
+    detection_conf_threshold: 0.25  # Min YOLO confidence (0..1); tune with `tune-detect`.
+    event_duration_s: 8.0         # Target length of a recorded event window (seconds).
+    stationary_threshold_s: 2.0   # Dog must hold still this long to start a candidate.
+    squat_threshold: 0.35         # Posture "squatness" (0..1) that flags a potty pose.
+    sample_rate_fps: 5.0          # Frames per second sampled for detection.
+    pre_roll_s: 15.0              # Seconds of footage kept before the event start.
+    post_roll_s: 30.0             # Seconds of footage kept after the event end.
+    retention_days: 30            # Delete events older than this many days.
+    retention_max_gb: 200.0       # Cap on this camera's on-disk events (GB); null = no cap.

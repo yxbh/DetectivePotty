@@ -56,6 +56,16 @@
     scopeKey: string;
     detections: TuneDetection[];
     pose: TunePose[];
+    // Whether this entry was fetched with pose=1. Box detections are valid for
+    // the (clip, model) scope regardless of overlay mode; pose is layered on
+    // only when wanted, so toggling boxes<->pose never discards boxes.
+    posed: boolean;
+  }
+
+  interface ZoomCard {
+    det: TuneDetection;
+    pose: TunePose | null;
+    kept: boolean;
   }
 
   const hasRvfc =
@@ -89,6 +99,24 @@
   let videoEl = $state<HTMLVideoElement | null>(null);
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let stripEl = $state<HTMLCanvasElement | null>(null);
+  // Per-detection zoom-crop canvases, indexed alongside `zoomCards`.
+  let zoomCanvases: HTMLCanvasElement[] = [];
+  let showZoom = $state(true);
+
+  // Scrub state. `scrubbing` is true while the pointer drags the native range;
+  // `scrubIndex` is the live drag target (drives the thumb instantly, decoupled
+  // from the slower video seek). `pendingDisplayIndex` holds the thumb at a
+  // committed seek target until the video actually paints it (no snap-back).
+  let scrubbing = $state(false);
+  let scrubIndex = $state(0);
+  let pendingDisplayIndex = $state<number | null>(null);
+
+  // Coalesced seeking: at most one seek in flight, always converging on the
+  // latest requested target so a fast drag can't pile up dozens of seeks.
+  let seekPendingTime: number | null = null;
+  let seekPendingPrecise = false;
+  let seekBusy = false;
+  let seekWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   // The scope-valid detections/pose for the currently presented frame. Kept as
   // reactive state (the `buffer` Map itself is non-reactive) so the draw effect
@@ -117,6 +145,23 @@
   );
   const belowCount = $derived(frameDetections.length - aboveCount);
 
+  // The frame the scrub thumb should show. While dragging it follows the live
+  // drag target; after a committed seek it holds the requested frame until the
+  // video paints it; otherwise it tracks the actually-presented frame (so
+  // playback and stepping move the thumb). The overlay still always draws
+  // `presentedIndex` — only the thumb uses this.
+  const displayIndex = $derived(
+    scrubbing
+      ? scrubIndex
+      : pendingDisplayIndex !== null
+        ? pendingDisplayIndex
+        : presentedIndex,
+  );
+
+  // Per-detection zoom cards for the presented frame (highest confidence first,
+  // capped). Each carries the best-matching pose (by box IoU) for its crop.
+  const zoomCards = $derived(buildZoomCards(frameDetections, framePose, threshold));
+
   void loadListing("");
   void loadModels();
 
@@ -139,8 +184,11 @@
     return overlayMode !== "boxes";
   }
 
+  // Scope is (clip, model) only — NOT overlay mode. Box detections don't change
+  // when the user toggles the pose overlay, so the buffer stays valid and pose
+  // is filled in additively (see `frameComplete`), never rebuffering on toggle.
   function currentScopeKey(): string {
-    return `${selectedPath}|${selectedModel}|${poseWanted() ? 1 : 0}`;
+    return `${selectedPath}|${selectedModel}`;
   }
 
   // --- listing + models -----------------------------------------------------
@@ -204,12 +252,28 @@
     intendedIndex = 0;
     presentedIndex = 0;
     playing = false;
+    resetSeekState();
     scopeToken++;
     buffer.clear();
     bufferedCount = 0;
     // Setting selectedPath renders the <video> with the new src; onLoadedMetadata
     // then seeks to frame 0, registers rVFC, and starts the filler.
     selectedPath = path;
+  }
+
+  // Drop any in-flight/queued seek bookkeeping so a new clip doesn't inherit a
+  // stale "busy" flag (which would otherwise wedge future seeks).
+  function resetSeekState(): void {
+    seekPendingTime = null;
+    seekPendingPrecise = false;
+    seekBusy = false;
+    if (seekWatchdog !== null) {
+      clearTimeout(seekWatchdog);
+      seekWatchdog = null;
+    }
+    scrubbing = false;
+    scrubIndex = 0;
+    pendingDisplayIndex = null;
   }
 
   function teardownClip(): void {
@@ -221,6 +285,7 @@
     inFlight.clear();
     buffer.clear();
     bufferedCount = 0;
+    resetSeekState();
     if (videoEl) {
       try {
         videoEl.pause();
@@ -279,6 +344,7 @@
       0,
       Math.max(0, totalFrames - 1),
     );
+    onPresented();
     syncView();
     pump();
     rvfcHandle = videoEl.requestVideoFrameCallback(frameCb);
@@ -295,8 +361,22 @@
       0,
       Math.max(0, totalFrames - 1),
     );
+    onPresented();
     syncView();
     pump();
+  }
+
+  // Called whenever a new frame is actually presented (rVFC or fallback). Keeps
+  // the paused filler anchor (`intendedIndex`) tracking the on-screen frame
+  // during playback, and releases the scrub-thumb hold once the video catches
+  // up to a committed seek target.
+  function onPresented(): void {
+    if (playing) {
+      intendedIndex = presentedIndex;
+    }
+    if (pendingDisplayIndex !== null && presentedIndex === pendingDisplayIndex) {
+      pendingDisplayIndex = null;
+    }
   }
 
   // Pull the presented frame's scope-valid detections/pose out of the buffer into
@@ -306,7 +386,9 @@
     const entry = buffer.get(presentedIndex);
     if (entry && entry.scopeKey === currentScopeKey()) {
       frameDetections = entry.detections;
-      framePose = entry.pose;
+      // Show pose (in both the main overlay and the zoom crops) only when the
+      // overlay wants it; in boxes mode the zoom still shows enlarged crops.
+      framePose = entry.posed && poseWanted() ? entry.pose : [];
     } else {
       frameDetections = [];
       framePose = [];
@@ -315,17 +397,85 @@
 
   // --- transport ------------------------------------------------------------
 
-  function seekToIndex(target: number): void {
+  // Request a seek to a frame index. `precise` true lands exactly on the frame
+  // (stepping, click, the final landing after a drag); `precise` false allows an
+  // approximate fast preview (mid-drag) where supported. Seeks are coalesced:
+  // only one is ever in flight and we always converge on the latest target, so a
+  // fast drag can't queue dozens of seeks.
+  function requestSeek(target: number, precise: boolean): void {
     if (!videoEl || !meta || totalFrames <= 0) {
       return;
     }
     const next = clamp(target, 0, totalFrames - 1);
     intendedIndex = next;
+    if (precise) {
+      // Hold the thumb at the committed target until the video paints it.
+      pendingDisplayIndex = next;
+    }
+    seekPendingTime = (next + 0.5) / fps;
+    seekPendingPrecise = precise;
+    if (!seekBusy) {
+      issueSeek();
+    }
+  }
+
+  function issueSeek(): void {
+    if (seekPendingTime === null || !videoEl) {
+      return;
+    }
+    const t = seekPendingTime;
+    const precise = seekPendingPrecise;
+    seekPendingTime = null;
+    seekBusy = true;
+    // Pause synchronously (not just videoEl.pause(), whose onpause is async) so
+    // the immediate pump() below uses the paused filler anchor (intendedIndex),
+    // not the stale playing anchor.
     if (playing) {
+      playing = false;
       videoEl.pause();
     }
-    videoEl.currentTime = (next + 0.5) / fps;
+    if (!precise && typeof videoEl.fastSeek === "function") {
+      videoEl.fastSeek(t);
+    } else {
+      videoEl.currentTime = t;
+    }
+    armSeekWatchdog();
     pump();
+  }
+
+  // Defensive: some browsers may not fire `seeked` (e.g. seeking to ~the current
+  // time, or a torn-down element). If one is dropped, don't wedge `seekBusy`.
+  function armSeekWatchdog(): void {
+    if (seekWatchdog !== null) {
+      clearTimeout(seekWatchdog);
+    }
+    seekWatchdog = setTimeout(() => {
+      seekWatchdog = null;
+      if (seekBusy) {
+        seekBusy = false;
+        if (seekPendingTime !== null) {
+          issueSeek();
+        }
+      }
+    }, 500);
+  }
+
+  function onVideoSeeked(): void {
+    if (seekWatchdog !== null) {
+      clearTimeout(seekWatchdog);
+      seekWatchdog = null;
+    }
+    if (seekBusy) {
+      seekBusy = false;
+      if (seekPendingTime !== null) {
+        issueSeek();
+      }
+    }
+    syncFromCurrentTime();
+  }
+
+  function seekToIndex(target: number): void {
+    requestSeek(target, true);
   }
 
   function step(delta: number): void {
@@ -347,17 +497,58 @@
 
   function onPlay(): void {
     playing = true;
+    // Playback supersedes any held scrub target.
+    pendingDisplayIndex = null;
     pump();
   }
 
   function onPause(): void {
     playing = false;
+    // Once paused, the paused filler anchors at the visible frame.
+    intendedIndex = presentedIndex;
     pump();
   }
 
-  function onScrub(event: Event): void {
-    const value = Number((event.currentTarget as HTMLInputElement).value);
-    seekToIndex(value);
+  // --- native scrub bar -----------------------------------------------------
+  // The scrub bar is a native <input type=range> (its thumb drags fluidly for
+  // free, decoupled from the slower video seek) over a separate "analyzed" strip
+  // canvas. Both share the same value->position mapping (idx / (total-1)) and the
+  // strip is inset by half the thumb width (CSS), so thumb and strip line up at
+  // every position, including the ends.
+  function onSeekPointerDown(): void {
+    if (totalFrames <= 0) {
+      return;
+    }
+    scrubbing = true;
+    scrubIndex = displayIndex;
+  }
+
+  function onSeekInput(event: Event): void {
+    if (totalFrames <= 0) {
+      return;
+    }
+    const value = clamp(
+      Math.round(Number((event.currentTarget as HTMLInputElement).value)),
+      0,
+      totalFrames - 1,
+    );
+    scrubIndex = value;
+    if (scrubbing) {
+      // Live drag: cheap approximate preview, thumb already follows scrubIndex.
+      requestSeek(value, false);
+    } else {
+      // Keyboard / discrete change (Home/End/PageUp/Down): precise landing.
+      requestSeek(value, true);
+    }
+  }
+
+  function onSeekCommit(): void {
+    if (!scrubbing) {
+      return;
+    }
+    scrubbing = false;
+    // Land exactly on the released frame.
+    requestSeek(scrubIndex, true);
   }
 
   function setModel(value: string): void {
@@ -370,13 +561,13 @@
     if (mode === overlayMode) {
       return;
     }
-    const wasPose = poseWanted();
     overlayMode = mode;
-    if (poseWanted() !== wasPose) {
-      resetScope(); // pose payload differs -> the buffer must be rebuilt
-    } else {
-      syncView();
-    }
+    // No buffer reset: box detections are already valid for this (clip, model)
+    // scope. Toggling the overlay only changes whether pose is *also*
+    // fetched/drawn; syncView re-reads the current frame and pump() tops up any
+    // missing pose additively, so boxes never re-analyze from scratch.
+    syncView();
+    pump();
   }
 
   // Invalidate + rebuild the detection buffer after a model/pose change.
@@ -423,9 +614,20 @@
     }
   }
 
+  // A frame is "complete" once we hold a scope-valid entry for it that also
+  // carries pose when the current overlay wants pose. This lets a boxes->pose
+  // switch re-enrich existing entries with pose instead of refetching boxes.
+  function frameComplete(idx: number): boolean {
+    const entry = buffer.get(idx);
+    if (!entry || entry.scopeKey !== currentScopeKey()) {
+      return false;
+    }
+    return entry.posed || !poseWanted();
+  }
+
   function nextNeeded(): number | null {
     for (const idx of candidateOrder()) {
-      if (!buffer.has(idx) && !inFlight.has(idx)) {
+      if (!inFlight.has(idx) && !frameComplete(idx)) {
         return idx;
       }
     }
@@ -468,6 +670,7 @@
         scopeKey,
         detections: res.detections,
         pose: res.pose,
+        posed: pose,
       });
       bufferedCount = buffer.size;
       if (res.index === presentedIndex) {
@@ -504,6 +707,17 @@
     void presentedIndex;
     void totalFrames;
     updateStrip();
+  });
+
+  // Redraw the per-detection zoom crops when the frame, detections, pose, or
+  // threshold change. Cheap: a few small drawImage() pulls from the <video>.
+  $effect(() => {
+    void zoomCards;
+    void presentedIndex;
+    void showZoom;
+    if (showZoom) {
+      drawZoom();
+    }
   });
 
   function drawOverlay(): void {
@@ -576,8 +790,11 @@
     }
   }
 
-  // The "analyzed" strip under the scrub bar: which frames have detections yet,
-  // plus a playhead marker.
+  // The "analyzed" strip under the scrub bar: which frames have detections
+  // buffered yet. It's a separate canvas inset (in CSS) by half the range thumb
+  // width and uses the SAME value->position mapping as the native range —
+  // idx / (total - 1) across the canvas width — so a buffered column sits exactly
+  // under the thumb for that frame, at every position including the two ends.
   function updateStrip(): void {
     const c = stripEl;
     if (!c || totalFrames <= 0) {
@@ -594,17 +811,154 @@
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "#23303f";
     ctx.fillRect(0, 0, w, h);
+    const span = Math.max(1, totalFrames - 1);
     const colW = Math.max(1, Math.ceil(w / totalFrames));
     ctx.fillStyle = "#3f7d5a";
     const key = currentScopeKey();
     for (const [idx, entry] of buffer) {
       if (entry.scopeKey !== key) continue;
-      const x = Math.floor((idx / totalFrames) * w);
+      const x = Math.min(w - colW, Math.floor((idx / span) * w));
       ctx.fillRect(x, 0, colW, h);
     }
-    ctx.fillStyle = "#f0b35a";
-    const px = Math.floor((presentedIndex / totalFrames) * w);
-    ctx.fillRect(px, 0, 2, h);
+  }
+
+  // --- zoom crops -----------------------------------------------------------
+
+  const ZOOM_TARGET = 220; // longest-side px of a zoom crop
+
+  function boxIou(a: TuneDetection, b: number[]): number {
+    const ix1 = Math.max(a.x1, b[0]);
+    const iy1 = Math.max(a.y1, b[1]);
+    const ix2 = Math.min(a.x2, b[2]);
+    const iy2 = Math.min(a.y2, b[3]);
+    const iw = Math.max(0, ix2 - ix1);
+    const ih = Math.max(0, iy2 - iy1);
+    const inter = iw * ih;
+    if (inter <= 0) {
+      return 0;
+    }
+    const areaA = Math.max(0, a.x2 - a.x1) * Math.max(0, a.y2 - a.y1);
+    const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+    const union = areaA + areaB - inter;
+    return union > 0 ? inter / union : 0;
+  }
+
+  // Pose payloads are 1:1 with detection boxes server-side (each pose carries
+  // the detector bbox), so the best IoU match recovers the dog for a crop.
+  function matchPose(det: TuneDetection, poses: TunePose[]): TunePose | null {
+    let best: TunePose | null = null;
+    let bestIou = 0.1; // require a little overlap to associate
+    for (const pose of poses) {
+      if (!pose.bbox || pose.bbox.length < 4) {
+        continue;
+      }
+      const score = boxIou(det, pose.bbox);
+      if (score > bestIou) {
+        bestIou = score;
+        best = pose;
+      }
+    }
+    return best;
+  }
+
+  function buildZoomCards(
+    dets: TuneDetection[],
+    poses: TunePose[],
+    thr: number,
+  ): ZoomCard[] {
+    return dets
+      .map((det) => ({
+        det,
+        pose: matchPose(det, poses),
+        kept: det.confidence >= thr,
+      }))
+      .sort((a, b) => b.det.confidence - a.det.confidence)
+      .slice(0, 8);
+  }
+
+  function drawZoom(): void {
+    if (!videoEl || !meta) {
+      return;
+    }
+    for (let i = 0; i < zoomCards.length; i++) {
+      const canvas = zoomCanvases[i];
+      if (canvas) {
+        drawZoomCard(canvas, zoomCards[i]);
+      }
+    }
+  }
+
+  function drawZoomCard(canvas: HTMLCanvasElement, card: ZoomCard): void {
+    if (!videoEl || !meta) {
+      return;
+    }
+    const fw = meta.width;
+    const fh = meta.height;
+    const det = card.det;
+    // Pad the crop so keypoints near the box edge stay visible.
+    const padX = (det.x2 - det.x1) * 0.12;
+    const padY = (det.y2 - det.y1) * 0.12;
+    const sx = clamp(det.x1 - padX, 0, fw);
+    const sy = clamp(det.y1 - padY, 0, fh);
+    const sw = Math.max(1, clamp(det.x2 + padX, 0, fw) - sx);
+    const sh = Math.max(1, clamp(det.y2 + padY, 0, fh) - sy);
+    const scale = clamp(ZOOM_TARGET / Math.max(sw, sh), 0.1, 8);
+    const cw = Math.max(1, Math.round(sw * scale));
+    const ch = Math.max(1, Math.round(sh * scale));
+    if (canvas.width !== cw) canvas.width = cw;
+    if (canvas.height !== ch) canvas.height = ch;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+    ctx.clearRect(0, 0, cw, ch);
+    try {
+      ctx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, cw, ch);
+    } catch {
+      return; // video not sampleable this tick
+    }
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = card.kept ? "#28d17c" : "#e0556b";
+    ctx.strokeRect(
+      (det.x1 - sx) * scale,
+      (det.y1 - sy) * scale,
+      (det.x2 - det.x1) * scale,
+      (det.y2 - det.y1) * scale,
+    );
+    if (card.pose) {
+      drawPoseScaled(ctx, card.pose, sx, sy, scale);
+    }
+  }
+
+  // Like drawPose, but offset+scaled into a zoom-crop canvas with fixed
+  // card-space dot/line sizes so points read clearly even for tiny boxes.
+  function drawPoseScaled(
+    ctx: CanvasRenderingContext2D,
+    pose: TunePose,
+    sx: number,
+    sy: number,
+    scale: number,
+  ): void {
+    const byName = new Map(pose.keypoints.map((kp) => [kp.name, kp]));
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "#5ad1ff";
+    for (const [a, b] of POSE_EDGES) {
+      const pa = byName.get(a);
+      const pb = byName.get(b);
+      if (!pa || !pb) {
+        continue;
+      }
+      ctx.beginPath();
+      ctx.moveTo((pa.x - sx) * scale, (pa.y - sy) * scale);
+      ctx.lineTo((pb.x - sx) * scale, (pb.y - sy) * scale);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "#ffd166";
+    for (const kp of pose.keypoints) {
+      ctx.beginPath();
+      ctx.arc((kp.x - sx) * scale, (kp.y - sy) * scale, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   function onKey(event: KeyboardEvent): void {
@@ -643,7 +997,7 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="tune">
+<div class="tune" class:has-zoom={selectedPath && showZoom && zoomCards.length > 0}>
   <aside class="browser">
     <div class="browser-head">
       <span class="eyebrow mono">CLIPS</span>
@@ -707,7 +1061,7 @@
             onplay={onPlay}
             onpause={onPause}
             onended={onPause}
-            onseeked={syncFromCurrentTime}
+            onseeked={onVideoSeeked}
             ontimeupdate={syncFromCurrentTime}
           ></video>
           <canvas bind:this={canvasEl}></canvas>
@@ -718,7 +1072,7 @@
 
         <div class="hud mono">
           <span class="clip" title={selectedPath}>{selectedName}</span>
-          <span>frame {presentedIndex}{totalFrames ? ` / ${totalFrames - 1}` : ""}</span>
+          <span>frame {displayIndex}{totalFrames ? ` / ${totalFrames - 1}` : ""}</span>
           {#if meta}<span>{fps.toFixed(1)} fps</span>{/if}
           <span class="kept">▣ {aboveCount}</span>
           <span class="dropped">▢ {belowCount}</span>
@@ -732,11 +1086,18 @@
             min="0"
             max={Math.max(0, totalFrames - 1)}
             step="1"
-            value={presentedIndex}
-            oninput={onScrub}
+            value={displayIndex}
+            disabled={totalFrames <= 0}
             aria-label="Timeline"
+            onpointerdown={onSeekPointerDown}
+            oninput={onSeekInput}
+            onpointerup={onSeekCommit}
+            onpointercancel={onSeekCommit}
+            onchange={onSeekCommit}
           />
-          <canvas bind:this={stripEl} class="strip"></canvas>
+          <div class="strip-wrap">
+            <canvas bind:this={stripEl} class="strip"></canvas>
+          </div>
         </div>
 
         <div class="controls">
@@ -787,6 +1148,16 @@
               </button>
             {/each}
           </div>
+
+          <button
+            type="button"
+            class="zoom-toggle"
+            class:active={showZoom}
+            onclick={() => (showZoom = !showZoom)}
+            title="Show zoomed crops of each detection"
+          >
+            ⛶ zoom
+          </button>
         </div>
 
         {#if overlayMode !== "boxes" && !poseAvailable}
@@ -798,17 +1169,94 @@
       </div>
     {/if}
   </section>
+
+  {#if selectedPath && showZoom && zoomCards.length > 0}
+    <aside class="zoom-col">
+      <div class="zoom-head">
+        <span class="eyebrow">DETECTIONS</span>
+        <span class="mono muted small">{zoomCards.length}</span>
+      </div>
+      <div class="zoom">
+        {#each zoomCards as card, i (card.det.x1 + ":" + card.det.y1 + ":" + i)}
+          <figure class="zoom-card" class:dropped={!card.kept}>
+            <canvas bind:this={zoomCanvases[i]}></canvas>
+            <figcaption class="mono">
+              {card.det.class_name}
+              {card.det.confidence.toFixed(2)}{card.pose ? " · pose" : ""}
+            </figcaption>
+          </figure>
+        {/each}
+      </div>
+    </aside>
+  {/if}
 </div>
 
 <style>
   .tune {
     display: grid;
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: 280px minmax(0, 1fr);
+    grid-template-areas: "browser stage";
     gap: 1rem;
     min-height: 0;
     height: 100%;
     padding: 1rem 1.25rem;
     box-sizing: border-box;
+  }
+
+  /* Wide + zoom on: file list | player | zoom column (crops stack down). */
+  .tune.has-zoom {
+    grid-template-columns: 260px minmax(0, 1fr) 320px;
+    grid-template-areas: "browser stage zoom";
+  }
+
+  .browser {
+    grid-area: browser;
+  }
+
+  .stage {
+    grid-area: stage;
+  }
+
+  .zoom-col {
+    grid-area: zoom;
+  }
+
+  /* Medium: drop the zoom to a full-width row beneath the player (crops wrap). */
+  @media (max-width: 1280px) {
+    .tune.has-zoom {
+      grid-template-columns: 260px minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) auto;
+      grid-template-areas:
+        "browser stage"
+        "zoom zoom";
+    }
+
+    .tune.has-zoom .zoom-col {
+      max-height: 32vh;
+    }
+
+    .tune.has-zoom .zoom {
+      flex-direction: row;
+      flex-wrap: wrap;
+      align-items: flex-start;
+    }
+
+    .tune.has-zoom .zoom-card {
+      width: 200px;
+    }
+  }
+
+  /* Narrow: single-column stack (file list, player, zoom). */
+  @media (max-width: 860px) {
+    .tune,
+    .tune.has-zoom {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      grid-template-areas:
+        "browser"
+        "stage"
+        "zoom";
+    }
   }
 
   .browser {
@@ -950,21 +1398,82 @@
   }
 
   .scrub {
+    /* Single source of truth for the thumb width: the native range thumb and
+       the analyzed-strip inset both derive from it, so they stay aligned. */
+    --seek-thumb-w: 14px;
+    --seek-track-h: 6px;
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
+    gap: 4px;
   }
 
-  .scrub .seek {
+  .seek {
+    -webkit-appearance: none;
+    appearance: none;
     width: 100%;
+    height: var(--seek-thumb-w);
     margin: 0;
+    background: transparent;
+    cursor: pointer;
   }
 
-  .scrub .strip {
+  .seek:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+
+  .seek::-webkit-slider-runnable-track {
+    height: var(--seek-track-h);
+    border-radius: 3px;
+    background: var(--line-strong, #324056);
+  }
+
+  .seek::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    box-sizing: border-box;
+    width: var(--seek-thumb-w);
+    height: var(--seek-thumb-w);
+    border: none;
+    border-radius: 50%;
+    background: var(--amber, #f0b35a);
+    /* Centre the thumb vertically on the track. */
+    margin-top: calc((var(--seek-track-h) - var(--seek-thumb-w)) / 2);
+  }
+
+  .seek::-moz-range-track {
+    height: var(--seek-track-h);
+    border-radius: 3px;
+    background: var(--line-strong, #324056);
+  }
+
+  .seek::-moz-range-thumb {
+    box-sizing: border-box;
+    width: var(--seek-thumb-w);
+    height: var(--seek-thumb-w);
+    border: none;
+    border-radius: 50%;
+    background: var(--amber, #f0b35a);
+  }
+
+  .seek:focus-visible {
+    outline: 2px solid var(--accent, #3f7d5a);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+
+  /* Inset by half the thumb width so the strip's [0..width] spans exactly the
+     thumb's centre-travel range; the strip then uses idx/(total-1) like the
+     range, lining up at every position including both ends. */
+  .strip-wrap {
+    padding-inline: calc(var(--seek-thumb-w) / 2);
+  }
+
+  .strip-wrap .strip {
+    display: block;
     width: 100%;
     height: 8px;
     border-radius: 3px;
-    display: block;
   }
 
   .model {
@@ -1087,6 +1596,86 @@
   .overlay-toggle button.active {
     background: var(--accent-dim, #1d3346);
     color: #fff;
+  }
+
+  .zoom-toggle {
+    background: var(--bg-1, #141a24);
+    border: 1px solid var(--line-strong, #324056);
+    color: var(--muted, #8a97a8);
+    border-radius: 6px;
+    padding: 0.3rem 0.7rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+  }
+
+  .zoom-toggle.active {
+    background: var(--accent-dim, #1d3346);
+    color: #fff;
+  }
+
+  .zoom-col {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border: 1px solid var(--line, #243042);
+    border-radius: 10px;
+    background: var(--bg-1, #141a24);
+    overflow: hidden;
+  }
+
+  .zoom-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid var(--line, #243042);
+  }
+
+  .zoom-head .eyebrow {
+    font-size: 0.62rem;
+    letter-spacing: 0.08em;
+    color: var(--muted, #8a97a8);
+  }
+
+  /* Wide: crops stack vertically down the column. */
+  .zoom {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    gap: 0.6rem;
+    align-items: stretch;
+    overflow-y: auto;
+    min-height: 0;
+    padding: 0.6rem;
+  }
+
+  .zoom-card {
+    margin: 0;
+    border: 2px solid #28d17c;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .zoom-card.dropped {
+    border-color: #e0556b;
+  }
+
+  .zoom-card canvas {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+  }
+
+  .zoom-card figcaption {
+    font-size: 0.66rem;
+    color: var(--text, #d8e0ec);
+    padding: 0.2rem 0.4rem;
+    background: var(--bg-1, #141a24);
+    white-space: nowrap;
   }
 
   .muted {

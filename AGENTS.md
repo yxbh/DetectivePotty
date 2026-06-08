@@ -15,13 +15,34 @@ human-label each event `pee` / `poop` / `not_potty` / `unknown`. The v0 pee-vs-p
 
 - **Toolchain:** [`uv`](https://docs.astral.sh/uv/), Python **3.12 only** (`>=3.12,<3.13`).
 - **Install:** `uv sync` (detection/core). Pose backend is opt-in: `uv sync --extra pose`.
-- **Test:** `uv run pytest -q` — fully offline, no GPU/model/network.
+- **Test:** `uv run pytest -q` — fully offline, no GPU/model/network. Single test:
+  `uv run pytest tests/test_pipeline.py -q` or `uv run pytest -k name -q`.
 - **Lint:** `uv run ruff check src/ tests/`.
 - **Run anything via `uv run`** (e.g. `uv run detectivepotty run --config config.yaml`,
   `uv run detectivepotty serve --config config.yaml`, `uv run detectivepotty detect-file ...`).
   Full CLI usage is in [`README.md`](README.md).
+- **Loading secrets:** the usual `set -a; source .env; set +a` before `uv run`. **Quote** `.env`
+  values containing shell metacharacters (e.g. `&` in an RTSP URL) — unquoted, `source` treats `&`
+  as "run in background" and the var ends up empty. Suspect this first when a credential/stream
+  isn't being picked up.
 
 Always run **ruff + the full suite** and confirm both are clean before calling a change done.
+
+## Frontend (Svelte review portal)
+
+The review UI is a Svelte 5 + Vite + TypeScript app in `src/detectivepotty/web/frontend/` (the old
+vanilla-JS `web/static/` portal is gone). Two non-obvious gotchas — full dev loop is in
+[`README.md`](README.md#frontend):
+
+- `serve` serves the **prebuilt** `web/frontend/dist/` bundle, so run `npm run build` after editing
+  frontend source. For iterative UI work use `npm run dev` (hot reload on `:5173`, auto-boots the
+  backend on `:8000`; open `:5173`, not `:8000`).
+- Svelte CSS is **component-scoped**: a class defined in `App.svelte` won't style markup rendered by
+  another component (e.g. `LiveFeed.svelte`). Use a global stylesheet or redefine it in the
+  consuming component.
+- **Verify UI changes with the Playwright MCP server** (configured globally, so it's already
+  available): start `npm run dev` and point it at the `:5173` URL to click through the portal
+  (event list, labeling, live feed, toggles) instead of eyeballing screenshots.
 
 ## Hard constraints — do not break these
 
@@ -52,9 +73,15 @@ Always run **ruff + the full suite** and confirm both are clean before calling a
 - **One event = one potty behavior, not one input file.** A quiet clip yields 0 events; a busy one
   yields several.
 - **`classifier_guess` / `classifier_confidence` are a weak v0 heuristic.** `label` / `label_status`
-  (human-reviewed) are the training-truth fields. Every event starts `unlabeled`.
+  (human-reviewed) are the training-truth fields. Every event starts `unlabeled`. If guesses look
+  wrong (e.g. "everything is 65% poop"), first confirm pose is actually enabled in the config being
+  run — a config with no `pose:` block is heuristic-only — before suspecting a wiring bug.
 - **Pee vs poop from posture is genuinely ambiguous** (squat-pee looks poop-like). Guesses carry
   `needs_label=True`; don't treat a mis-guess as a wiring bug.
+- **Native UniFi vs third-party ONVIF cameras.** ONVIF cameras behind the NVR often can't be
+  reliably re-streamed through Protect's RTSPS proxy — FFmpeg then floods `Empty H.264 RTP packet` /
+  "session invalidated" (a symptom, not a bug). Stream those directly with a per-camera RTSP
+  override (`DETECTIVEPOTTY_<NAME>_RTSP_URL`, quoted) instead of through UniFi.
 
 ## Pose subsystem status
 
@@ -77,7 +104,8 @@ off unless a task explicitly says otherwise.
 - `classify/` — `base.py`, `heuristic.py` (weak pee/poop guess), `pose.py` (pose-based classifier, opt-in).
 - `pose/` — keypoint backends: `MockPoseEstimator` (tests) + SuperAnimal/DeepLabCut real backend, gate.
 - `recording/` — `recorder.py`, `clip_writer.py`, `dataset.py` (on-disk event layout), `retention.py`.
-- `web/` — FastAPI review/labeling app (`app.py`, `dataset_index.py`, `static/`).
+- `web/` — FastAPI review/labeling app (`app.py`, `dataset_index.py`) + `frontend/` (Svelte 5 + Vite
+  portal, built to `frontend/dist/`).
 - `protect/` — UniFi Protect client + animal smart-detect trigger. `triggers/` — trigger interfaces + YOLO fallback.
 - `geometry.py` — `BBox` (crop/expand/`union`) and coordinate helpers.
 

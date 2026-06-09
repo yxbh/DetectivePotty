@@ -8,6 +8,7 @@ real YOLO/pose model, GPU, or network is touched.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 
 import cv2
@@ -260,6 +261,24 @@ def test_collect_tune_models_scans_dir_and_appends_default(tmp_path: Path) -> No
     assert all(not m.endswith(".txt") for m in models)
 
 
+def test_collect_tune_models_discovers_mlpackage_dirs(tmp_path: Path) -> None:
+    models_dir = tmp_path / "models"
+    (models_dir / "coreml").mkdir(parents=True)
+    (models_dir / "yolo11m.pt").write_bytes(b"x")
+    # *.mlpackage is a DIRECTORY bundle, not a file.
+    (models_dir / "yolo11m.mlpackage").mkdir()
+    (models_dir / "yolo11m.mlpackage" / "Manifest.json").write_text("{}")
+    (models_dir / "coreml" / "yolo11l.mlpackage").mkdir()
+    # A regular file that merely ends in .mlpackage must NOT be discovered.
+    (models_dir / "stray.mlpackage").write_text("not a bundle")
+    config = make_config(tmp_path, tmp_path / "c.mp4")
+    models = tune_mod.collect_tune_models(config, models_dir=models_dir)
+    assert str(models_dir / "yolo11m.pt") in models
+    assert str(models_dir / "yolo11m.mlpackage") in models
+    assert str(models_dir / "coreml" / "yolo11l.mlpackage") in models
+    assert str(models_dir / "stray.mlpackage") not in models
+
+
 def test_tune_models_endpoint_lists_default(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
@@ -267,6 +286,55 @@ def test_tune_models_endpoint_lists_default(tmp_path: Path) -> None:
     # Injected detector pins the allow-list to just the configured model.
     assert body["default"] == "models/yolo11m.pt"
     assert body["models"] == ["models/yolo11m.pt"]
+
+
+def test_tune_export_coreml_adds_model_and_refreshes_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+
+    calls: dict = {}
+
+    def fake_export(weights, out_path=None, imgsz=640, half=True):
+        calls["weights"] = str(weights)
+        calls["imgsz"] = imgsz
+        return "models/yolo11m.mlpackage"
+
+    # The endpoint resolves export_coreml off the module at call time, so patching
+    # the module attribute keeps the test fully offline (no real CoreML export).
+    monkeypatch.setattr(
+        "detectivepotty.detect.coreml_export.export_coreml", fake_export
+    )
+
+    resp = client.post("/api/tune/export-coreml", json={"model": "models/yolo11m.pt"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["model"] == "models/yolo11m.mlpackage"
+    assert "models/yolo11m.mlpackage" in body["models"]
+    assert calls["weights"] == "models/yolo11m.pt"
+    assert calls["imgsz"] == client.app.state.config.global_settings.inference_long_edge_px
+    # Allow-list now includes the new model so it is selectable.
+    listed = client.get("/api/tune/models").json()["models"]
+    assert "models/yolo11m.mlpackage" in listed
+
+
+def test_tune_export_coreml_rejects_unknown_model(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.post("/api/tune/export-coreml", json={"model": "models/ghost.pt"})
+    assert resp.status_code == 400
+
+
+def test_tune_export_coreml_rejects_non_pt(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    # An already-exported .mlpackage in the allow-list can't be re-exported.
+    client.app.state.tune_models.append("models/yolo11m.mlpackage")
+    resp = client.post(
+        "/api/tune/export-coreml", json={"model": "models/yolo11m.mlpackage"}
+    )
+    assert resp.status_code == 400
 
 
 def test_tune_meta_returns_clip_properties(tmp_path: Path) -> None:
@@ -371,3 +439,141 @@ def test_spa_fallback_does_not_shadow_api(tmp_path: Path) -> None:
     assert client.get("/api").status_code == 404
     # A real API route still works.
     assert client.get("/api/dogs").status_code == 200
+
+
+# --- persistent decoder cache (ClipFrameReader) --------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_reader_cache():
+    """Keep the process-wide reader cache from leaking between tests."""
+
+    tune_mod.clear_clip_reader_cache()
+    yield
+    tune_mod.clear_clip_reader_cache()
+
+
+def _decode_all_sequential(path: Path) -> list[np.ndarray]:
+    """Ground-truth frames: a fresh capture read straight through, in order."""
+
+    cap = cv2.VideoCapture(str(path))
+    frames: list[np.ndarray] = []
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            frames.append(frame)
+    finally:
+        cap.release()
+    return frames
+
+
+def test_reader_sequential_matches_ground_truth(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "seq.mp4", frames=20)
+    truth = _decode_all_sequential(clip)
+    reader = tune_mod.get_clip_reader(clip)
+    for i in range(len(truth)):
+        frame, idx, total, _fps, _w, _h = reader.read(i)
+        assert idx == i
+        assert total == len(truth)
+        assert np.array_equal(frame, truth[i]), f"sequential frame {i} mismatch"
+
+
+def test_reader_random_access_matches_ground_truth(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "rand.mp4", frames=20)
+    truth = _decode_all_sequential(clip)
+    reader = tune_mod.get_clip_reader(clip)
+    # Mix of forward jumps (grab-skip path), backward jumps (seek path), repeats,
+    # a large forward jump past FORWARD_GRAB_MAX, and the very first frame again.
+    order = [0, 1, 2, 5, 6, 3, 19, 4, 0, 18, 10, 11, 12]
+    for i in order:
+        frame, idx, _total, _fps, _w, _h = reader.read(i)
+        assert idx == i
+        assert np.array_equal(frame, truth[i]), f"random frame {i} mismatch"
+
+
+def test_reader_clamps_index_past_end(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "clamp.mp4", frames=8)
+    reader = tune_mod.get_clip_reader(clip)
+    frame, idx, total, _fps, _w, _h = reader.read(999)
+    assert idx == total - 1 == 7
+    assert frame is not None
+
+
+def test_reader_cache_reuses_same_instance(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "reuse.mp4", frames=8)
+    a = tune_mod.get_clip_reader(clip)
+    b = tune_mod.get_clip_reader(clip)
+    assert a is b, "same path within cache should return the same open reader"
+
+
+def test_reader_cache_invalidates_on_mtime_change(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "mtime.mp4", frames=8)
+    first = tune_mod.get_clip_reader(clip)
+    assert first.meta()[0] == 8
+
+    # Rewrite the clip with a different frame count and force a newer mtime so the
+    # cache must rebuild the reader rather than serve the stale (now-wrong) one.
+    write_clip(clip, frames=15)
+    bump = os.stat(clip).st_mtime_ns + 2_000_000_000
+    os.utime(clip, ns=(bump, bump))
+
+    second = tune_mod.get_clip_reader(clip)
+    assert second is not first
+    assert second.meta()[0] == 15
+    assert first.retired, "stale reader should be retired (capture released)"
+
+
+def test_reader_cache_evicts_oldest_over_capacity(tmp_path: Path) -> None:
+    readers = []
+    for i in range(tune_mod.MAX_OPEN_READERS + 2):
+        clip = write_clip(tmp_path / f"evict_{i}.mp4", frames=6)
+        readers.append(tune_mod.get_clip_reader(clip))
+
+    with tune_mod._READER_CACHE_LOCK:
+        assert len(tune_mod._READER_CACHE) == tune_mod.MAX_OPEN_READERS
+    # The two oldest readers were evicted and must have been closed.
+    assert readers[0].retired
+    assert readers[1].retired
+    # The most-recent ones are still live.
+    assert not readers[-1].retired
+
+
+def test_read_frame_retries_after_reader_retired(tmp_path: Path) -> None:
+    """read_frame transparently recovers if its reader is retired mid-use."""
+
+    clip = write_clip(tmp_path / "retire.mp4", frames=8)
+    stale = tune_mod.get_clip_reader(clip)
+    stale.close()  # simulate an eviction racing ahead of the read
+    # The cache still holds the retired instance; read_frame should fetch a fresh
+    # one and succeed rather than raising on the closed capture.
+    frame, idx, _total, _fps, _w, _h = tune_mod.read_frame(clip, 3)
+    assert idx == 3 and frame is not None
+
+
+def test_reader_concurrent_reads_are_safe(tmp_path: Path) -> None:
+    import threading as _threading
+
+    clip = write_clip(tmp_path / "threads.mp4", frames=20)
+    truth = _decode_all_sequential(clip)
+    reader = tune_mod.get_clip_reader(clip)
+    errors: list[str] = []
+
+    def worker(seed: int) -> None:
+        rng = np.random.default_rng(seed)
+        for _ in range(40):
+            i = int(rng.integers(0, len(truth)))
+            try:
+                frame, idx, _t, _f, _w, _h = reader.read(i)
+                if idx != i or not np.array_equal(frame, truth[i]):
+                    errors.append(f"seed {seed} frame {i} mismatch")
+            except Exception as exc:  # noqa: BLE001 - surface any crash
+                errors.append(f"seed {seed}: {exc!r}")
+
+    workers = [_threading.Thread(target=worker, args=(s,)) for s in range(6)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    assert not errors, errors[:5]

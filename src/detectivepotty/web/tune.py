@@ -22,9 +22,12 @@ object handed in by the caller.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from collections.abc import Sequence
 import importlib.util
+import os
 from pathlib import Path
+import threading
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -183,11 +186,16 @@ def collect_tune_models(
 ) -> list[str]:
     """Return the YOLO weights the model picker may select, as detector strings.
 
-    Discovers ``*.pt`` files under ``models_dir`` (the conventional weights
-    folder) and always includes the configured ``global.model_name`` so the
-    active model is selectable even if it lives elsewhere or is a bare
-    Ultralytics name. Each returned string is usable directly as
-    ``DogDetector(model_name=...)``; the client labels options by basename.
+    Discovers ``*.pt`` files and ``*.mlpackage`` CoreML bundles under
+    ``models_dir`` (the conventional weights folder) plus any ``*.mlpackage``
+    under ``models_dir/coreml`` (the curated, committable export location), and
+    always includes the configured ``global.model_name`` so the active model is
+    selectable even if it lives elsewhere or is a bare Ultralytics name. Each
+    returned string is usable directly as ``DogDetector(model_name=...)``; the
+    client labels options by basename.
+
+    Note ``*.mlpackage`` is a **directory** bundle, not a file, so it is matched
+    with ``is_dir()`` while ``*.pt`` weights are matched with ``is_file()``.
 
     The list doubles as an **allow-list**: ``/api/tune/detect`` only builds a
     detector for a model in this set, so an arbitrary ``model`` query can't be
@@ -202,15 +210,18 @@ def collect_tune_models(
             seen.add(value)
             models.append(value)
 
-    try:
-        children = sorted(
-            models_dir.glob("*.pt"), key=lambda p: p.name.lower()
-        )
-    except OSError:  # pragma: no cover - defensive (e.g. unreadable dir)
-        children = []
-    for child in children:
-        if child.is_file():
-            add(str(models_dir / child.name))
+    def discover(directory: Path, pattern: str, want_dir: bool) -> None:
+        try:
+            matches = sorted(directory.glob(pattern), key=lambda p: p.name.lower())
+        except OSError:  # pragma: no cover - defensive (e.g. unreadable dir)
+            return
+        for match in matches:
+            if match.is_dir() if want_dir else match.is_file():
+                add(str(match))
+
+    discover(models_dir, "*.pt", want_dir=False)
+    discover(models_dir, "*.mlpackage", want_dir=True)
+    discover(models_dir / "coreml", "*.mlpackage", want_dir=True)
 
     add(config.global_settings.model_name)
     return models
@@ -222,23 +233,11 @@ def read_meta(path: Path) -> tuple[int, float, int, int, float]:
     Reads container properties without decoding a frame, so the client can map
     ``video.currentTime`` to a frame index cheaply (no YOLO). ``total_frames`` is
     ``0`` when the container does not report a reliable count; ``duration_s`` is
-    ``0.0`` when it cannot be derived.
+    ``0.0`` when it cannot be derived. Routes through the persistent reader cache
+    so selecting a clip also warms its decoder for the subsequent frame buffer.
     """
 
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        capture.release()
-        raise FileNotFoundError(f"failed to open video file: {path}")
-    try:
-        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        total = total if total > 0 else 0
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    finally:
-        capture.release()
-    duration = (total / fps) if (total > 0 and fps > 0) else 0.0
-    return total, fps, width, height, duration
+    return get_clip_reader(path).meta()
 
 
 def read_frame(
@@ -248,33 +247,166 @@ def read_frame(
 
     Returns ``(frame_bgr, idx_used, total_frames, fps, width, height)``.
     ``total_frames`` is ``0`` when the container does not report a reliable
-    count. The capture is opened and released per call so the endpoint stays
-    stateless and thread-safe under ``run_in_threadpool``. Raises ``IndexError``
-    if the requested frame cannot be read (e.g. past the end).
+    count. Backed by a process-wide :class:`ClipFrameReader` cache that keeps the
+    ``cv2.VideoCapture`` open and reads sequentially when possible — the tuner's
+    background filler walks frames forward, and a persistent sequential read is
+    ~20x cheaper than reopening + keyframe-seeking per request. Raises
+    ``IndexError`` if the requested frame cannot be read (e.g. past the end).
     """
 
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        capture.release()
-        raise FileNotFoundError(f"failed to open video file: {path}")
-    try:
+    # If the reader we hold is retired out from under us by a concurrent
+    # eviction, fetch a fresh one and retry rather than touching a closed
+    # capture. Bounded so a pathological churn can't spin forever.
+    last_exc: _ReaderRetired | None = None
+    for _ in range(3):
+        reader = get_clip_reader(path)
+        try:
+            return reader.read(index)
+        except _ReaderRetired as exc:  # pragma: no cover - needs eviction race
+            last_exc = exc
+    raise IndexError(f"no frame at index {index} (reader churn)") from last_exc
+
+
+# --- persistent per-clip decoder cache -----------------------------------
+#
+# Opening a fresh ``cv2.VideoCapture`` and seeking by frame index re-decodes
+# from the preceding keyframe on every call (~65 ms on a 2688x1512 clip),
+# whereas a persistent capture read sequentially costs ~3 ms. The tuner's
+# buffer fills mostly forward, so we keep one open capture per clip and only
+# fall back to a hard seek for backward / large-forward jumps.
+
+# A forward jump of up to this many frames is served by grabbing intervening
+# frames (~3 ms each) rather than a hard seek (~42 ms ≈ 16 grabs); chosen a bit
+# below break-even from the measured numbers above.
+FORWARD_GRAB_MAX = 12
+# Bound on simultaneously open captures (file handles). The tuner views one clip
+# at a time; a few keeps recently-browsed clips warm without leaking handles.
+MAX_OPEN_READERS = 4
+
+
+class _ReaderRetired(Exception):
+    """Raised when a reader was evicted/closed while a caller still held it."""
+
+
+class ClipFrameReader:
+    """A persistent ``cv2.VideoCapture`` with a sequential-read fast path.
+
+    Thread-safe: every capture access is serialized by ``self._lock`` (a single
+    ``VideoCapture`` is not safe for concurrent use). ``_next_pos`` tracks the
+    0-based index the next ``read()`` would return; it is set to ``None``
+    ("unknown") after any decode/seek failure so the following read forces a hard
+    seek instead of silently returning the wrong frame.
+    """
+
+    def __init__(self, path: Path, mtime_ns: int) -> None:
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            capture.release()
+            raise FileNotFoundError(f"failed to open video file: {path}")
         total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        total = total if total > 0 else 0
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        self._cap = capture
+        self.path = path
+        self.mtime_ns = mtime_ns
+        self._total = total if total > 0 else 0
+        self._fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        self._width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._next_pos: int | None = 0
+        self._retired = False
+        self._lock = threading.Lock()
 
-        idx = max(0, index)
-        if total > 0:
-            idx = min(idx, total - 1)
-        if idx > 0:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
-        ok, frame = capture.read()
+    def meta(self) -> tuple[int, float, int, int, float]:
+        duration = (self._total / self._fps) if (self._total > 0 and self._fps > 0) else 0.0
+        return self._total, self._fps, self._width, self._height, duration
+
+    @property
+    def retired(self) -> bool:
+        return self._retired
+
+    def read(self, index: int) -> tuple[np.ndarray, int, int, float, int, int]:
+        with self._lock:
+            if self._retired:
+                raise _ReaderRetired
+            idx = index if index >= 0 else 0
+            if self._total > 0:
+                idx = min(idx, self._total - 1)
+            ok, frame = self._decode_at(idx)
+            if not ok or frame is None:
+                # Position is no longer trustworthy after a failed grab/read/seek.
+                self._next_pos = None
+                raise IndexError(f"no frame at index {index}")
+            self._next_pos = idx + 1
+            height, width = frame.shape[:2]
+            return frame, idx, self._total, self._fps, width, height
+
+    def _decode_at(self, idx: int) -> tuple[bool, np.ndarray | None]:
+        """Advance the capture to ``idx`` and decode it. Caller holds the lock."""
+
+        pos = self._next_pos
+        if pos is not None and pos == idx:
+            return self._cap.read()
+        if pos is not None and 0 <= (idx - pos) <= FORWARD_GRAB_MAX:
+            for _ in range(idx - pos):
+                if not self._cap.grab():
+                    return False, None
+            return self._cap.read()
+        # Backward, large forward jump, or unknown position -> hard seek.
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
+        return self._cap.read()
+
+    def close(self) -> None:
+        """Retire the reader and release its capture (waits for any in-flight read)."""
+
+        with self._lock:
+            self._retired = True
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None  # type: ignore[assignment]
+
+
+_READER_CACHE: OrderedDict[str, ClipFrameReader] = OrderedDict()
+_READER_CACHE_LOCK = threading.Lock()
+
+
+def get_clip_reader(path: Path) -> ClipFrameReader:
+    """Return a cached open reader for ``path``, creating/evicting as needed.
+
+    Keyed by path string; an entry is invalidated when the file's mtime changes
+    (the clip was rewritten). Evicted/stale readers are ``close()``d *after* the
+    cache lock is released so a slow close can never block unrelated lookups.
+    """
+
+    key = str(path)
+    mtime_ns = os.stat(path).st_mtime_ns  # FileNotFoundError if the clip is gone
+    victims: list[ClipFrameReader] = []
+    try:
+        with _READER_CACHE_LOCK:
+            existing = _READER_CACHE.get(key)
+            if existing is not None and existing.mtime_ns == mtime_ns and not existing.retired:
+                _READER_CACHE.move_to_end(key)
+                return existing
+            if existing is not None:
+                victims.append(_READER_CACHE.pop(key))
+            reader = ClipFrameReader(path, mtime_ns)
+            _READER_CACHE[key] = reader
+            while len(_READER_CACHE) > MAX_OPEN_READERS:
+                _, evicted = _READER_CACHE.popitem(last=False)
+                victims.append(evicted)
+            return reader
     finally:
-        capture.release()
+        for victim in victims:
+            victim.close()
 
-    if not ok or frame is None:
-        raise IndexError(f"no frame at index {index}")
-    height, width = frame.shape[:2]
-    return frame, idx, total, fps, width, height
+
+def clear_clip_reader_cache() -> None:
+    """Release and drop all cached readers (test hygiene / explicit reset)."""
+
+    with _READER_CACHE_LOCK:
+        readers = list(_READER_CACHE.values())
+        _READER_CACHE.clear()
+    for reader in readers:
+        reader.close()
+
 
 
 def encode_jpeg_dataurl(frame_bgr: np.ndarray) -> str:

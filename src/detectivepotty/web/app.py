@@ -93,6 +93,10 @@ class LabelUpdate(BaseModel):
     dog: str | None = Field(default=None, max_length=200)
 
 
+class ExportCoremlRequest(BaseModel):
+    model: str = Field(max_length=500)
+
+
 class _ApiNoStoreMiddleware:
     """Default ``Cache-Control: no-store`` for /api/ responses.
 
@@ -198,6 +202,9 @@ def create_app(
     app.state.tune_detector_lock = threading.Lock()
     app.state.tune_infer_lock = threading.Lock()
     app.state.tune_pose_lock = threading.Lock()
+    # Serializes CoreML exports (heavy, macOS-only) triggered from the tuner UI so
+    # only one runs at a time.
+    app.state.tune_export_lock = threading.Lock()
     # Resolved as (estimator | None, available). Seeded when a fake is injected.
     app.state.tune_pose_resolved = (
         (tune_pose_estimator, True) if tune_pose_estimator is not None else None
@@ -459,6 +466,48 @@ def create_app(
         """The model picker's allow-list: discovered weights + the configured one."""
 
         return {
+            "models": list(app.state.tune_models),
+            "default": app.state.tune_default_model,
+        }
+
+    @app.post("/api/tune/export-coreml")
+    async def tune_export_coreml(req: ExportCoremlRequest) -> dict:
+        """Export a discovered ``.pt`` model to a GPU-safe CoreML ``.mlpackage``.
+
+        Drives the tuner's "Export to CoreML (GPU)" button. The source must be a
+        ``.pt`` already in the allow-list (``.mlpackage`` / unknown → 400). The
+        export is heavy (~20-60s) and macOS-only, so it runs in a threadpool
+        serialized by ``tune_export_lock``. On success the new ``.mlpackage`` is
+        added to the allow-list and returned for immediate selection.
+        """
+
+        name = req.model
+        if name not in app.state.tune_models:
+            raise HTTPException(status_code=400, detail="unknown model")
+        if not name.endswith(".pt"):
+            raise HTTPException(status_code=400, detail="model is not a .pt")
+
+        from detectivepotty.detect import coreml_export
+
+        def _run() -> str:
+            with app.state.tune_export_lock:
+                return str(
+                    coreml_export.export_coreml(
+                        name,
+                        imgsz=config.global_settings.inference_long_edge_px,
+                    )
+                )
+
+        try:
+            result = await run_in_threadpool(_run)
+        except Exception as exc:  # noqa: BLE001 - surface any export failure as 500
+            logger.exception("CoreML export failed for %s", name)
+            raise HTTPException(status_code=500, detail="coreml export failed") from exc
+
+        if result not in app.state.tune_models:
+            app.state.tune_models = [*app.state.tune_models, result]
+        return {
+            "model": result,
             "models": list(app.state.tune_models),
             "default": app.state.tune_default_model,
         }

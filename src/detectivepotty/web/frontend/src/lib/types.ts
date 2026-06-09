@@ -127,6 +127,13 @@ export interface TuneModelList {
   default: string;
 }
 
+/** Result of a one-off CoreML export: the new model + refreshed allow-list. */
+export interface TuneExportResult {
+  model: string;
+  models: string[];
+  default: string;
+}
+
 /** Clip properties for index<->time mapping (no inference). */
 export interface TuneMeta {
   path: string;

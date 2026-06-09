@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import {
+    exportCoreml,
     fetchTuneDetect,
     fetchTuneFiles,
     fetchTuneMeta,
@@ -78,6 +79,9 @@
 
   let models = $state<string[]>([]);
   let selectedModel = $state<string>("");
+  // One-off CoreML export (the "Export to CoreML (GPU)" button) state.
+  let exporting = $state(false);
+  let exportError = $state<string | null>(null);
 
   let selectedPath = $state<string | null>(null);
   let selectedName = $state<string>("");
@@ -557,6 +561,49 @@
     resetScope();
   }
 
+  // Dropdown label: ".../yolo11m.mlpackage" -> "yolo11m (CoreML)"; ".pt" -> basename.
+  function modelOptionLabel(model: string): string {
+    const base = model.split("/").pop() ?? model;
+    return base.endsWith(".mlpackage")
+      ? `${base.slice(0, -".mlpackage".length)} (CoreML)`
+      : base;
+  }
+
+  function modelStem(model: string): string {
+    const base = model.split("/").pop() ?? model;
+    return base.replace(/\.(pt|mlpackage)$/, "");
+  }
+
+  // The export button only applies to a .pt source; if its CoreML twin already
+  // exists the button just switches to it instead of re-exporting.
+  let canExport = $derived(selectedModel.endsWith(".pt"));
+  let existingCoreml = $derived(
+    selectedModel.endsWith(".pt")
+      ? (models.find(
+          (m) => m.endsWith(".mlpackage") && modelStem(m) === modelStem(selectedModel),
+        ) ?? null)
+      : null,
+  );
+
+  async function onExportCoreml(): Promise<void> {
+    if (!canExport || exporting) return;
+    if (existingCoreml) {
+      setModel(existingCoreml);
+      return;
+    }
+    exporting = true;
+    exportError = null;
+    try {
+      const result = await exportCoreml(selectedModel);
+      models = result.models;
+      setModel(result.model);
+    } catch (err) {
+      exportError = err instanceof Error ? err.message : "CoreML export failed";
+    } finally {
+      exporting = false;
+    }
+  }
+
   function setOverlay(mode: OverlayMode): void {
     if (mode === overlayMode) {
       return;
@@ -997,7 +1044,7 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="tune" class:has-zoom={selectedPath && showZoom && zoomCards.length > 0}>
+<div class="tune" class:has-zoom={selectedPath && showZoom}>
   <aside class="browser">
     <div class="browser-head">
       <span class="eyebrow mono">CLIPS</span>
@@ -1119,10 +1166,31 @@
                 onchange={(e) => setModel((e.currentTarget as HTMLSelectElement).value)}
               >
                 {#each models as model (model)}
-                  <option value={model}>{model.split("/").pop()}</option>
+                  <option value={model}>{modelOptionLabel(model)}</option>
                 {/each}
               </select>
             </label>
+          {/if}
+
+          {#if canExport}
+            <button
+              type="button"
+              class="coreml-btn"
+              onclick={onExportCoreml}
+              disabled={exporting}
+              title={existingCoreml
+                ? "Use the already-exported CoreML (GPU) model"
+                : "Export this model to a GPU-safe CoreML model (runs on the GPU, ~2x faster). Takes ~1 min."}
+            >
+              {exporting
+                ? "Exporting… (~1 min)"
+                : existingCoreml
+                  ? "Switch to CoreML (GPU)"
+                  : "Export to CoreML (GPU)"}
+            </button>
+          {/if}
+          {#if exportError}
+            <span class="export-error mono small" role="alert">{exportError}</span>
           {/if}
 
           <label class="slider">
@@ -1170,23 +1238,27 @@
     {/if}
   </section>
 
-  {#if selectedPath && showZoom && zoomCards.length > 0}
+  {#if selectedPath && showZoom}
     <aside class="zoom-col">
       <div class="zoom-head">
         <span class="eyebrow">DETECTIONS</span>
         <span class="mono muted small">{zoomCards.length}</span>
       </div>
-      <div class="zoom">
-        {#each zoomCards as card, i (card.det.x1 + ":" + card.det.y1 + ":" + i)}
-          <figure class="zoom-card" class:dropped={!card.kept}>
-            <canvas bind:this={zoomCanvases[i]}></canvas>
-            <figcaption class="mono">
-              {card.det.class_name}
-              {card.det.confidence.toFixed(2)}{card.pose ? " · pose" : ""}
-            </figcaption>
-          </figure>
-        {/each}
-      </div>
+      {#if zoomCards.length > 0}
+        <div class="zoom">
+          {#each zoomCards as card, i (card.det.x1 + ":" + card.det.y1 + ":" + i)}
+            <figure class="zoom-card" class:dropped={!card.kept}>
+              <canvas bind:this={zoomCanvases[i]}></canvas>
+              <figcaption class="mono">
+                {card.det.class_name}
+                {card.det.confidence.toFixed(2)}{card.pose ? " · pose" : ""}
+              </figcaption>
+            </figure>
+          {/each}
+        </div>
+      {:else}
+        <div class="zoom-empty muted small">No detections on this frame.</div>
+      {/if}
     </aside>
   {/if}
 </div>
@@ -1221,17 +1293,26 @@
     grid-area: zoom;
   }
 
-  /* Medium: drop the zoom to a full-width row beneath the player (crops wrap). */
+  /* Medium: drop the zoom to a full-width row beneath the player (crops wrap).
+     The stacked layout is content-sized and scrolls the tune-main as a whole, so
+     the player is never squeezed/clipped by the detections row. */
   @media (max-width: 1280px) {
+    .tune,
+    .tune.has-zoom {
+      height: auto;
+      min-height: 100%;
+    }
+
     .tune.has-zoom {
       grid-template-columns: 260px minmax(0, 1fr);
-      grid-template-rows: minmax(0, 1fr) auto;
+      grid-template-rows: auto auto;
       grid-template-areas:
         "browser stage"
         "zoom zoom";
     }
 
     .tune.has-zoom .zoom-col {
+      min-width: 0;
       max-height: 32vh;
     }
 
@@ -1251,7 +1332,7 @@
     .tune,
     .tune.has-zoom {
       grid-template-columns: minmax(0, 1fr);
-      grid-template-rows: auto minmax(0, 1fr) auto;
+      grid-template-rows: auto auto auto;
       grid-template-areas:
         "browser"
         "stage"
@@ -1348,6 +1429,9 @@
     min-width: 0;
     min-height: 0;
     display: flex;
+    /* Keep the player pinned to the top so a taller detections column never
+       stretches/centers it and pushes the transport controls down. */
+    align-items: flex-start;
   }
 
   .empty {
@@ -1493,6 +1577,32 @@
     max-width: 16ch;
   }
 
+  .coreml-btn {
+    background: var(--bg-1, #141a24);
+    border: 1px solid var(--accent, #3f7d5a);
+    color: var(--text, #d8e0ec);
+    border-radius: 6px;
+    padding: 0.25rem 0.55rem;
+    font-size: 0.74rem;
+    font-family: ui-monospace, monospace;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .coreml-btn:hover:not(:disabled) {
+    border-color: var(--amber, #f0b35a);
+  }
+
+  .coreml-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
+  }
+
+  .export-error {
+    color: var(--amber, #f0b35a);
+    max-width: 22ch;
+  }
+
   .frame-error {
     position: absolute;
     bottom: 0.5rem;
@@ -1617,10 +1727,21 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
     border: 1px solid var(--line, #243042);
     border-radius: 10px;
     background: var(--bg-1, #141a24);
     overflow: hidden;
+  }
+
+  /* Keep the panel a stable width so toggling between frames with and without
+     detections (e.g. while scrubbing) doesn't reflow / resize the player. */
+  .tune.has-zoom .zoom-col {
+    min-width: 320px;
+  }
+
+  .zoom-empty {
+    padding: 0.75rem;
   }
 
   .zoom-head {
@@ -1651,6 +1772,7 @@
 
   .zoom-card {
     margin: 0;
+    flex: 0 0 auto;
     border: 2px solid #28d17c;
     border-radius: 8px;
     overflow: hidden;

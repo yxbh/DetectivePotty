@@ -30,6 +30,13 @@ dist/
 *.pt
 *.onnx
 *.engine
+*.mlpackage
+*.mlmodel
+
+# Curated, committable CoreML exports live here (negate the *.mlpackage ignore
+# above so a minimal set can be checked in without `git add -f`).
+!models/coreml/
+!models/coreml/**
 
 # Frontend build artifacts (built on demand, not committed)
 src/detectivepotty/web/frontend/node_modules/

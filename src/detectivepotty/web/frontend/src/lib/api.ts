@@ -5,6 +5,7 @@ import type {
   EventsPage,
   LabelPayload,
   TuneDetectResult,
+  TuneExportResult,
   TuneFrame,
   TuneListing,
   TuneMeta,
@@ -132,6 +133,16 @@ export async function fetchTuneFrame(
 export async function fetchTuneModels(): Promise<TuneModelList> {
   const response = await fetch("/api/tune/models");
   return jsonOrThrow<TuneModelList>(response);
+}
+
+/** Export a discovered .pt model to a GPU-safe CoreML .mlpackage (one-off). */
+export async function exportCoreml(model: string): Promise<TuneExportResult> {
+  const response = await fetch("/api/tune/export-coreml", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
+  return jsonOrThrow<TuneExportResult>(response);
 }
 
 export async function fetchTuneMeta(

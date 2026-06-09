@@ -519,6 +519,50 @@ def tune_detect(
     typer.echo(f"Chosen detection_conf_threshold: {chosen:.2f}")
 
 
+@app.command("export-coreml")
+def export_coreml_command(
+    weights: Annotated[
+        list[Path],
+        typer.Argument(help="YOLO .pt weights to export (one or more, e.g. models/yolo11m.pt)."),
+    ],
+    out_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help="Directory to write <stem>.mlpackage into (e.g. models/coreml for the "
+            "committable set). Default: next to each .pt.",
+        ),
+    ] = None,
+    imgsz: Annotated[
+        int,
+        typer.Option("--imgsz", min=32, help="Inference long edge baked into the model. Default 640."),
+    ] = 640,
+    half: Annotated[
+        bool,
+        typer.Option("--half/--no-half", help="Export FP16 (default, GPU-fast) vs FP32."),
+    ] = True,
+) -> None:
+    """Export YOLO11 ``.pt`` weights to a GPU-safe CoreML ``.mlpackage``.
+
+    Rewrites YOLO11's C2PSA attention with scaled-dot-product-attention so the
+    exported ``mlprogram`` runs on Apple's GPU (~2x faster than the ``.pt`` MPS
+    path) instead of crashing the MPSGraph compiler — numerically identical to the
+    original weights. macOS-only. The result is auto-discovered by the ``/tune``
+    model picker; pass ``--out models/coreml`` to produce the curated, committable
+    set.
+    """
+
+    from detectivepotty.detect.coreml_export import export_coreml
+
+    for pt in weights:
+        if not pt.is_file():
+            raise typer.BadParameter(f"Weights not found: {pt}")
+        out_path = (out_dir / f"{pt.stem}.mlpackage") if out_dir is not None else None
+        typer.echo(f"Exporting {pt} -> CoreML (imgsz={imgsz}, half={half}) ...")
+        result = export_coreml(pt, out_path=out_path, imgsz=imgsz, half=half)
+        typer.echo(f"  saved: {result}")
+
+
 def _build_camera_provider(config, camera, file_provider_cls, live_provider_cls):
     kind = camera.input.kind
     if kind == "file":

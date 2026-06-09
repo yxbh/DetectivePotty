@@ -852,6 +852,14 @@
     overflow: hidden;
   }
 
+  .tune-main {
+    flex: 1 1 auto;
+    min-height: 0;
+    /* Scrolls only when the player itself can't fit a short window; the
+       detections panel scrolls internally so its height never grows this. */
+    overflow: auto;
+  }
+
   .toaster {
     position: fixed;
     right: 1rem;

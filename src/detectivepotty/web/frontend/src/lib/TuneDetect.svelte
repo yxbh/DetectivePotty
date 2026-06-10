@@ -992,6 +992,24 @@
   // one pixel column, so values are aggregated per-column by max and drawn
   // background -> faint -> bright (bright last) so a faint frame can never paint
   // over a brighter neighbour.
+  // Opaque blend between two RGB triples (avoids translucent-overlap moiré on the strip).
+  function lerpColor(
+    a: readonly [number, number, number],
+    b: readonly [number, number, number],
+    t: number,
+  ): string {
+    const u = clamp(t, 0, 1);
+    const r = Math.round(a[0] + (b[0] - a[0]) * u);
+    const g = Math.round(a[1] + (b[1] - a[1]) * u);
+    const bl = Math.round(a[2] + (b[2] - a[2]) * u);
+    return `rgb(${r}, ${g}, ${bl})`;
+  }
+
+  const LANE1_TRACK: readonly [number, number, number] = [51, 80, 107]; // #33506b
+  const LANE1_BRIGHT: readonly [number, number, number] = [40, 209, 124]; // #28d17c
+  const LANE2_TRACK: readonly [number, number, number] = [44, 85, 102]; // #2c5566
+  const LANE2_BRIGHT: readonly [number, number, number] = [90, 209, 255]; // #5ad1ff
+
   function updateStrip(): void {
     const c = stripEl;
     if (!c || totalFrames <= 0) {
@@ -1055,22 +1073,20 @@
     ctx.fillStyle = "#2c5566";
     for (let x = 0; x < w; x++) if (detected[x]) ctx.fillRect(x, lane2Y, colW, laneH);
 
-    // Bright fills on top, opacity encoding confidence.
-    ctx.fillStyle = "#28d17c";
+    // Bright fills on top, opaque color (not alpha) encoding confidence so
+    // overlapping 1px columns overwrite instead of double-compositing (no moiré).
     for (let x = 0; x < w; x++) {
       if (keptConf[x] >= 0) {
-        ctx.globalAlpha = clamp(0.35 + 0.65 * keptConf[x], 0.35, 1);
+        ctx.fillStyle = lerpColor(LANE1_TRACK, LANE1_BRIGHT, 0.4 + 0.6 * keptConf[x]);
         ctx.fillRect(x, 0, colW, laneH);
       }
     }
-    ctx.fillStyle = "#5ad1ff";
     for (let x = 0; x < w; x++) {
       if (poseConf[x] >= 0) {
-        ctx.globalAlpha = clamp(0.35 + 0.65 * poseConf[x], 0.35, 1);
+        ctx.fillStyle = lerpColor(LANE2_TRACK, LANE2_BRIGHT, 0.4 + 0.6 * poseConf[x]);
         ctx.fillRect(x, lane2Y, colW, laneH);
       }
     }
-    ctx.globalAlpha = 1;
   }
 
   // --- zoom crops -----------------------------------------------------------

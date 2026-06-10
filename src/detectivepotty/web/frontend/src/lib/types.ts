@@ -134,6 +134,13 @@ export interface TuneExportResult {
   default: string;
 }
 
+/** Result of the decoupled pose pass (`POST /api/tune/pose`). */
+export interface TunePoseResult {
+  index: number;
+  pose: TunePose[];
+  pose_available: boolean;
+}
+
 /** Clip properties for index<->time mapping (no inference). */
 export interface TuneMeta {
   path: string;

@@ -337,6 +337,45 @@ def test_tune_export_coreml_rejects_non_pt(tmp_path: Path) -> None:
     assert resp.status_code == 400
 
 
+def test_tune_pose_returns_keypoints_for_boxes(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)  # injects MockPoseEstimator
+    resp = client.post(
+        "/api/tune/pose",
+        json={"path": str(clip), "index": 0, "boxes": [[10.0, 10.0, 80.0, 90.0]]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pose_available"] is True
+    assert len(body["pose"]) == 1
+    assert body["pose"][0]["keypoints"], "mock estimator should yield keypoints"
+
+
+def test_tune_pose_unavailable_without_estimator(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip, with_pose=False)
+    # Pin the resolver to "unavailable" so no real (heavy) backend is ever built.
+    client.app.state.tune_pose_resolved = (None, False)
+    resp = client.post(
+        "/api/tune/pose",
+        json={"path": str(clip), "index": 0, "boxes": [[10.0, 10.0, 80.0, 90.0]]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pose_available"] is False
+    assert body["pose"] == []
+
+
+def test_tune_pose_rejects_invalid_path(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.post(
+        "/api/tune/pose",
+        json={"path": "/etc/passwd", "index": 0, "boxes": [[0.0, 0.0, 1.0, 1.0]]},
+    )
+    assert resp.status_code == 400
+
+
 def test_tune_meta_returns_clip_properties(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4", frames=8, size=(160, 120))
     client = make_client(tmp_path, clip)

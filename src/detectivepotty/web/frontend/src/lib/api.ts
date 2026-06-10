@@ -10,6 +10,7 @@ import type {
   TuneListing,
   TuneMeta,
   TuneModelList,
+  TunePoseResult,
 } from "./types";
 
 const EVENTS_LIMIT = 200;
@@ -169,6 +170,23 @@ export async function fetchTuneDetect(
   });
   const response = await fetch(`/api/tune/detect?${params.toString()}`, { signal });
   return jsonOrThrow<TuneDetectResult>(response);
+}
+
+/** Pose pass for client-supplied boxes on one frame — no YOLO re-run. Drives the
+ *  decoupled, proactive pose lane so flipping the overlay to pose is instant. */
+export async function fetchTunePose(
+  path: string,
+  index: number,
+  boxes: number[][],
+  signal?: AbortSignal,
+): Promise<TunePoseResult> {
+  const response = await fetch("/api/tune/pose", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, index, boxes }),
+    signal,
+  });
+  return jsonOrThrow<TunePoseResult>(response);
 }
 
 /** URL for the raw clip the <video> element streams (Range-seekable). */

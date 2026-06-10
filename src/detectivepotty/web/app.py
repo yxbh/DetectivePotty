@@ -97,6 +97,19 @@ class ExportCoremlRequest(BaseModel):
     model: str = Field(max_length=500)
 
 
+class TunePoseRequest(BaseModel):
+    """Body for ``POST /api/tune/pose`` — the decoupled pose pass.
+
+    ``boxes`` are the ``[x1, y1, x2, y2]`` detections the tuner already buffered,
+    so pose runs without re-running YOLO. Bounded to keep a hostile/buggy client
+    from scheduling unbounded inference work.
+    """
+
+    path: str = Field(max_length=4096)
+    index: int = Field(ge=0)
+    boxes: list[list[float]] = Field(default_factory=list, max_length=64)
+
+
 class _ApiNoStoreMiddleware:
     """Default ``Cache-Control: no-store`` for /api/ responses.
 
@@ -422,7 +435,15 @@ def create_app(
 
         frame, idx, total, fps, width, height = tune_mod.read_frame(file_path, index)
         detector, model_used = _get_tune_detector(model_name)
-        estimator, pose_available = _get_tune_pose()
+        # Only resolve/build the pose estimator when pose is actually requested.
+        # Building the real SuperAnimal backend is slow, so doing it on the
+        # boxes-only buffer path would stall the first detection (YOLO priority).
+        if want_pose:
+            estimator, pose_available = _get_tune_pose()
+        else:
+            resolved = app.state.tune_pose_resolved
+            estimator = None
+            pose_available = resolved[1] if resolved is not None else True
         with app.state.tune_infer_lock:
             detections = detector.detect(
                 frame,
@@ -460,6 +481,40 @@ def create_app(
         if want_image:
             payload["image"] = tune_mod.encode_jpeg_dataurl(frame)
         return payload
+
+    def _pose_payload(
+        file_path: Path,
+        index: int,
+        boxes: list[list[float]],
+    ) -> dict:
+        """Run pose for ``boxes`` on one frame — the decoupled pose pass.
+
+        Drives ``POST /api/tune/pose``. The frame is decoded *outside*
+        ``tune_infer_lock`` (CPU/IO shouldn't block the GPU); only inference is
+        serialized. Inference failure downgrades pose app-wide (same contract as
+        ``_detect_payload``) so the UI stops promising pose instead of retrying
+        the heavy path every frame.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        estimator, pose_available = _get_tune_pose()
+        if estimator is None:
+            return {"index": index, "pose": [], "pose_available": False}
+
+        frame, idx, _total, _fps, _w, _h = tune_mod.read_frame(file_path, index)
+        pose_list: list = []
+        with app.state.tune_infer_lock:
+            try:
+                pose_list = tune_mod.pose_payload_for_boxes(
+                    estimator, frame, boxes, frame_idx=idx
+                )
+            except Exception:
+                logger.warning("pose inference failed; disabling pose overlay")
+                app.state.tune_pose_resolved = (None, False)
+                pose_available = False
+                pose_list = []
+        return {"index": idx, "pose": pose_list, "pose_available": pose_available}
 
     @app.get("/api/tune/models")
     def tune_models() -> dict:
@@ -606,6 +661,34 @@ def create_app(
                 model_name,
                 bool(pose),
                 False,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.post("/api/tune/pose")
+    async def tune_pose(req: TunePoseRequest) -> dict:
+        """Pose keypoints for client-supplied boxes on one frame — no YOLO re-run.
+
+        The decoupled, proactive pose pass: the tuner sends the detection boxes it
+        already buffered and gets back keypoints, so pose precomputes behind YOLO
+        without redoing detection. Returns ``{index, pose, pose_available}``;
+        ``pose_available=False`` (with empty pose) when the pose backend isn't
+        installed/working, which tells the client to stop the pose pass.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(req.path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+
+        try:
+            return await run_in_threadpool(
+                _pose_payload,
+                file_path,
+                req.index,
+                req.boxes,
             )
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc

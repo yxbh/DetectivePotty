@@ -6,6 +6,7 @@
     fetchTuneFiles,
     fetchTuneMeta,
     fetchTuneModels,
+    fetchTunePose,
     tuneClipUrl,
   } from "./api";
   import type {
@@ -21,7 +22,14 @@
   // Cap concurrent detection fetches. Server serializes inference under a lock,
   // so a deep queue just delays interactive seeks; 2 keeps the pipe busy while
   // a fresh seek's frame can still jump the queue within one inference slot.
+  // This budget is shared by the YOLO detect filler AND the pose filler.
   const MAX_INFLIGHT = 2;
+  // Pose trails YOLO: at most one pose pass in flight, and only when YOLO has no
+  // urgent (near-cursor) work, so detection always wins the GPU lock.
+  const MAX_POSE_INFLIGHT = 1;
+  // A YOLO-needed index this close to the playhead anchor is "urgent" and always
+  // preempts pose (so stepping/scrubbing stays snappy while pose backfills).
+  const URGENT_WINDOW = 30;
   // The floor the slider can't go below (overwritten by the first detect result).
   const DEFAULT_FLOOR = 0.05;
 
@@ -57,9 +65,11 @@
     scopeKey: string;
     detections: TuneDetection[];
     pose: TunePose[];
-    // Whether this entry was fetched with pose=1. Box detections are valid for
-    // the (clip, model) scope regardless of overlay mode; pose is layered on
-    // only when wanted, so toggling boxes<->pose never discards boxes.
+    // Whether the decoupled pose pass has RUN for this frame (regardless of
+    // whether it produced keypoints — empty is a valid result, marked posed so
+    // it isn't retried forever). Boxes come from the detect filler (always
+    // pose=0); pose is filled in proactively afterwards via POST /api/tune/pose,
+    // so flipping the overlay to pose is instant and never rebuffers boxes.
     posed: boolean;
   }
 
@@ -99,6 +109,11 @@
   let poseAvailable = $state(true);
   let floor = $state(DEFAULT_FLOOR);
   let bufferedCount = $state(0);
+  // Frames with >=1 detection (a dog present) and frames whose pose pass has run.
+  // Maintained by transition-guarded increments in the fillers (never recomputed
+  // from an effect) and used both for the HUD and as strip-redraw triggers.
+  let detectedCount = $state(0);
+  let posedCount = $state(0);
 
   let videoEl = $state<HTMLVideoElement | null>(null);
   let canvasEl = $state<HTMLCanvasElement | null>(null);
@@ -129,10 +144,12 @@
   let framePose = $state<TunePose[]>([]);
 
   // Async overlay buffer: detections (+pose) per frame index, each tagged with the
-  // (path, model, pose) scope it was fetched under so a stale draw is impossible.
+  // (path, model) scope it was fetched under so a stale draw is impossible.
   const buffer = new Map<number, BufferEntry>();
   const inFlight = new Map<number, AbortController>();
-  // Bumped on every scope change (clip / model / pose). In-flight fetches whose
+  // Decoupled pose passes in flight (POST /api/tune/pose), keyed by frame index.
+  const poseInFlight = new Map<number, AbortController>();
+  // Bumped on every scope change (clip / model). In-flight fetches whose
   // token is stale are dropped; a new clip selection also bumps selectSeq.
   let scopeToken = 0;
   let selectSeq = 0;
@@ -190,7 +207,8 @@
 
   // Scope is (clip, model) only — NOT overlay mode. Box detections don't change
   // when the user toggles the pose overlay, so the buffer stays valid and pose
-  // is filled in additively (see `frameComplete`), never rebuffering on toggle.
+  // is filled in proactively by the decoupled pose pass (see fetchPoseInto),
+  // never rebuffering on toggle.
   function currentScopeKey(): string {
     return `${selectedPath}|${selectedModel}`;
   }
@@ -258,11 +276,28 @@
     playing = false;
     resetSeekState();
     scopeToken++;
-    buffer.clear();
-    bufferedCount = 0;
+    clearBuffers();
     // Setting selectedPath renders the <video> with the new src; onLoadedMetadata
     // then seeks to frame 0, registers rVFC, and starts the filler.
     selectedPath = path;
+  }
+
+  // Abort + drop every in-flight/queued YOLO and pose fetch and the buffered
+  // results, resetting all derived counts. The single place buffer state is
+  // cleared so a clip/model change can never leak stale entries or counters.
+  function clearBuffers(): void {
+    for (const controller of inFlight.values()) {
+      controller.abort();
+    }
+    inFlight.clear();
+    for (const controller of poseInFlight.values()) {
+      controller.abort();
+    }
+    poseInFlight.clear();
+    buffer.clear();
+    bufferedCount = 0;
+    detectedCount = 0;
+    posedCount = 0;
   }
 
   // Drop any in-flight/queued seek bookkeeping so a new clip doesn't inherit a
@@ -283,12 +318,7 @@
   function teardownClip(): void {
     selectSeq++;
     scopeToken++;
-    for (const controller of inFlight.values()) {
-      controller.abort();
-    }
-    inFlight.clear();
-    buffer.clear();
-    bufferedCount = 0;
+    clearBuffers();
     resetSeekState();
     if (videoEl) {
       try {
@@ -609,23 +639,19 @@
       return;
     }
     overlayMode = mode;
-    // No buffer reset: box detections are already valid for this (clip, model)
-    // scope. Toggling the overlay only changes whether pose is *also*
-    // fetched/drawn; syncView re-reads the current frame and pump() tops up any
-    // missing pose additively, so boxes never re-analyze from scratch.
+    // No buffer reset and no new fetches needed: boxes are valid for this
+    // (clip, model) scope and pose is precomputed proactively regardless of the
+    // overlay. Toggling only changes what's *drawn*, so syncView re-reads the
+    // current frame's already-buffered boxes/pose. (pump() is a harmless no-op
+    // here unless there's still outstanding fill work.)
     syncView();
     pump();
   }
 
-  // Invalidate + rebuild the detection buffer after a model/pose change.
+  // Invalidate + rebuild the detection buffer after a model change.
   function resetScope(): void {
     scopeToken++;
-    for (const controller of inFlight.values()) {
-      controller.abort();
-    }
-    inFlight.clear();
-    buffer.clear();
-    bufferedCount = 0;
+    clearBuffers();
     syncView();
     pump();
   }
@@ -661,49 +687,104 @@
     }
   }
 
-  // A frame is "complete" once we hold a scope-valid entry for it that also
-  // carries pose when the current overlay wants pose. This lets a boxes->pose
-  // switch re-enrich existing entries with pose instead of refetching boxes.
-  function frameComplete(idx: number): boolean {
-    const entry = buffer.get(idx);
-    if (!entry || entry.scopeKey !== currentScopeKey()) {
-      return false;
-    }
-    return entry.posed || !poseWanted();
+  // Anchor the urgency test tracks: where the user is looking (or, while playing,
+  // a touch ahead of the playhead). YOLO work within URGENT_WINDOW of it must
+  // never wait behind a pose pass.
+  function anchorIndex(): number {
+    const total = Math.max(1, totalFrames);
+    return playing
+      ? clamp(presentedIndex + leadFrames(), 0, total - 1)
+      : clamp(intendedIndex, 0, total - 1);
   }
 
+  function isUrgentYolo(idx: number): boolean {
+    return Math.abs(idx - anchorIndex()) <= URGENT_WINDOW;
+  }
+
+  function hasEntry(idx: number): boolean {
+    const entry = buffer.get(idx);
+    return !!entry && entry.scopeKey === currentScopeKey();
+  }
+
+  // Next frame still missing its YOLO detections, in priority order.
   function nextNeeded(): number | null {
     for (const idx of candidateOrder()) {
-      if (!inFlight.has(idx) && !frameComplete(idx)) {
+      if (!inFlight.has(idx) && !hasEntry(idx)) {
         return idx;
       }
     }
     return null;
   }
 
+  // Next DETECTED frame (>=1 box) whose pose pass hasn't run yet, in priority
+  // order. Frames with no boxes need no pose, so they're skipped (they never
+  // appear in the pose lane). Mirrors candidateOrder so pose fills cursor-first.
+  function nextPoseNeeded(): number | null {
+    const key = currentScopeKey();
+    for (const idx of candidateOrder()) {
+      if (poseInFlight.has(idx)) {
+        continue;
+      }
+      const entry = buffer.get(idx);
+      if (
+        entry &&
+        entry.scopeKey === key &&
+        entry.detections.length > 0 &&
+        !entry.posed
+      ) {
+        return idx;
+      }
+    }
+    return null;
+  }
+
+  // Schedule a single fetch into one free slot with strict priority:
+  //   urgent YOLO  >  pose (spare capacity, capped)  >  backfill YOLO.
+  // Returns false when there's nothing left to do.
+  function scheduleOne(): boolean {
+    const y = nextNeeded();
+    if (y !== null && isUrgentYolo(y)) {
+      void fetchInto(y);
+      return true;
+    }
+    if (poseAvailable && poseInFlight.size < MAX_POSE_INFLIGHT) {
+      const p = nextPoseNeeded();
+      if (p !== null) {
+        void fetchPoseInto(p);
+        return true;
+      }
+    }
+    if (y !== null) {
+      void fetchInto(y);
+      return true;
+    }
+    return false;
+  }
+
   function pump(): void {
     if (!selectedPath || !meta) {
       return;
     }
-    while (inFlight.size < MAX_INFLIGHT) {
-      const idx = nextNeeded();
-      if (idx === null) break;
-      void fetchInto(idx);
+    while (inFlight.size + poseInFlight.size < MAX_INFLIGHT) {
+      if (!scheduleOne()) {
+        break;
+      }
     }
   }
 
+  // YOLO detect pass — boxes only (always pose=0). Pose is filled separately by
+  // fetchPoseInto so flipping the overlay never rebuffers boxes.
   async function fetchInto(idx: number): Promise<void> {
     if (!selectedPath) return;
     const path = selectedPath;
     const model = selectedModel;
-    const pose = poseWanted();
     const scopeKey = currentScopeKey();
     const token = scopeToken;
     const controller = new AbortController();
     inFlight.set(idx, controller);
     const started = performance.now();
     try {
-      const res = await fetchTuneDetect(path, idx, model, pose, controller.signal);
+      const res = await fetchTuneDetect(path, idx, model, false, controller.signal);
       if (token !== scopeToken) {
         return; // scope changed while in flight -> drop
       }
@@ -712,14 +793,23 @@
         threshold = res.detection_floor;
       }
       floor = res.detection_floor;
-      poseAvailable = res.pose_available;
+      // poseAvailable is sticky-down: the backend disables pose app-wide on a
+      // failure, so never flip it back to true here.
+      if (!res.pose_available) {
+        poseAvailable = false;
+      }
+      // nextNeeded only yields un-buffered indices, so this is always a fresh
+      // entry in this scope -> a plain detected-count increment (no decrement).
       buffer.set(res.index, {
         scopeKey,
         detections: res.detections,
-        pose: res.pose,
-        posed: pose,
+        pose: [],
+        posed: false,
       });
       bufferedCount = buffer.size;
+      if (res.detections.length > 0) {
+        detectedCount++;
+      }
       if (res.index === presentedIndex) {
         syncView();
       }
@@ -735,6 +825,51 @@
     }
   }
 
+  // Decoupled pose pass: run pose for a detected frame's already-buffered boxes
+  // (no YOLO re-run). Mutates the existing buffer entry in place and marks it
+  // posed (even when no keypoints come back) so it isn't retried forever.
+  async function fetchPoseInto(idx: number): Promise<void> {
+    if (!selectedPath) return;
+    const entry = buffer.get(idx);
+    const scopeKey = currentScopeKey();
+    if (!entry || entry.scopeKey !== scopeKey || entry.detections.length === 0) {
+      return;
+    }
+    const path = selectedPath;
+    const token = scopeToken;
+    const boxes = entry.detections.map((d) => [d.x1, d.y1, d.x2, d.y2]);
+    const controller = new AbortController();
+    poseInFlight.set(idx, controller);
+    try {
+      const res = await fetchTunePose(path, idx, boxes, controller.signal);
+      if (token !== scopeToken) {
+        return; // scope changed while in flight -> drop
+      }
+      if (!res.pose_available) {
+        poseAvailable = false;
+      }
+      const cur = buffer.get(idx);
+      if (cur && cur.scopeKey === scopeKey && !cur.posed) {
+        cur.pose = res.pose;
+        cur.posed = true;
+        posedCount++;
+        if (idx === presentedIndex) {
+          syncView();
+        }
+        updateStrip();
+      }
+    } catch {
+      // Aborted or a transient pose error: leave the frame un-posed; it'll be
+      // retried on the next pass (unless pose got disabled above).
+    } finally {
+      poseInFlight.delete(idx);
+      if (token === scopeToken) {
+        pump();
+      }
+    }
+  }
+
+
   // --- rendering ------------------------------------------------------------
 
   // Redraw the box/pose overlay when its inputs change. This effect only paints
@@ -748,11 +883,17 @@
     drawOverlay();
   });
 
-  // Redraw the "analyzed" strip when the buffer grows or the playhead moves.
+  // Redraw the two-lane "analyzed/pose" strip when the buffer grows, the
+  // playhead moves, or anything affecting lane shading changes. The YOLO lane's
+  // bright fill reacts live to `threshold`; the pose lane reacts to `posedCount`.
   $effect(() => {
     void bufferedCount;
+    void detectedCount;
+    void posedCount;
     void presentedIndex;
     void totalFrames;
+    void threshold;
+    void poseAvailable;
     updateStrip();
   });
 
@@ -837,36 +978,99 @@
     }
   }
 
-  // The "analyzed" strip under the scrub bar: which frames have detections
-  // buffered yet. It's a separate canvas inset (in CSS) by half the range thumb
-  // width and uses the SAME value->position mapping as the native range —
-  // idx / (total - 1) across the canvas width — so a buffered column sits exactly
-  // under the thumb for that frame, at every position including the two ends.
+  // The two-lane timeline strip under the scrub bar:
+  //   Lane 1 (YOLO):  faint track = frame analyzed (swept); bright green = >=1
+  //     detection ABOVE the current confidence threshold, opacity ~ top kept
+  //     confidence. Reacts live to the slider.
+  //   Lane 2 (pose):  faint track = frame has >=1 detection (a dog present);
+  //     bright cyan = pose pass ran AND produced keypoints, opacity ~ mean
+  //     keypoint confidence.
+  // It's a separate canvas inset (in CSS) by half the range thumb width and uses
+  // the SAME value->position mapping as the native range (idx / (total - 1)
+  // across the canvas width), so a column sits exactly under the thumb for that
+  // frame at every position including the ends. Multiple frames can collapse to
+  // one pixel column, so values are aggregated per-column by max and drawn
+  // background -> faint -> bright (bright last) so a faint frame can never paint
+  // over a brighter neighbour.
   function updateStrip(): void {
     const c = stripEl;
     if (!c || totalFrames <= 0) {
       return;
     }
     const w = c.clientWidth || 300;
-    const h = 8;
+    const laneH = 8;
+    const gap = 2;
+    const h = laneH * 2 + gap;
     if (c.width !== w) c.width = w;
     if (c.height !== h) c.height = h;
     const ctx = c.getContext("2d");
     if (!ctx) {
       return;
     }
+    const lane2Y = laneH + gap;
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#23303f";
-    ctx.fillRect(0, 0, w, h);
+    // Lane backgrounds.
+    ctx.fillStyle = "#1b2532";
+    ctx.fillRect(0, 0, w, laneH);
+    ctx.fillRect(0, lane2Y, w, laneH);
+
     const span = Math.max(1, totalFrames - 1);
     const colW = Math.max(1, Math.ceil(w / totalFrames));
-    ctx.fillStyle = "#3f7d5a";
+    const maxX = Math.max(0, w - colW);
+    // Per-column aggregates (max). -1 marks "no bright signal" for the conf lanes.
+    const analyzed = new Uint8Array(w);
+    const detected = new Uint8Array(w);
+    const keptConf = new Float32Array(w).fill(-1);
+    const poseConf = new Float32Array(w).fill(-1);
     const key = currentScopeKey();
     for (const [idx, entry] of buffer) {
       if (entry.scopeKey !== key) continue;
-      const x = Math.min(w - colW, Math.floor((idx / span) * w));
-      ctx.fillRect(x, 0, colW, h);
+      const x = clamp(Math.floor((idx / span) * w), 0, maxX);
+      analyzed[x] = 1;
+      let top = -1;
+      for (const d of entry.detections) {
+        if (d.confidence >= threshold && d.confidence > top) top = d.confidence;
+      }
+      if (top > keptConf[x]) keptConf[x] = top;
+      if (entry.detections.length > 0) {
+        detected[x] = 1;
+        if (entry.posed && entry.pose.length > 0) {
+          let sum = 0;
+          let n = 0;
+          for (const p of entry.pose) {
+            for (const kp of p.keypoints) {
+              sum += kp.confidence;
+              n++;
+            }
+          }
+          const mc = n > 0 ? sum / n : 0;
+          if (mc > poseConf[x]) poseConf[x] = mc;
+        }
+      }
     }
+
+    // Faint tracks first.
+    ctx.fillStyle = "#33506b";
+    for (let x = 0; x < w; x++) if (analyzed[x]) ctx.fillRect(x, 0, colW, laneH);
+    ctx.fillStyle = "#2c5566";
+    for (let x = 0; x < w; x++) if (detected[x]) ctx.fillRect(x, lane2Y, colW, laneH);
+
+    // Bright fills on top, opacity encoding confidence.
+    ctx.fillStyle = "#28d17c";
+    for (let x = 0; x < w; x++) {
+      if (keptConf[x] >= 0) {
+        ctx.globalAlpha = clamp(0.35 + 0.65 * keptConf[x], 0.35, 1);
+        ctx.fillRect(x, 0, colW, laneH);
+      }
+    }
+    ctx.fillStyle = "#5ad1ff";
+    for (let x = 0; x < w; x++) {
+      if (poseConf[x] >= 0) {
+        ctx.globalAlpha = clamp(0.35 + 0.65 * poseConf[x], 0.35, 1);
+        ctx.fillRect(x, lane2Y, colW, laneH);
+      }
+    }
+    ctx.globalAlpha = 1;
   }
 
   // --- zoom crops -----------------------------------------------------------
@@ -1124,6 +1328,14 @@
           <span class="kept">▣ {aboveCount}</span>
           <span class="dropped">▢ {belowCount}</span>
           {#if totalFrames}<span class="muted">analyzed {bufferedCount}/{totalFrames}</span>{/if}
+          {#if totalFrames}<span class="hud-yolo">dogs {detectedCount}</span>{/if}
+          {#if totalFrames}
+            {#if poseAvailable}
+              <span class="hud-pose">pose {posedCount}/{detectedCount}</span>
+            {:else}
+              <span class="muted">pose n/a</span>
+            {/if}
+          {/if}
         </div>
 
         <div class="scrub">
@@ -1144,6 +1356,10 @@
           />
           <div class="strip-wrap">
             <canvas bind:this={stripEl} class="strip"></canvas>
+            <div class="strip-legend mono small muted">
+              <span><i class="sw yolo"></i> YOLO (analyzed · detected)</span>
+              <span><i class="sw pose"></i> pose</span>
+            </div>
           </div>
         </div>
 
@@ -1556,8 +1772,32 @@
   .strip-wrap .strip {
     display: block;
     width: 100%;
-    height: 8px;
+    height: 18px;
     border-radius: 3px;
+  }
+
+  .strip-legend {
+    display: flex;
+    gap: 1rem;
+    margin-top: 3px;
+    padding-inline: 1px;
+  }
+
+  .strip-legend .sw {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    margin-right: 4px;
+    vertical-align: -1px;
+  }
+
+  .strip-legend .sw.yolo {
+    background: #28d17c;
+  }
+
+  .strip-legend .sw.pose {
+    background: #5ad1ff;
   }
 
   .model {
@@ -1637,6 +1877,14 @@
 
   .hud .dropped {
     color: #e0556b;
+  }
+
+  .hud .hud-yolo {
+    color: #28d17c;
+  }
+
+  .hud .hud-pose {
+    color: #5ad1ff;
   }
 
   .controls {

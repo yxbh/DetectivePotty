@@ -36,7 +36,9 @@ import numpy as np
 if TYPE_CHECKING:
     from detectivepotty.config import Config
     from detectivepotty.events import Detection
+    from detectivepotty.geometry import BBox
     from detectivepotty.pose.base import PoseEstimator
+    from detectivepotty.pose.keypoints import PoseKeypoints
 
 # Container/extension allow-list for the file browser. Lower-cased suffix match.
 VIDEO_EXTENSIONS: frozenset[str] = frozenset(
@@ -437,6 +439,27 @@ def detections_payload(detections: Sequence[Detection]) -> list[dict[str, Any]]:
     ]
 
 
+def _pose_entry(bbox: BBox, keypoints: PoseKeypoints) -> dict[str, Any]:
+    """Shape one (bbox, keypoints) pair into the overlay payload.
+
+    Coordinates are original-resolution pixels (the same space as the boxes), so
+    the client draws boxes and keypoints in one coordinate frame.
+    """
+
+    return {
+        "bbox": [float(bbox.x1), float(bbox.y1), float(bbox.x2), float(bbox.y2)],
+        "keypoints": [
+            {
+                "name": name,
+                "x": float(point.x),
+                "y": float(point.y),
+                "confidence": float(point.confidence),
+            }
+            for name, point in keypoints.points.items()
+        ],
+    }
+
+
 def pose_payload(
     estimator: PoseEstimator,
     frame_bgr: np.ndarray,
@@ -445,9 +468,7 @@ def pose_payload(
 ) -> list[dict[str, Any]]:
     """Estimate pose for each detection and shape keypoints for the overlay.
 
-    One entry per detection that yields keypoints; coordinates are
-    original-resolution pixels (same space as the boxes), so the client draws
-    boxes and keypoints in one coordinate frame.
+    One entry per detection that yields keypoints.
     """
 
     out: list[dict[str, Any]] = []
@@ -460,25 +481,47 @@ def pose_payload(
         )
         if keypoints is None:
             continue
-        out.append(
-            {
-                "bbox": [
-                    float(det.bbox.x1),
-                    float(det.bbox.y1),
-                    float(det.bbox.x2),
-                    float(det.bbox.y2),
-                ],
-                "keypoints": [
-                    {
-                        "name": name,
-                        "x": float(point.x),
-                        "y": float(point.y),
-                        "confidence": float(point.confidence),
-                    }
-                    for name, point in keypoints.points.items()
-                ],
-            }
+        out.append(_pose_entry(det.bbox, keypoints))
+    return out
+
+
+def pose_payload_for_boxes(
+    estimator: PoseEstimator,
+    frame_bgr: np.ndarray,
+    boxes: Sequence[Sequence[float]],
+    frame_idx: int,
+) -> list[dict[str, Any]]:
+    """Estimate pose for client-supplied ``[x1, y1, x2, y2]`` boxes.
+
+    Drives the decoupled pose pass (``POST /api/tune/pose``): the tuner sends the
+    detection boxes it already buffered, so pose runs **without re-running YOLO**.
+    Boxes are clamped to the frame and degenerate (zero/negative-area) boxes are
+    skipped; one entry is returned per box that yields keypoints.
+    """
+
+    from detectivepotty.geometry import BBox
+
+    height, width = frame_bgr.shape[:2]
+    out: list[dict[str, Any]] = []
+    for box in boxes:
+        if len(box) != 4:
+            continue
+        x1 = min(max(float(box[0]), 0.0), float(width))
+        y1 = min(max(float(box[1]), 0.0), float(height))
+        x2 = min(max(float(box[2]), 0.0), float(width))
+        y2 = min(max(float(box[3]), 0.0), float(height))
+        bbox = BBox(x1, y1, x2, y2)
+        if bbox.width <= 0 or bbox.height <= 0:
+            continue
+        keypoints = estimator.estimate(
+            frame_bgr,
+            bbox,
+            frame_idx=frame_idx,
+            source_id="tune",
         )
+        if keypoints is None:
+            continue
+        out.append(_pose_entry(bbox, keypoints))
     return out
 
 

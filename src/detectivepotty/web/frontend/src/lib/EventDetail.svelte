@@ -90,10 +90,10 @@
     if (dur != null) {
       parts.push(`stationary ${dur.toFixed(1)}s${durThr != null ? ` ≥ ${durThr.toFixed(1)}s` : ""}`);
     }
-    const squat = num(s.squat_metric);
-    const squatThr = num(s.squat_threshold);
-    if (squat != null) {
-      parts.push(`squat ${squat.toFixed(2)}${squatThr != null ? ` ≥ ${squatThr.toFixed(2)}` : ""}`);
+    const dwell = num(s.dwell_duration_s);
+    const dwellThr = num(s.dwell_trigger_s);
+    if (dwell != null) {
+      parts.push(`held ${dwell.toFixed(1)}s${dwellThr != null ? ` ≥ ${dwellThr.toFixed(1)}s` : ""}`);
     }
     return parts.length ? parts.join(" · ") : "n/a";
   }
@@ -153,7 +153,7 @@
       {
         title: "Posture",
         value: posturePhrase(meta.extra?.posture_summary),
-        hint: "Why this fired: the stationary + squat evidence measured against the camera's thresholds.",
+        hint: "Why this fired: how long the dog held still (dwell) measured against the camera's trigger threshold.",
       },
     ];
   });

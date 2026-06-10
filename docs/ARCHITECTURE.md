@@ -20,7 +20,7 @@ sequenceDiagram
     Buf->>Det: sampled original frames
     Det->>Track: dog Detection boxes in original pixels
     Track->>SM: Track histories
-    SM-->>Rec: PottyCandidate when stationary+squat persists
+    SM-->>Rec: PottyCandidate when stationary dwell persists
     Buf->>Rec: pre-roll + event + post-roll frames
     Rec->>Rec: weak heuristic classifier guess
     Rec->>Rec: write clip.mp4, frames, crops, metadata.json
@@ -56,7 +56,13 @@ sequenceDiagram
 1. **Capture warms up first.** File mode decodes inline. Protect mode obtains an RTSPS URL, starts an `RTSPSource`, and pumps frames into a `RollingBuffer` so event capture is not cold-started.
 2. **Triggers annotate windows.** `ProtectAnimalTrigger` parses Animal smart-detect events with detection and notification timestamps. `YoloTrigger` can emit fallback dog-appearance triggers from a warm source. The state machine itself only needs detections and a `TriggerReason`, so it is trigger-agnostic.
 3. **Detect small, crop big.** `DogDetector` resizes only the inference frame. Detections are mapped back to original pixel coordinates. `EventRecorder` saves full frames and dog-centered crops from the original decoded frames.
-4. **Track posture.** `Tracker` links dog detections by IoU. `PottyEventDetector` watches for a stationary window plus a squat-like bbox height/aspect change. It emits a camera/time-window `PottyCandidate`, not just a raw track ID.
+4. **Track posture.** `Tracker` links dog detections by IoU. `PottyEventDetector` emits a potty
+   candidate when a non-suppressed track holds **stationary continuously for `dwell_trigger_s`**
+   (default 2 s, viewpoint-invariant). This sustained-dwell hold is the sole, robust trigger for
+   high/top-down cameras, where the old bbox squat metric was foreshortened and never registered a
+   steady squat (it was removed entirely). The recorded `posture_summary` keeps the measured
+   `dwell_duration_s` / `dwell_trigger_s` so events stay triageable in review. It emits a
+   camera/time-window `PottyCandidate`, not just a raw track ID.
 5. **Record after post-roll.** The pipeline waits for `post_roll_s`, assembles `[pre_roll, event, post_roll]` from the buffer/history, runs the weak classifier, and writes `clip.mp4`, `frames/`, `crops/`, and `metadata.json`.
 6. **Review is the source of truth.** The FastAPI app scans `metadata.json` files, serves media (a prebuilt Svelte frontend from `web/frontend/dist/`), and atomically updates `label`, `label_status`, `extra.label_note`, and `extra.labeled_at`.
 7. **Reruns reconcile, not duplicate.** With `dedupe_reruns` on (default), `EventRecorder` snapshots the prior on-disk events for each camera + source at the start of a run and matches each new event against that snapshot (Protect `event_id` → source-relative `[source_start_s, source_end_s]` overlap → wall-clock `[start_ts, end_ts]` overlap → start within `rerun_match_tolerance_s`). The source-relative offsets are anchor-independent (`frame_idx / fps`), so file reruns dedupe even when the wall-clock basis is the non-deterministic `runtime_now` fallback. A match reuses the prior identity, carries human label fields forward, refreshes the media, moves `protect_recording.mp4` forward, and supersedes the duplicate — only after the new metadata is committed. Disagreeing labeled matches are treated as conflicts (carry nothing, delete nothing); unmatched labeled priors are kept. The `dedupe-events` CLI applies the same logic to existing on-disk duplicates without re-detecting; `cleanup-legacy` reversibly quarantines pre-determinism duplicates (unlabeled, no offsets, source still present) into `<dataset>/.trash/` so a clean rerun can regenerate honest events.
@@ -100,3 +106,23 @@ All path components are sanitized; source URLs are stripped of credentials and s
 ## Current validation path
 
 The offline tests inject fake detectors and synthetic videos, so they do not require a GPU, model download, NVR, camera, or network. The integration path exercises `run_pipeline` → dataset writer → FastAPI review API → label update on disk.
+
+## Model roadmap (data-gated, not yet implemented)
+
+The trigger and the pose pee/poop guess are deliberately **heuristics whose job is to
+bootstrap a labeled dataset**, not to be the final detector. The Apollo 17:29 diagnosis showed
+the gap is **behavior recognition, not detection** — generic YOLO already detects the dog at
+0.6–0.84 confidence right through the potty hold; what failed was the bbox squat metric. So a
+fine-tuned *dog detector* is low ROI. The valuable model is a **potty-behavior** model, and every
+variant is **data-gated** (only a handful of labeled clips exist today).
+
+- **First model = a crop classifier.** Fine-tune a small image classifier (e.g. YOLO-cls or a
+  lightweight CNN) on the saved dog crops: "potty-squat vs not". It runs as a **second stage** on
+  dwell candidates to trim the intentional over-capture (a dwell trigger also fires on a dog that
+  simply sits/sniffs in place) and can recover events. Lowest data and complexity cost.
+- **Later:** temporal action recognition (clip → potty/not) for the "still but not pottying" cases;
+  optionally fine-tune SuperAnimal for small/top-down dogs (low ROI given current crop sizes).
+- **Data gate to start:** revisit once there are on the order of a few hundred human-labeled events
+  (`pee`/`poop`/`not_potty`). The Phase-1 stationary-dwell trigger plus the existing crop/metadata
+  capture is exactly what produces that set — the saved crops and `posture_summary` dwell metadata are
+  the training data — so the heuristic is designed to feed the model, not compete with it.

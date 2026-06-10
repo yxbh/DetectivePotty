@@ -26,7 +26,7 @@ flowchart LR
     J --> K[FastAPI review + labeling app]
 ```
 
-Main flow: cameras/Protect (or a local file) feed `VideoSource`; a warm buffer preserves pre-roll; `DogDetector` finds dogs; `Tracker` builds tracks; `PottyEventDetector` emits generic potty candidates from stationary+squat posture; `HeuristicPottyClassifier` pre-fills a weak guess; `EventRecorder` writes clips, frames, crops, and metadata; the FastAPI app reads the dataset for review and labeling.
+Main flow: cameras/Protect (or a local file) feed `VideoSource`; a warm buffer preserves pre-roll; `DogDetector` finds dogs; `Tracker` builds tracks; `PottyEventDetector` emits generic potty candidates from a sustained stationary dwell; `HeuristicPottyClassifier` pre-fills a weak guess; `EventRecorder` writes clips, frames, crops, and metadata; the FastAPI app reads the dataset for review and labeling.
 
 For more detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -120,7 +120,10 @@ Important fields:
 - `detection_conf_threshold`: dog confidence threshold.
 - `event_duration_s`: how long a candidate must persist before recording.
 - `stationary_threshold_s`: stationary posture window.
-- `squat_threshold`: bbox posture threshold for squat-like motion.
+- `dwell_trigger_s`: continuous stationary hold (seconds) that triggers a potty candidate. This is
+  the sole detection trigger — a viewpoint-invariant sustained-dwell cue that works on high/top-down
+  cameras where a bbox squat metric is unreliable. Must be `> 0` (default 2). (The old
+  `squat_threshold` field was removed; delete it from any existing config or validation will fail.)
 - `sample_rate_fps`: detector sampling rate.
 - `pre_roll_s`, `post_roll_s`: event window around the candidate.
 - `roi`, `ignore_zones`: normalized polygon zones for include/exclude filtering.
@@ -149,10 +152,10 @@ heuristics, so enabling pose never removes the bbox coverage/recall behavior. Re
 - `candidate_only`: when set, the classifier only runs pose on candidate windows (not every dog every frame).
 - `enable_pose_classifier`: let `PosePottyClassifier` use pose for the pee/poop guess (still `needs_label=true`).
 - `enable_pose_gate`: **experimental — not yet validated with the real pose backend.** Lets pose augment
-  the detection gate's squat/stationary signals. It is strictly additive (it can flip a frame's squat to
-  true and relax the motion-jitter check via OR, but never removes the bbox `covered_long_enough`
-  requirement). The gate-OFF path is byte-for-byte identical to the bbox baseline (verified: the 4-clip
-  regression stays 1/1/1/2 with the gate off). Keep it `false` until it has been validated end-to-end
+  the detection gate's stationarity signal. It is strictly additive (it can relax the motion-jitter check
+  via OR for the dwell trigger, but never removes the bbox `covered_long_enough` requirement, and its
+  squat signal is no longer consumed). The gate-OFF path is byte-for-byte identical to the bbox baseline.
+  Keep it `false` until it has been validated end-to-end
   against the real `superanimal` backend on the night/IR clips; the mock backend only proves wiring.
 
 
@@ -243,7 +246,7 @@ uv run detectivepotty serve --config config.yaml
 
 Open <http://127.0.0.1:8000>. The portal is a keyboard-first, two-pane "review console": an independently-scrollable event list on the left and the selected event (clip, crops/frames, metadata, label panel) on the right. It writes labels back into `metadata.json`. The command bar shows a status filter, a camera filter, and a progress meter ("X of Y labeled"); the sidebar/header report how many events match the current filter and the total recorded on disk. If the bundle hasn't been built yet, `serve` still starts and the page tells you to run `npm run build`. (For active frontend development with hot reload, see [Development](#development).)
 
-> One recorded event = one detected potty behavior, **not** one input file. A clip with no qualifying stationary+squat behavior produces zero events, and a busy clip can produce several. So 4 input files may legitimately yield 3 events. The status filter defaults to **All**; switching it to `Unlabeled` hides events once you label them.
+> One recorded event = one detected potty behavior, **not** one input file. A clip with no qualifying stationary-dwell behavior produces zero events, and a busy clip can produce several. So 4 input files may legitimately yield 3 events. The status filter defaults to **All**; switching it to `Unlabeled` hides events once you label them.
 
 **Two timestamps, clearly separated.** Each event shows both:
 

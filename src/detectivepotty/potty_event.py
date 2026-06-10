@@ -62,7 +62,6 @@ class PottyCandidate:
     ambiguous: bool
     lifecycle: PottyLifecycle
     stationary_duration_s: float
-    squat_metric: float
     posture_summary: dict[str, Any] = field(default_factory=dict)
     near_miss: bool = False
     confidence: float = 0.0
@@ -83,11 +82,7 @@ class _PostureStats:
     stationary_duration_s: float
     max_centroid_motion_px: float
     centroid_motion_threshold_px: float
-    squat_metric: float
-    height_drop: float
-    aspect_ratio_increase: float
     is_stationary: bool
-    is_squat: bool
     window_start_mono: float
     window_end_mono: float
     pose_summary: dict[str, Any] | None = None
@@ -96,14 +91,13 @@ class _PostureStats:
 class PottyEventDetector:
     """State machine that emits generic potty candidates for one camera.
 
-    Stationary metric: over the trailing ``stationary_threshold_s`` window the dog's
-    detections must cover most of that window (within a per-camera sampling
-    tolerance, so intermittent night-time detections still qualify) and the maximum
-    center displacement from the first center must be no more than
-    ``max(10px, 20% of the median bbox diagonal)``. Squat metric: the max of
-    relative bbox height drop and relative width/height aspect-ratio increase
-    compared with the track's standing-looking history. It must exceed
-    ``CameraConfig.squat_threshold``.
+    Trigger: a non-suppressed track that reads stationary continuously for at least
+    ``CameraConfig.dwell_trigger_s`` becomes a candidate (a viewpoint-invariant
+    sustained-dwell cue). Stationary metric: over the trailing
+    ``stationary_threshold_s`` window the dog's detections must cover most of that
+    window (within a per-camera sampling tolerance, so intermittent night-time
+    detections still qualify) and the maximum center displacement from the first
+    center must be no more than ``max(10px, 20% of the median bbox diagonal)``.
     """
 
     def __init__(
@@ -132,6 +126,16 @@ class PottyEventDetector:
         self._event_due_mono: float | None = None
         self._best_stats: _PostureStats | None = None
         self._near_miss_stats: _PostureStats | None = None
+        # Per-track continuous-stationary run start (mono_ts); drives the dwell
+        # trigger. Cleared when a track stops being stationary or the window resets.
+        # Brief detection gaps are tolerated on purpose: ``is_stationary`` itself is
+        # computed over a gap-forgiving trailing window (so intermittent night-time
+        # detections still qualify), and dwell credit only survives while the track
+        # stays alive in the tracker (bounded by ``max_age_frames``).
+        self._stationary_since: dict[str, float] = {}
+        # Continuous dwell (s) of the current candidate's primary track, captured for
+        # confidence scaling and review metadata.
+        self._best_dwell_s: float = 0.0
         self._suppressed_track_ids: set[str] = set()
         self._last_frame: Frame | None = None
         self._last_trigger_reason = TriggerReason.YOLO
@@ -240,6 +244,8 @@ class PottyEventDetector:
         self._event_due_mono = None
         self._best_stats = None
         self._near_miss_stats = None
+        self._stationary_since = {}
+        self._best_dwell_s = 0.0
 
     def _append_window(
         self,
@@ -278,15 +284,43 @@ class PottyEventDetector:
                 self._near_miss_stats,
             ):
                 self._near_miss_stats = item
+
+        # Maintain a per-track continuous-stationary accumulator so a dog that simply
+        # holds still long enough triggers a candidate. Runs are dropped the moment a
+        # track stops reading stationary.
+        stationary_ids = {item.track_id for item in stationary}
+        self._stationary_since = {
+            track_id: since
+            for track_id, since in self._stationary_since.items()
+            if track_id in stationary_ids
+        }
+        dwell_by_id: dict[str, float] = {}
+        for item in stationary:
+            since = self._stationary_since.get(item.track_id)
+            if since is None:
+                # Credit the coverage already observed in the trailing window.
+                since = item.window_start_mono
+                self._stationary_since[item.track_id] = since
+            dwell_by_id[item.track_id] = frame.mono_ts - since
+
+        dwell_trigger_s = self.camera_config.dwell_trigger_s
         candidates = [
             item
             for item in stationary
-            if item.is_squat and item.track_id not in self._suppressed_track_ids
+            if item.track_id not in self._suppressed_track_ids
+            and dwell_by_id[item.track_id] >= dwell_trigger_s
         ]
         if not candidates:
             return
-        best = max(candidates, key=_posture_rank)
+        # Rank by the real continuous dwell first (the trigger signal), then by the
+        # trailing-window span as a tiebreaker, so the strongest hold wins.
+        best = max(
+            candidates,
+            key=lambda item: (dwell_by_id[item.track_id], item.stationary_duration_s),
+        )
+        best_dwell = dwell_by_id.get(best.track_id, 0.0)
         self._best_stats = best
+        self._best_dwell_s = best_dwell
         if self._state != _DetectorState.CANDIDATE:
             self._state = _DetectorState.CANDIDATE
             self._primary_track_id = best.track_id
@@ -294,6 +328,7 @@ class PottyEventDetector:
             self._event_due_mono = frame.mono_ts + self.camera_config.event_duration_s
         elif self._primary_track_id == best.track_id:
             self._best_stats = best
+            self._best_dwell_s = best_dwell
 
     def _posture_stats(self, track: Track, current_mono: float) -> _PostureStats:
         threshold_s = self.camera_config.stationary_threshold_s
@@ -317,15 +352,13 @@ class PottyEventDetector:
         ]
         median_diag = sorted(diagonals)[len(diagonals) // 2] if diagonals else 0.0
         motion_threshold = max(10.0, 0.2 * median_diag)
-        height_drop, aspect_increase = self._squat_components(track, recent)
-        squat_metric = max(height_drop, aspect_increase)
         # The trailing window must *cover* most of ``stationary_threshold_s`` rather
         # than span it exactly. Allow it to fall short by the larger of ~15% of the
         # threshold or two sample intervals (capped at half the threshold): discrete
         # sampling and intermittent (e.g. night) detections leave the in-window span
-        # structurally below the threshold even when the dog stood still and squatted
-        # for many seconds. Requiring real coverage (not merely an old track) still
-        # rejects a near-empty window, and the motion check enforces localization.
+        # structurally below the threshold even when the dog stood still for many
+        # seconds. Requiring real coverage (not merely an old track) still rejects a
+        # near-empty window, and the motion check enforces localization.
         sample_fps = self.camera_config.sample_rate_fps
         sample_interval_s = (1.0 / sample_fps) if sample_fps > 0 else 0.0
         coverage_tolerance_s = min(
@@ -338,22 +371,24 @@ class PottyEventDetector:
 
         bbox_motion_ok = max_motion <= motion_threshold
         bbox_is_stationary = covered_long_enough and bbox_motion_ok
-        bbox_is_squat = squat_metric >= self.camera_config.squat_threshold
 
-        # Pose is additive: it may flip squat to True and relax the motion-jitter
-        # check, but it never removes the bbox coverage requirement, so the
-        # candidate-window timing structure (and the recall fix) is preserved. When
-        # the gate is off or pose is too sparse/low-quality, this leaves the bbox
-        # result and posture_summary byte-for-byte unchanged.
+        # Pose is additive: it may relax the motion-jitter check, but it never removes
+        # the bbox coverage requirement, so the candidate-window timing structure (and
+        # the dwell recall fix) is preserved. When the gate is off or pose is too
+        # sparse/low-quality, this leaves the bbox result and posture_summary
+        # byte-for-byte unchanged.
         is_stationary = bbox_is_stationary
-        is_squat = bbox_is_squat
         pose_summary: dict[str, Any] | None = None
         if self.pose_gate is not None:
             gate_result = self.pose_gate.posture(recent)
             if gate_result is not None:
-                pose_summary = gate_result.summary()
-                if gate_result.pose_squat:
-                    is_squat = True
+                # The detection trigger is dwell-only, so the gate's squat signal is
+                # not consumed and must not leak into review metadata.
+                pose_summary = {
+                    key: value
+                    for key, value in gate_result.summary().items()
+                    if key != "pose_squat"
+                }
                 if gate_result.pose_stationary:
                     is_stationary = covered_long_enough and (
                         bbox_motion_ok or gate_result.pose_stationary
@@ -364,11 +399,7 @@ class PottyEventDetector:
             stationary_duration_s=duration_s,
             max_centroid_motion_px=max_motion,
             centroid_motion_threshold_px=motion_threshold,
-            squat_metric=squat_metric,
-            height_drop=height_drop,
-            aspect_ratio_increase=aspect_increase,
             is_stationary=is_stationary,
-            is_squat=is_squat,
             window_start_mono=recent[0].mono_ts if recent else current_mono,
             window_end_mono=recent[-1].mono_ts if recent else current_mono,
             pose_summary=pose_summary,
@@ -397,36 +428,6 @@ class PottyEventDetector:
                     keep.add(id(detection))
         return keep
 
-    @staticmethod
-    def _squat_components(
-        track: Track,
-        recent: Sequence[Detection],
-    ) -> tuple[float, float]:
-        if not recent:
-            return 0.0, 0.0
-        heights = [detection.bbox.height for detection in track.detections]
-        recent_heights = [detection.bbox.height for detection in recent]
-        max_height = max(heights, default=0.0)
-        min_recent_height = min(recent_heights, default=0.0)
-        height_drop = 0.0
-        if max_height > 0.0:
-            height_drop = max(0.0, (max_height - min_recent_height) / max_height)
-
-        aspects = [
-            detection.bbox.width / detection.bbox.height
-            for detection in track.detections
-            if detection.bbox.height > 0.0
-        ]
-        recent_aspects = [
-            detection.bbox.width / detection.bbox.height
-            for detection in recent
-            if detection.bbox.height > 0.0
-        ]
-        aspect_increase = 0.0
-        if aspects and recent_aspects and min(aspects) > 0.0:
-            aspect_increase = max(0.0, (max(recent_aspects) - min(aspects)) / min(aspects))
-        return height_drop, aspect_increase
-
     def _finish_event(self, frame: Frame, near_miss: bool) -> PottyCandidate:
         if self._window_start_mono is None or self._window_start_ts is None:
             self._start_window(frame)
@@ -440,6 +441,9 @@ class PottyEventDetector:
             primary_track_id = "unknown"
         stats = self._near_miss_stats if near_miss else self._best_stats
         posture_summary = self._posture_summary(stats)
+        dwell_duration_s = 0.0 if near_miss else self._best_dwell_s
+        posture_summary["dwell_trigger_s"] = self.camera_config.dwell_trigger_s
+        posture_summary["dwell_duration_s"] = dwell_duration_s
         detections = [
             detection
             for detection in self._window_detections
@@ -448,7 +452,7 @@ class PottyEventDetector:
         multi_dog = self._multi_dog or len(tracks) > 1
         ambiguous = self._ambiguous or multi_dog
         lifecycle = PottyLifecycle.NEAR_MISS if near_miss else PottyLifecycle.EMITTED
-        confidence = self._confidence(stats, near_miss)
+        confidence = self._confidence(stats, near_miss, dwell_duration_s)
         return PottyCandidate(
             camera_id=self.camera_id,
             primary_track_id=primary_track_id,
@@ -461,7 +465,6 @@ class PottyEventDetector:
             ambiguous=ambiguous,
             lifecycle=lifecycle,
             stationary_duration_s=stats.stationary_duration_s if stats else 0.0,
-            squat_metric=stats.squat_metric if stats else 0.0,
             posture_summary=posture_summary,
             near_miss=near_miss,
             confidence=confidence,
@@ -486,17 +489,12 @@ class PottyEventDetector:
         if stats is None:
             return {
                 "stationary_threshold_s": self.camera_config.stationary_threshold_s,
-                "squat_threshold": self.camera_config.squat_threshold,
             }
         summary = {
             "stationary_threshold_s": self.camera_config.stationary_threshold_s,
             "stationary_duration_s": stats.stationary_duration_s,
             "max_centroid_motion_px": stats.max_centroid_motion_px,
             "centroid_motion_threshold_px": stats.centroid_motion_threshold_px,
-            "squat_threshold": self.camera_config.squat_threshold,
-            "squat_metric": stats.squat_metric,
-            "height_drop": stats.height_drop,
-            "aspect_ratio_increase": stats.aspect_ratio_increase,
             "posture_window_start_mono": stats.window_start_mono,
             "posture_window_end_mono": stats.window_end_mono,
         }
@@ -507,12 +505,18 @@ class PottyEventDetector:
         return summary
 
     @staticmethod
-    def _confidence(stats: _PostureStats | None, near_miss: bool) -> float:
+    def _confidence(
+        stats: _PostureStats | None,
+        near_miss: bool,
+        dwell_duration_s: float = 0.0,
+    ) -> float:
         if stats is None:
             return 0.25 if near_miss else 0.5
         if near_miss:
             return min(0.45, 0.25 + 0.05 * stats.stationary_duration_s)
-        return min(0.9, 0.55 + 0.2 * stats.squat_metric)
+        # Events are dwell-triggered: confidence grows with how long the dog actually
+        # held still.
+        return min(0.7, 0.4 + 0.03 * dwell_duration_s)
 
     def _suppress_tracks(self, candidate: PottyCandidate) -> None:
         self._suppressed_track_ids.update(track.track_id for track in candidate.tracks)
@@ -530,12 +534,14 @@ class PottyEventDetector:
         self._event_due_mono = None
         self._best_stats = None
         self._near_miss_stats = None
+        self._stationary_since = {}
+        self._best_dwell_s = 0.0
         if clear_suppressed:
             self._suppressed_track_ids = set()
 
 
 def _posture_rank(stats: _PostureStats) -> tuple[float, float]:
-    return (stats.squat_metric, stats.stationary_duration_s)
+    return (stats.stationary_duration_s, -stats.max_centroid_motion_px)
 
 
 def _first_track_id(tracks: Sequence[Track]) -> str | None:

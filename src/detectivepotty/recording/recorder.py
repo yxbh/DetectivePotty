@@ -414,7 +414,6 @@ def _candidate_extra(
         "primary_track_id": candidate.primary_track_id,
         "lifecycle": candidate.lifecycle.value,
         "stationary_duration_s": candidate.stationary_duration_s,
-        "squat_metric": candidate.squat_metric,
         "posture_summary": candidate.posture_summary,
         "near_miss": candidate.near_miss,
         "candidate_confidence": candidate.confidence,

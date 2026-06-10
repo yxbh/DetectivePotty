@@ -98,7 +98,7 @@ def make_config(dataset_dir: Path, video_path: Path) -> Config:
                 detection_conf_threshold=0.1,
                 event_duration_s=0.5,
                 stationary_threshold_s=0.5,
-                squat_threshold=0.2,
+                dwell_trigger_s=1.0,
                 sample_rate_fps=10.0,
                 pre_roll_s=0.2,
                 post_roll_s=0.3,

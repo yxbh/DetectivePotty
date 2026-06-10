@@ -22,7 +22,9 @@ def _camera_config(**overrides: object) -> CameraConfig:
         "detection_conf_threshold": 0.25,
         "event_duration_s": 2.0,
         "stationary_threshold_s": 1.0,
-        "squat_threshold": 0.3,
+        # The trigger is dwell-only; default to a real (>0) dwell. Tests that want to
+        # isolate the pose gate without a dwell trigger use a short hold instead.
+        "dwell_trigger_s": 5.0,
         "sample_rate_fps": 1.0,
     }
     values.update(overrides)
@@ -68,52 +70,62 @@ def _squat_gate(**kwargs: object) -> PoseGate:
     return PoseGate(squat_fn, min_required_frames=2, min_pose_coverage=0.5, **kwargs)
 
 
-def test_pose_gate_promotes_bbox_non_squat_window_to_event() -> None:
-    """A stationary dog whose *bbox* never reads as a squat still emits when pose
-    reports a squat — pose adds recall the bbox heuristic missed."""
+def test_gate_on_dwell_event_strips_pose_squat_from_metadata() -> None:
+    """With the gate ON, a dwell-triggered event records the pose summary but must NOT
+    leak a ``pose_squat`` key: the trigger is dwell-only, so the gate's squat signal
+    is no longer a decision input and must not appear as if it were training truth."""
 
     detector = PottyEventDetector(_camera_config(), pose_gate=_squat_gate())
 
     emitted = []
-    for idx in range(6):
+    for idx in range(8):
         emitted.extend(detector.process(_frame(idx), [_detection(idx, _standing())]))
     emitted.extend(detector.flush())
 
     assert len(emitted) == 1
-    candidate = emitted[0]
-    assert candidate.squat_metric < 0.3  # bbox alone would not have qualified
-    assert "pose" in candidate.posture_summary
-    assert candidate.posture_summary["pose"]["pose_squat"] is True
+    pose_summary = emitted[0].posture_summary["pose"]
+    assert "pose_squat" not in pose_summary
+    # The gate still ran and contributed its trustworthy stationarity signal.
+    assert "pose_stationary" in pose_summary
+    assert "pose_coverage" in pose_summary
 
 
-def test_same_window_without_gate_emits_nothing() -> None:
-    """Identical standing sequence with the gate OFF stays a non-event and carries
-    no pose key (gate-off path is byte-for-byte unchanged)."""
+def test_pose_squat_alone_does_not_trigger() -> None:
+    """A short hold where pose reports a squat but the dog never dwells long enough
+    must NOT emit: pose squat is no longer a trigger, only sustained dwell is."""
 
-    detector = PottyEventDetector(_camera_config())
+    detector = PottyEventDetector(_camera_config(dwell_trigger_s=5.0), pose_gate=_squat_gate())
 
     emitted = []
-    for idx in range(6):
+    for idx in range(4):  # only ~3s held: below the 5s dwell trigger
         emitted.extend(detector.process(_frame(idx), [_detection(idx, _standing())]))
     emitted.extend(detector.flush())
 
     assert emitted == []
 
 
-def test_gate_off_posture_summary_has_no_pose_key() -> None:
-    """An ordinary bbox squat event records no pose key when the gate is off."""
+def test_same_short_window_without_gate_emits_nothing() -> None:
+    """The same sub-dwell standing sequence with the gate OFF is also a non-event
+    (gate-off path is unchanged)."""
+
+    detector = PottyEventDetector(_camera_config(dwell_trigger_s=5.0))
+
+    emitted = []
+    for idx in range(4):
+        emitted.extend(detector.process(_frame(idx), [_detection(idx, _standing())]))
+    emitted.extend(detector.flush())
+
+    assert emitted == []
+
+
+def test_gate_off_dwell_event_has_no_pose_key() -> None:
+    """A dwell event records no pose key when the gate is off."""
 
     detector = PottyEventDetector(_camera_config())
 
-    def squat(x: float = 40.0) -> BBox:
-        return BBox(x - 15, 35, x + 55, 85)
-
-    boxes = [[_standing()], [_standing()], [squat()], [squat()], [squat()], [squat()]]
     emitted = []
-    for idx, frame_boxes in enumerate(boxes):
-        emitted.extend(
-            detector.process(_frame(idx), [_detection(idx, b) for b in frame_boxes])
-        )
+    for idx in range(8):
+        emitted.extend(detector.process(_frame(idx), [_detection(idx, _standing())]))
     emitted.extend(detector.flush())
 
     assert len(emitted) == 1
@@ -121,8 +133,8 @@ def test_gate_off_posture_summary_has_no_pose_key() -> None:
 
 
 def test_sparse_pose_does_not_fabricate_event() -> None:
-    """When pose succeeds on too few frames the gate stays silent, so a
-    bbox-non-squat window does not emit (no fabricated recall)."""
+    """When pose succeeds on too few frames the gate stays silent; a sub-dwell hold
+    therefore does not emit (no fabricated recall)."""
 
     succeed_on = {1}
 
@@ -137,10 +149,10 @@ def test_sparse_pose_does_not_fabricate_event() -> None:
         return None
 
     gate = PoseGate(sparse_fn, min_required_frames=2, min_pose_coverage=0.5)
-    detector = PottyEventDetector(_camera_config(), pose_gate=gate)
+    detector = PottyEventDetector(_camera_config(dwell_trigger_s=5.0), pose_gate=gate)
 
     emitted = []
-    for idx in range(6):
+    for idx in range(4):
         emitted.extend(detector.process(_frame(idx), [_detection(idx, _standing())]))
     emitted.extend(detector.flush())
 
@@ -149,10 +161,15 @@ def test_sparse_pose_does_not_fabricate_event() -> None:
 
 def test_pose_cannot_bypass_coverage_requirement() -> None:
     """Even with pose reporting squat AND stationary, a window that does not cover
-    ``stationary_threshold_s`` must not emit — pose is additive, it never removes
-    the bbox coverage gate (the recall fix)."""
+    ``stationary_threshold_s`` must not emit — pose is additive, it never removes the
+    bbox coverage gate (the recall fix). Here dwell would otherwise fire immediately
+    (tiny trigger), so coverage is the only thing keeping the window a non-event."""
 
-    config = _camera_config(stationary_threshold_s=2.0, event_duration_s=0.1)
+    config = _camera_config(
+        stationary_threshold_s=2.0,
+        dwell_trigger_s=0.1,
+        event_duration_s=0.1,
+    )
     detector = PottyEventDetector(config, pose_gate=_squat_gate())
 
     # Two detections only 0.3s apart: a real trailing window far short of the 2.0s

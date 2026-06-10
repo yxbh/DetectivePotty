@@ -80,8 +80,7 @@ def candidate() -> PottyCandidate:
         ambiguous=False,
         lifecycle=PottyLifecycle.EMITTED,
         stationary_duration_s=2.5,
-        squat_metric=0.42,
-        posture_summary={"height_drop": 0.42},
+        posture_summary={"dwell_duration_s": 6.0},
         near_miss=False,
         confidence=0.77,
     )
@@ -133,8 +132,7 @@ def test_event_recorder_writes_dataset_event_and_metadata(tmp_path) -> None:
     assert len(metadata["crop_boxes"]) == 2
     assert metadata["extra"]["primary_track_id"] == "dog-1"
     assert metadata["extra"]["stationary_duration_s"] == 2.5
-    assert metadata["extra"]["squat_metric"] == 0.42
-    assert metadata["extra"]["posture_summary"] == {"height_drop": 0.42}
+    assert metadata["extra"]["posture_summary"] == {"dwell_duration_s": 6.0}
     assert metadata["extra"]["near_miss"] is False
 
     for secret in ("user", "pass", "token", "secret"):

@@ -95,7 +95,10 @@ cameras:
     detection_conf_threshold: 0.25
     event_duration_s: 8.0         # Target length of a recorded event window (seconds).
     stationary_threshold_s: 2.0   # Dog must hold still this long to start a candidate.
-    squat_threshold: 0.35         # Posture "squatness" (0..1) that flags a potty pose.
+    # Continuous stationary hold (s) that triggers a potty candidate. This is the sole
+    # detection trigger -- a viewpoint-invariant sustained-dwell cue that works on
+    # high/top-down cameras where a bbox squat metric is unreliable. Must be > 0.
+    dwell_trigger_s: 2.0
     sample_rate_fps: 5.0          # Frames per second sampled for detection.
     pre_roll_s: 15.0              # Seconds of footage kept before the event start.
     post_roll_s: 30.0             # Seconds of footage kept after the event end.

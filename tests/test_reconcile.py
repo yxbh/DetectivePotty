@@ -271,8 +271,7 @@ def make_candidate(start_offset: float = 1.0, end_offset: float = 2.0) -> PottyC
         ambiguous=False,
         lifecycle=PottyLifecycle.EMITTED,
         stationary_duration_s=2.5,
-        squat_metric=0.42,
-        posture_summary={"height_drop": 0.42},
+        posture_summary={"dwell_duration_s": 6.0},
         near_miss=False,
         confidence=0.77,
     )

@@ -60,10 +60,16 @@ vanilla-JS `web/static/` portal is gone). Two non-obvious gotchas — full dev l
 ## Testing & regression discipline
 
 - Tests are offline and inject fake detectors — no cameras, models, GPU, or network.
-- **Pose-OFF must stay byte-identical.** The end-to-end regression baseline on `config.multiFile.yaml`
-  is **7 events**: sample 1 / 1946 1 / 1949 1 / 2240 2 / 0903 1 / 0908 1. Any pose-disabled change that
-  shifts these counts is a regression. (To run e2e on real clips, copy a config to a temp file and
-  point `global.dataset_dir` at a temp dir — `data/`/`dataset/` are gitignored.)
+- **Pose-OFF baseline on `config.multiFile.yaml` is 9 events** (7 cameras, `dwell_trigger_s`
+  default 2 s): sample 1 / 1946 1 / 1949 2 / 2240 2 / 0903 1 / 0908 1 / **1729 1**. The trigger is
+  **dwell-only** — a non-suppressed track that reads stationary continuously for at least
+  `dwell_trigger_s` becomes a candidate. The old bbox **squat** trigger was removed entirely (it was
+  unreliable on high/top-down cameras and missed the 17:29 Apollo potty); at the old 5 s default
+  dwell-only dropped two real short pees (the Gromit sample and 0903), so the default was lowered to
+  2 s, which recovers them and adds Apollo. A pose-disabled change that shifts these counts is a
+  regression; over-capture is acceptable by design (every event is `needs_label`). (To run e2e on
+  real clips, copy a config to a temp file and point `global.dataset_dir` at a temp dir —
+  `data/`/`dataset/` are gitignored.)
 - Add tests with new behavior; keep the suite green.
 
 ## Domain invariants (easy to get wrong)
@@ -98,7 +104,7 @@ off unless a task explicitly says otherwise.
 - `sources/` — `VideoSource` impls: `file.py`, `rtsp.py`, `rolling_buffer.py` (warm pre-roll buffer).
 - `detect/yolo.py` — `DogDetector` (Ultralytics YOLO, downscaled inference).
 - `tracking.py` — `Tracker` + `temporal_box_union` (multi-frame box recovery for pose crops).
-- `potty_event.py` — `PottyEventDetector` state machine (stationary + squat → potty candidate).
+- `potty_event.py` — `PottyEventDetector` state machine (sustained stationary dwell → potty candidate).
 - `events.py` — core data models/enums (`Detection`, `Track`, `FrameRecord`, `CropRecord`,
   `EventMetadata`, `Label`/`LabelStatus`/`ClassifierGuess`) + `write_metadata_json`.
 - `classify/` — `base.py`, `heuristic.py` (weak pee/poop guess), `pose.py` (pose-based classifier, opt-in).

@@ -192,7 +192,10 @@ class CameraConfig(BaseModel):
     detection_conf_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
     event_duration_s: float = Field(default=8.0, gt=0.0)
     stationary_threshold_s: float = Field(default=2.0, ge=0.0)
-    squat_threshold: float = Field(default=0.35, ge=0.0)
+    # Continuous stationary hold (seconds) that triggers a potty candidate. This is
+    # the sole detection trigger: a viewpoint-invariant sustained-dwell cue that works
+    # on high/top-down cameras where a bbox squat metric is unreliable. Must be > 0.
+    dwell_trigger_s: float = Field(default=2.0, gt=0.0)
     sample_rate_fps: float = Field(default=5.0, gt=0.0)
     pre_roll_s: float = Field(default=15.0, ge=0.0)
     post_roll_s: float = Field(default=30.0, ge=0.0)

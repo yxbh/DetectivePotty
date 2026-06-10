@@ -20,7 +20,7 @@ def camera_config(**overrides: object) -> CameraConfig:
         "detection_conf_threshold": 0.25,
         "event_duration_s": 2.0,
         "stationary_threshold_s": 1.0,
-        "squat_threshold": 0.3,
+        "dwell_trigger_s": 5.0,
         "sample_rate_fps": 1.0,
     }
     values.update(overrides)
@@ -52,10 +52,6 @@ def standing(x: float = 40.0) -> BBox:
     return BBox(x, 20, x + 40, 100)
 
 
-def squat(x: float = 40.0) -> BBox:
-    return BBox(x - 15, 35, x + 55, 85)
-
-
 def run_sequence(
     detector: PottyEventDetector,
     boxes_by_frame: list[list[BBox]],
@@ -72,25 +68,21 @@ def run_sequence(
     return emitted
 
 
-def test_stationary_squat_emits_one_potty_candidate() -> None:
+def test_stationary_hold_emits_one_potty_candidate() -> None:
+    # A dog that holds still for >= dwell_trigger_s becomes a potty candidate.
     detector = PottyEventDetector(camera_config())
 
-    emitted = run_sequence(
-        detector,
-        [[standing()], [standing()], [squat()], [squat()], [squat()], [squat()]],
-    )
+    emitted = run_sequence(detector, [[standing()] for _ in range(8)])
 
     assert len(emitted) == 1
     candidate = emitted[0]
     assert candidate.camera_id == "cam-1"
     assert candidate.primary_track_id == "1"
     assert candidate.start_ts == BASE_TS
-    assert candidate.end_ts == BASE_TS + timedelta(seconds=4)
     assert candidate.near_miss is False
     assert candidate.stationary_duration_s >= 1.0
-    assert candidate.squat_metric >= 0.3
+    assert candidate.posture_summary["dwell_duration_s"] >= 5.0
     assert [track.track_id for track in candidate.tracks] == ["1"]
-    assert len(candidate.detections) == 5
 
 
 def test_walking_through_emits_no_event() -> None:
@@ -115,13 +107,7 @@ def test_two_dogs_sets_multi_dog_and_ambiguous_flags() -> None:
 
     emitted = run_sequence(
         detector,
-        [
-            [standing(25), standing(95)],
-            [standing(25), standing(95)],
-            [squat(25), squat(95)],
-            [squat(25), squat(95)],
-            [squat(25), squat(95)],
-        ],
+        [[standing(25), standing(95)] for _ in range(8)],
     )
 
     assert len(emitted) == 1
@@ -140,26 +126,17 @@ def test_roi_and_ignore_zone_filtering() -> None:
 
     # Center (60, 60) -> (0.375, 0.5): inside ROI but inside the ignore box.
     ignored_detector = PottyEventDetector(config)
-    ignored = run_sequence(
-        ignored_detector,
-        [[standing(40)], [standing(40)], [squat(40)], [squat(40)], [squat(40)]],
-    )
+    ignored = run_sequence(ignored_detector, [[standing(40)] for _ in range(8)])
     assert ignored == []
 
     # Center (150, 60) -> (0.9375, 0.5): outside the ROI.
     outside_detector = PottyEventDetector(config)
-    outside = run_sequence(
-        outside_detector,
-        [[standing(130)], [standing(130)], [squat(130)], [squat(130)], [squat(130)]],
-    )
+    outside = run_sequence(outside_detector, [[standing(130)] for _ in range(8)])
     assert outside == []
 
     # Center (20, 60) -> (0.125, 0.5): inside ROI, left of the ignore box.
     allowed_detector = PottyEventDetector(config)
-    allowed = run_sequence(
-        allowed_detector,
-        [[standing(0)], [standing(0)], [squat(0)], [squat(0)], [squat(0)]],
-    )
+    allowed = run_sequence(allowed_detector, [[standing(0)] for _ in range(8)])
     assert len(allowed) == 1
     assert allowed[0].camera_id == "cam-1"
 
@@ -169,7 +146,7 @@ def test_stationary_window_emits_with_non_integer_fps_timestamps() -> None:
     stationary window spanning ``stationary_threshold_s`` lands a few microseconds
     below the threshold (1.9999972677...s for a 2.0s window). A strict ``>=``
     comparison rejected every frame and no event ever fired. The detector must
-    tolerate that sub-threshold rounding and still emit one event.
+    tolerate that sub-threshold rounding and still read the window as stationary.
     """
 
     fps = 30.000040983662547  # measured fps of the real sample clip
@@ -178,7 +155,7 @@ def test_stationary_window_emits_with_non_integer_fps_timestamps() -> None:
     threshold_s = 2.0
     config = camera_config(
         stationary_threshold_s=threshold_s,
-        squat_threshold=0.3,
+        dwell_trigger_s=1.0,
         sample_rate_fps=10.0,
         event_duration_s=2.0,
     )
@@ -205,22 +182,32 @@ def test_stationary_window_emits_with_non_integer_fps_timestamps() -> None:
         )
         return the_frame, the_detection
 
-    # A few standing frames establish the tall baseline, then ~3s of in-place
-    # squatting so the 2.0s stationary window is fully inside the squat phase.
-    boxes = [standing()] * 3 + [squat()] * 35
+    # ~3.8s of holding still in place so the 2.0s stationary window is fully covered.
+    boxes = [standing()] * 38
 
+    durations: list[float] = []
+    original_posture_stats = PottyEventDetector._posture_stats
+
+    def spy(self, track, current_mono):  # type: ignore[no-untyped-def]
+        stats = original_posture_stats(self, track, current_mono)
+        durations.append(stats.stationary_duration_s)
+        return stats
+
+    PottyEventDetector._posture_stats = spy  # type: ignore[assignment]
     emitted: list = []
-    for sample_idx, bbox in enumerate(boxes):
-        the_frame, the_detection = at(sample_idx, bbox)
-        emitted.extend(detector.process(the_frame, [the_detection]))
-    emitted.extend(detector.flush())
+    try:
+        for sample_idx, bbox in enumerate(boxes):
+            the_frame, the_detection = at(sample_idx, bbox)
+            emitted.extend(detector.process(the_frame, [the_detection]))
+        emitted.extend(detector.flush())
+    finally:
+        PottyEventDetector._posture_stats = original_posture_stats
 
     assert len(emitted) == 1
-    assert emitted[0].squat_metric >= config.squat_threshold
-    # The measured duration is genuinely just below the threshold; the detector
-    # emits anyway thanks to the sampling/float tolerance.
-    assert emitted[0].stationary_duration_s < threshold_s
-    assert abs(emitted[0].stationary_duration_s - threshold_s) < 1e-3
+    # The measured window span is genuinely just below the threshold; the detector
+    # reads it as stationary anyway thanks to the sampling/float tolerance.
+    assert max(durations) < threshold_s
+    assert abs(max(durations) - threshold_s) < 1e-3
 
 
 def test_stationary_emits_when_window_span_stays_below_threshold() -> None:
@@ -228,16 +215,15 @@ def test_stationary_emits_when_window_span_stays_below_threshold() -> None:
     the trailing ``stationary_threshold_s`` window only ever *spans* up to one
     sample interval less than the threshold (e.g. 1.8s for a 2.0s threshold), so a
     strict ``window_span >= threshold`` check never fired even though the dog stood
-    in one spot and squatted for many seconds. The gate tolerates a bounded coverage
-    shortfall, so a long-lived stationary, squatting track must still emit exactly
-    one event.
+    in one spot for many seconds. The gate tolerates a bounded coverage shortfall, so
+    a long-lived stationary track must still emit exactly one event.
     """
 
     dt = 0.3  # sample spacing that does not divide the 2.0s threshold evenly
     threshold_s = 2.0
     config = camera_config(
         stationary_threshold_s=threshold_s,
-        squat_threshold=0.3,
+        dwell_trigger_s=1.0,
         sample_rate_fps=10.0,
         event_duration_s=2.0,
     )
@@ -263,7 +249,7 @@ def test_stationary_emits_when_window_span_stays_below_threshold() -> None:
         )
         return the_frame, the_detection
 
-    boxes = [standing()] * 3 + [squat()] * 25
+    boxes = [standing()] * 28
 
     emitted: list = []
     spans: list[float] = []
@@ -288,19 +274,18 @@ def test_stationary_emits_when_window_span_stays_below_threshold() -> None:
     assert spans, "posture stats should have been evaluated"
     assert max(spans) < threshold_s - 1e-2
     assert len(emitted) == 1
-    assert emitted[0].squat_metric >= config.squat_threshold
 
 
-def test_brief_squat_after_long_walk_does_not_emit() -> None:
-    """A long-lived track that walks across the frame and only briefly drops into a
-    squat must NOT emit: the trailing window then still contains the moving samples
-    (high centroid motion), so it is not stationary. Guards against the coverage
-    tolerance over-crediting an old-but-moving track.
+def test_brief_stationary_after_long_walk_does_not_emit() -> None:
+    """A long-lived track that walks across the frame and only briefly stops must NOT
+    emit: the trailing window then still contains the moving samples (high centroid
+    motion), so it is never stationary and never accrues dwell. Guards against the
+    coverage tolerance over-crediting an old-but-moving track.
     """
 
     config = camera_config(
         stationary_threshold_s=2.0,
-        squat_threshold=0.3,
+        dwell_trigger_s=5.0,
         sample_rate_fps=10.0,
         event_duration_s=2.0,
     )
@@ -329,32 +314,102 @@ def test_brief_squat_after_long_walk_does_not_emit() -> None:
             ),
         )
 
-    # ~3s walking across the frame (tall standing box moves every sample).
-    squat_flags: list[bool] = []
+    stationary_flags: list[bool] = []
     original_posture_stats = PottyEventDetector._posture_stats
 
     def spy(self, track, current_mono):  # type: ignore[no-untyped-def]
         stats = original_posture_stats(self, track, current_mono)
-        squat_flags.append(stats.is_squat)
+        stationary_flags.append(stats.is_stationary)
         return stats
 
     PottyEventDetector._posture_stats = spy  # type: ignore[assignment]
     try:
+        # ~3s walking across the frame (tall standing box moves every sample).
         for step in range(30):
             x = float(step) * 15.0
             frame_obj, det = make(idx, BBox(x, 20, x + 40, 100))
             emitted.extend(detector.process(frame_obj, [det]))
             idx += 1
 
-        # Then only ~0.3s of in-place squatting (short box => genuine squat posture).
-        squat_x = 30.0 * 15.0
+        # Then only ~0.3s of standing in place.
+        stop_x = 30.0 * 15.0
         for _ in range(3):
-            frame_obj, det = make(idx, BBox(squat_x - 15, 40, squat_x + 55, 90))
+            frame_obj, det = make(idx, BBox(stop_x, 20, stop_x + 40, 100))
             emitted.extend(detector.process(frame_obj, [det]))
             idx += 1
         emitted.extend(detector.flush())
     finally:
         PottyEventDetector._posture_stats = original_posture_stats
 
-    assert any(squat_flags), "the brief posture should register as a squat"
+    # The trailing window always contains moving samples, so it never reads stationary.
+    assert not any(stationary_flags)
     assert emitted == []
+
+
+def test_long_stationary_hold_dwell_triggers_event() -> None:
+    # A dog that holds still long enough (>= dwell_trigger_s) triggers a potty
+    # candidate -- the viewpoint-invariant cue for high/top-down cameras.
+    detector = PottyEventDetector(camera_config(dwell_trigger_s=5.0))
+
+    emitted = run_sequence(detector, [[standing()] for _ in range(8)])
+
+    assert len(emitted) == 1
+    candidate = emitted[0]
+    assert candidate.near_miss is False
+    assert candidate.posture_summary["dwell_trigger_s"] == 5.0
+    # The recorded dwell duration is the real continuous hold (>= the trigger).
+    assert candidate.posture_summary["dwell_duration_s"] >= 5.0
+    # Dwell confidence is moderate and scales with the hold length.
+    assert 0.5 <= candidate.confidence <= 0.7
+
+
+def test_dwell_confidence_grows_with_hold_length() -> None:
+    short = PottyEventDetector(camera_config(dwell_trigger_s=5.0, event_duration_s=1.0))
+    short_event = run_sequence(short, [[standing()] for _ in range(8)])[0]
+
+    long = PottyEventDetector(camera_config(dwell_trigger_s=5.0, event_duration_s=5.0))
+    long_event = run_sequence(long, [[standing()] for _ in range(12)])[0]
+
+    assert long_event.posture_summary["dwell_duration_s"] > short_event.posture_summary[
+        "dwell_duration_s"
+    ]
+    assert long_event.confidence > short_event.confidence
+
+
+def test_short_stationary_hold_below_dwell_threshold_emits_nothing() -> None:
+    # Stationary but for less than dwell_trigger_s: no event.
+    detector = PottyEventDetector(camera_config(dwell_trigger_s=5.0))
+
+    emitted = run_sequence(detector, [[standing()] for _ in range(4)])
+
+    assert emitted == []
+
+
+def test_motion_breaks_dwell_accumulation() -> None:
+    # Two sub-threshold stationary holds split by a move must not sum into a trigger:
+    # the dwell accumulator resets the moment the dog stops reading stationary.
+    detector = PottyEventDetector(camera_config(dwell_trigger_s=5.0))
+
+    emitted = run_sequence(
+        detector,
+        [[standing()]] * 4 + [[standing(120)]] + [[standing(120)]] * 4,
+    )
+
+    assert emitted == []
+
+
+def test_two_separate_dwell_events() -> None:
+    # A dwell event, then the dog leaves (tracks clear) and a second dog holds still:
+    # the detector resets cleanly and emits a second independent dwell event.
+    detector = PottyEventDetector(camera_config(dwell_trigger_s=5.0))
+
+    emitted = run_sequence(
+        detector,
+        [[standing()] for _ in range(8)]
+        + [[], [], []]
+        + [[standing()] for _ in range(8)],
+    )
+
+    assert len(emitted) == 2
+    assert all(c.near_miss is False for c in emitted)
+    assert all(c.posture_summary["dwell_duration_s"] >= 5.0 for c in emitted)

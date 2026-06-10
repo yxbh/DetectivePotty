@@ -183,3 +183,70 @@ export interface TuneDetectRangeResult {
   model: string;
   frames: TuneDetectResult[];
 }
+
+// --- Range labeling (/label) ---------------------------------------------
+
+/** One harvested clip's listing row (identity + labeling progress). */
+export interface LabelClipSummary {
+  span_id: string;
+  clip_path: string;
+  source_id: string;
+  date: string;
+  fps: number;
+  frame_count: number;
+  width: number;
+  height: number;
+  duration_s: number;
+  track_id: string | null;
+  n_detections: number;
+  labeled: boolean;
+  n_ranges: number;
+  n_trainable_ranges: number;
+  behaviors: string[];
+  dogs: string[];
+}
+
+/** A recorded detection box for a track at one clip frame. */
+export interface LabelTrackBox {
+  clip_frame_idx: number;
+  bbox: { x1: number; y1: number; x2: number; y2: number };
+  confidence: number;
+}
+
+/** One labeled frame range bound to a dog track (mirrors `LabelRange`). */
+export interface LabelRangeItem {
+  start_frame: number;
+  end_frame: number;
+  start_s: number;
+  end_s: number;
+  behavior: string;
+  dog: string;
+  track_id: string | null;
+  time_basis?: string;
+  created_at?: string;
+}
+
+/** The `labels.json` body for one clip. */
+export interface ClipLabelsBody {
+  schema_version?: string;
+  clip?: string;
+  ranges: LabelRangeItem[];
+}
+
+/** Full payload for the labeling screen (summary + tracks + existing labels). */
+export interface LabelClipDetail extends LabelClipSummary {
+  tracks: Record<string, LabelTrackBox[]>;
+  labels: ClipLabelsBody;
+}
+
+/** Fixed enum choices the labeler renders. */
+export interface LabelVocabulary {
+  behaviors: string[];
+  dogs: string[];
+}
+
+/** Response of `GET /api/label/clips`. */
+export interface LabelClipList {
+  clips: LabelClipSummary[];
+  vocabulary: LabelVocabulary;
+}

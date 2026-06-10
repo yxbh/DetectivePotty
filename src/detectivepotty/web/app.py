@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -249,6 +249,10 @@ def create_app(
 
     app.state.config = config
     app.state.tune_roots = collect_tune_roots(config)
+    # Root the range-labeling API discovers harvested clips under. Kept separate
+    # from the tuner's browse roots (which include it) so /api/label only ever
+    # exposes harvested clip dirs, never the wider dataset/data tree.
+    app.state.harvest_root = config.global_settings.harvest_dir
     app.state.tune_default_model = config.global_settings.model_name
     # Per-model detector cache (model string -> DogDetector), built lazily under
     # ``tune_detector_lock``. An injected detector (tests) seeds the cache for the
@@ -929,6 +933,62 @@ def create_app(
             )
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.get("/api/label/clips")
+    def label_clips() -> dict:
+        """List harvested clips with their labeling progress (unlabeled first)."""
+
+        from detectivepotty.web import labeling
+
+        return {
+            "clips": labeling.list_clips(app.state.harvest_root),
+            "vocabulary": labeling.label_vocabulary(),
+        }
+
+    @app.get("/api/label/clips/{span_id}")
+    def label_clip_detail(span_id: str) -> dict:
+        """Geometry + detection tracks + existing labels for one harvested clip."""
+
+        from detectivepotty.web import labeling
+
+        try:
+            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="clip not found") from exc
+        return labeling.clip_detail(clip_dir)
+
+    @app.put("/api/label/clips/{span_id}/labels")
+    def label_clip_save(span_id: str, payload: dict = Body(...)) -> dict:
+        """Validate + persist ``labels.json`` for one clip, return fresh detail."""
+
+        from detectivepotty.web import labeling
+
+        try:
+            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="clip not found") from exc
+        try:
+            return labeling.save_clip_labels(clip_dir, payload)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/label/clips/{span_id}/video")
+    def label_clip_video(span_id: str) -> FileResponse:
+        """Stream a harvested ``clip.mp4`` (Range-seekable) for the labeler's video."""
+
+        from detectivepotty.harvest import CLIP_NAME
+        from detectivepotty.web import labeling
+
+        try:
+            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="clip not found") from exc
+        clip_path = clip_dir / CLIP_NAME
+        return FileResponse(
+            clip_path,
+            media_type=_VIDEO_MIME.get(clip_path.suffix.lower(), "video/mp4"),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str) -> Response:

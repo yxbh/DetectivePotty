@@ -76,6 +76,7 @@ def collect_tune_roots(config: Config) -> list[Path]:
             add(camera.input.path.parent)
     add(Path("data"))
     add(config.global_settings.dataset_dir)
+    add(config.global_settings.harvest_dir)
     return roots
 
 

@@ -18,6 +18,7 @@
   import EventDetailView from "./EventDetail.svelte";
   import LiveFeed from "./LiveFeed.svelte";
   import TuneDetect from "./TuneDetect.svelte";
+  import LabelReview from "./LabelReview.svelte";
   import HelpOverlay from "./HelpOverlay.svelte";
   import { navigate, route, routeToView } from "./router";
 
@@ -411,6 +412,15 @@
       }
       return;
     }
+    // The Label page owns its own keyboard (Space, ←/→, I/O, 1-4, Enter, S, j/k);
+    // let its window handler act and only catch Escape here to return to Review.
+    if (view === "label") {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        navigate("/");
+      }
+      return;
+    }
     // The Live feed has its own minimal keymap: v / Esc return to Review.
     if (view === "live") {
       if (event.key === "v" || event.key === "Escape") {
@@ -567,6 +577,16 @@
       >
         Tune
       </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={view === "label"}
+        class:active={view === "label"}
+        onclick={() => navigate("/label")}
+        title="Label harvested clips for training"
+      >
+        Label
+      </button>
     </div>
 
     {#if view === "review"}
@@ -644,6 +664,10 @@
   {:else if view === "tune"}
     <main class="tune-main">
       <TuneDetect />
+    </main>
+  {:else if view === "label"}
+    <main class="tune-main">
+      <LabelReview />
     </main>
   {:else}
     <main class="layout">

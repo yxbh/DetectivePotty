@@ -1,0 +1,572 @@
+"""Historical footage harvester: cut dog-present spans out of long clips.
+
+This module is the data-engine entry point. Given a long recording (a local
+file for now; UNVR time-range download is wired separately), it:
+
+1. decodes the clip and samples every Nth frame,
+2. runs a dog detector + greedy tracker over the samples,
+3. groups each track's sampled detections into **track-aware spans** (merge with
+   a time tolerance, pad, clamp, enforce min/max length), and
+4. writes one immutable ``clip.mp4`` per span at the source resolution/fps plus a
+   ``metadata.json`` describing it (checksum, fps, frame count, timebase, source
+   UTC range, and the per-sampled-frame detection boxes keyed by the *harvested
+   clip's* frame numbering so the exporter can bind a label back to the dog).
+
+The span math (:func:`compute_spans`) is a pure function and is unit-tested in
+isolation. The orchestrator (:func:`harvest_clips`) takes injectable
+``capture_factory`` / ``detector`` / ``clip_writer_factory`` seams so the offline
+test suite never opens a real camera, model, or codec.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import hashlib
+import logging
+from pathlib import Path
+from typing import Any, Protocol
+
+import cv2
+import numpy as np
+
+from detectivepotty.events import Detection, _jsonify
+from detectivepotty.geometry import BBox
+from detectivepotty.sources.base import sanitize_source_id
+from detectivepotty.sources.file import derive_base_wall_ts
+from detectivepotty.tracking import Tracker
+from detectivepotty.video_encode import open_h264_writer
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SAMPLE_EVERY = 5
+DEFAULT_MERGE_GAP_S = 2.0
+DEFAULT_PAD_S = 1.0
+DEFAULT_MIN_LEN_S = 0.5
+DEFAULT_MAX_LEN_S = 60.0
+
+CLIP_NAME = "clip.mp4"
+METADATA_NAME = "metadata.json"
+SCHEMA_VERSION = "harvest-1.0"
+TIME_BASIS_CLIP_FRAMES = "clip_frames"
+
+
+class DetectorLike(Protocol):
+    """Minimal detector surface the harvester needs (matches ``DogDetector``)."""
+
+    def detect(
+        self, frame_bgr_original: np.ndarray, frame_idx: int = ...
+    ) -> list[Detection]: ...
+
+
+class ClipWriter(Protocol):
+    def write(self, frame: np.ndarray) -> Any: ...
+
+    def release(self) -> Any: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FrameSample:
+    """A single sampled detection of one track, in the *source* clip's numbering."""
+
+    frame_idx: int
+    time_s: float
+    bbox: BBox
+    confidence: float
+
+
+@dataclass(slots=True)
+class DogSpan:
+    """A contiguous dog-present window for one track, in source-clip coordinates.
+
+    ``start_frame``/``end_frame`` are inclusive source-frame indices; ``start_s``/
+    ``end_s`` are the padded/clamped seconds. ``samples`` are the track's sampled
+    detections inside the (unpadded) span, retained as reference boxes for the
+    exporter's dense re-detection binding.
+    """
+
+    track_id: str
+    start_frame: int
+    end_frame: int
+    start_s: float
+    end_s: float
+    samples: list[FrameSample] = field(default_factory=list)
+
+    @property
+    def frame_count(self) -> int:
+        return self.end_frame - self.start_frame + 1
+
+
+@dataclass(slots=True)
+class HarvestResult:
+    span: DogSpan
+    span_id: str
+    clip_dir: Path
+    clip_path: Path
+    metadata_path: Path
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def compute_spans(
+    presence: Mapping[str, Sequence[FrameSample]],
+    *,
+    fps: float,
+    total_frames: int,
+    merge_gap_s: float = DEFAULT_MERGE_GAP_S,
+    pad_s: float = DEFAULT_PAD_S,
+    min_len_s: float = DEFAULT_MIN_LEN_S,
+    max_len_s: float = DEFAULT_MAX_LEN_S,
+) -> list[DogSpan]:
+    """Group per-track sampled detections into padded, clamped, capped spans.
+
+    ``presence`` maps ``track_id`` -> that track's sampled detections (any order).
+    Spans are computed independently per track (overlaps across tracks are
+    expected and allowed). A new span starts whenever the gap between consecutive
+    samples of a track exceeds ``merge_gap_s``. Each raw span is padded by
+    ``pad_s`` on both sides, clamped to ``[0, total_frames-1]`` / ``[0, duration]``,
+    dropped if shorter than ``min_len_s``, and split into ``max_len_s`` chunks if
+    longer. Returned spans are sorted by ``(start_frame, track_id)``.
+    """
+
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    if total_frames <= 0:
+        return []
+    duration_s = total_frames / fps
+
+    spans: list[DogSpan] = []
+    for track_id, raw_samples in presence.items():
+        samples = sorted(raw_samples, key=lambda s: s.frame_idx)
+        if not samples:
+            continue
+
+        group: list[FrameSample] = [samples[0]]
+        for sample in samples[1:]:
+            if sample.time_s - group[-1].time_s > merge_gap_s:
+                spans.extend(
+                    _finalize_group(
+                        track_id, group, fps, total_frames, duration_s,
+                        pad_s, min_len_s, max_len_s,
+                    )
+                )
+                group = [sample]
+            else:
+                group.append(sample)
+        spans.extend(
+            _finalize_group(
+                track_id, group, fps, total_frames, duration_s,
+                pad_s, min_len_s, max_len_s,
+            )
+        )
+
+    spans.sort(key=lambda span: (span.start_frame, _track_sort_key(span.track_id)))
+    return spans
+
+
+def _finalize_group(
+    track_id: str,
+    group: Sequence[FrameSample],
+    fps: float,
+    total_frames: int,
+    duration_s: float,
+    pad_s: float,
+    min_len_s: float,
+    max_len_s: float,
+) -> list[DogSpan]:
+    raw_start_s = group[0].time_s
+    raw_end_s = group[-1].time_s
+    start_s = _clamp(raw_start_s - pad_s, 0.0, duration_s)
+    end_s = _clamp(raw_end_s + pad_s, 0.0, duration_s)
+    if end_s - start_s < min_len_s:
+        return []
+
+    chunks: list[tuple[float, float]] = []
+    if max_len_s > 0 and end_s - start_s > max_len_s:
+        cursor = start_s
+        while cursor < end_s - 1e-9:
+            chunk_end = min(cursor + max_len_s, end_s)
+            chunks.append((cursor, chunk_end))
+            cursor = chunk_end
+    else:
+        chunks.append((start_s, end_s))
+
+    out: list[DogSpan] = []
+    for chunk_start_s, chunk_end_s in chunks:
+        start_frame = int(_clamp(round(chunk_start_s * fps), 0, total_frames - 1))
+        end_frame = int(_clamp(round(chunk_end_s * fps), 0, total_frames - 1))
+        if end_frame < start_frame:
+            end_frame = start_frame
+        chunk_samples = [
+            s for s in group if chunk_start_s - 1e-9 <= s.time_s <= chunk_end_s + 1e-9
+        ]
+        out.append(
+            DogSpan(
+                track_id=track_id,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                start_s=chunk_start_s,
+                end_s=chunk_end_s,
+                samples=chunk_samples,
+            )
+        )
+    return out
+
+
+def make_span_id(source_id: str, span: DogSpan) -> str:
+    """Deterministic, idempotent span id from source + frame range + track."""
+
+    digest = hashlib.sha1(
+        f"{source_id}|{span.start_frame}|{span.end_frame}|{span.track_id}".encode()
+    ).hexdigest()[:10]
+    return f"{span.start_frame:07d}_{span.end_frame:07d}_t{span.track_id}_{digest}"
+
+
+def _default_clip_writer_factory(
+    path: Path, fps: float, size: tuple[int, int]
+) -> ClipWriter:
+    """Write immutable clips as browser-playable H.264 (see ``video_encode``)."""
+
+    return open_h264_writer(path, fps, size)
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def harvest_clips(
+    input_path: str | Path,
+    out_dir: str | Path,
+    *,
+    detector: DetectorLike,
+    sample_every: int = DEFAULT_SAMPLE_EVERY,
+    merge_gap_s: float = DEFAULT_MERGE_GAP_S,
+    pad_s: float = DEFAULT_PAD_S,
+    min_len_s: float = DEFAULT_MIN_LEN_S,
+    max_len_s: float = DEFAULT_MAX_LEN_S,
+    source_start_utc: datetime | None = None,
+    source_id: str | None = None,
+    iou_threshold: float = 0.3,
+    max_age_frames: int = 5,
+    capture_factory: Callable[[str], Any] = cv2.VideoCapture,
+    clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter] = (
+        _default_clip_writer_factory
+    ),
+) -> list[HarvestResult]:
+    """Harvest dog-present spans from ``input_path`` into ``out_dir``.
+
+    Returns one :class:`HarvestResult` per written span. Re-running is idempotent:
+    span directories are keyed by a deterministic id, so an unchanged clip yields
+    the same outputs. ``source_start_utc`` anchors absolute time; when omitted it
+    is derived from the filename / mtime via :func:`derive_base_wall_ts`.
+    ``source_id`` overrides the provenance/span-id key (derived from
+    ``input_path`` when omitted); pass a stable value for chunked sources so
+    span ids stay deterministic regardless of the temp file path.
+    """
+
+    input_path = Path(input_path)
+    out_dir = Path(out_dir)
+    if sample_every < 1:
+        raise ValueError("sample_every must be >= 1")
+
+    if source_start_utc is None:
+        source_start_utc, _ = derive_base_wall_ts(input_path)
+    source_start_utc = source_start_utc.astimezone(timezone.utc)
+    if source_id is None:
+        source_id = sanitize_source_id(str(input_path))
+
+    fps, total_frames, presence = _scan_for_dogs(
+        input_path,
+        detector=detector,
+        sample_every=sample_every,
+        iou_threshold=iou_threshold,
+        max_age_frames=max_age_frames,
+        capture_factory=capture_factory,
+    )
+    if total_frames == 0:
+        logger.warning("harvest: no frames decoded from %s", input_path)
+        return []
+
+    spans = compute_spans(
+        presence,
+        fps=fps,
+        total_frames=total_frames,
+        merge_gap_s=merge_gap_s,
+        pad_s=pad_s,
+        min_len_s=min_len_s,
+        max_len_s=max_len_s,
+    )
+    if not spans:
+        logger.info("harvest: no dog spans in %s", input_path)
+        return []
+
+    return _write_spans(
+        spans,
+        input_path=input_path,
+        out_dir=out_dir,
+        fps=fps,
+        source_id=source_id,
+        source_start_utc=source_start_utc,
+        sample_every=sample_every,
+        capture_factory=capture_factory,
+        clip_writer_factory=clip_writer_factory,
+    )
+
+
+def _scan_for_dogs(
+    input_path: Path,
+    *,
+    detector: DetectorLike,
+    sample_every: int,
+    iou_threshold: float,
+    max_age_frames: int,
+    capture_factory: Callable[[str], Any],
+) -> tuple[float, int, dict[str, list[FrameSample]]]:
+    capture = capture_factory(str(input_path))
+    if not _capture_opened(capture):
+        _release(capture)
+        raise RuntimeError(f"failed to open video file: {input_path}")
+
+    fps = _capture_value(capture, cv2.CAP_PROP_FPS) or 30.0
+    tracker = Tracker(iou_threshold=iou_threshold, max_age_frames=max_age_frames)
+    presence: dict[str, list[FrameSample]] = {}
+
+    decoded_idx = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            if decoded_idx % sample_every == 0:
+                detections = detector.detect(frame, frame_idx=decoded_idx)
+                tracks = tracker.update(list(detections))
+                time_s = decoded_idx / fps
+                for track in tracks:
+                    latest = _latest_detection_at(track, decoded_idx)
+                    if latest is None:
+                        continue
+                    presence.setdefault(track.track_id, []).append(
+                        FrameSample(
+                            frame_idx=decoded_idx,
+                            time_s=time_s,
+                            bbox=latest.bbox,
+                            confidence=latest.confidence,
+                        )
+                    )
+            decoded_idx += 1
+    finally:
+        _release(capture)
+
+    return fps, decoded_idx, presence
+
+
+def _write_spans(
+    spans: Sequence[DogSpan],
+    *,
+    input_path: Path,
+    out_dir: Path,
+    fps: float,
+    source_id: str,
+    source_start_utc: datetime,
+    sample_every: int,
+    capture_factory: Callable[[str], Any],
+    clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter],
+) -> list[HarvestResult]:
+    plans: list[tuple[DogSpan, str, Path]] = []
+    for span in spans:
+        span_id = make_span_id(source_id, span)
+        clip_dir = out_dir / span_id
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        plans.append((span, span_id, clip_dir))
+
+    sizes = _extract_span_clips(
+        input_path,
+        plans,
+        fps=fps,
+        capture_factory=capture_factory,
+        clip_writer_factory=clip_writer_factory,
+    )
+
+    results: list[HarvestResult] = []
+    for span, span_id, clip_dir in plans:
+        clip_path = clip_dir / CLIP_NAME
+        width, height = sizes.get(span_id, (0, 0))
+        metadata_path = _write_clip_metadata(
+            clip_dir,
+            span=span,
+            span_id=span_id,
+            source_id=source_id,
+            source_path=input_path,
+            source_start_utc=source_start_utc,
+            fps=fps,
+            width=width,
+            height=height,
+            sample_every=sample_every,
+        )
+        results.append(
+            HarvestResult(
+                span=span,
+                span_id=span_id,
+                clip_dir=clip_dir,
+                clip_path=clip_path,
+                metadata_path=metadata_path,
+            )
+        )
+    return results
+
+
+def _extract_span_clips(
+    input_path: Path,
+    plans: Sequence[tuple[DogSpan, str, Path]],
+    *,
+    fps: float,
+    capture_factory: Callable[[str], Any],
+    clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter],
+) -> dict[str, tuple[int, int]]:
+    """Single sequential pass writing each source frame into every span it hits.
+
+    Overlapping spans (different tracks) share frames, so one decode pass feeds
+    all writers. Writers are created lazily on the first frame so we know the
+    real frame size. Returns ``span_id -> (width, height)``.
+    """
+
+    capture = capture_factory(str(input_path))
+    if not _capture_opened(capture):
+        _release(capture)
+        raise RuntimeError(f"failed to open video file: {input_path}")
+
+    writers: dict[str, ClipWriter] = {}
+    sizes: dict[str, tuple[int, int]] = {}
+    decoded_idx = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            height, width = frame.shape[:2]
+            for span, span_id, clip_dir in plans:
+                if span.start_frame <= decoded_idx <= span.end_frame:
+                    writer = writers.get(span_id)
+                    if writer is None:
+                        writer = clip_writer_factory(
+                            clip_dir / CLIP_NAME, fps, (width, height)
+                        )
+                        writers[span_id] = writer
+                        sizes[span_id] = (width, height)
+                    writer.write(frame)
+            decoded_idx += 1
+    finally:
+        for writer in writers.values():
+            writer.release()
+        _release(capture)
+    return sizes
+
+
+def _write_clip_metadata(
+    clip_dir: Path,
+    *,
+    span: DogSpan,
+    span_id: str,
+    source_id: str,
+    source_path: Path,
+    source_start_utc: datetime,
+    fps: float,
+    width: int,
+    height: int,
+    sample_every: int,
+) -> Path:
+    source_span_start_utc = source_start_utc + timedelta(seconds=span.start_s)
+    source_span_end_utc = source_start_utc + timedelta(seconds=span.end_s)
+
+    detections: list[dict[str, Any]] = []
+    for sample in sorted(span.samples, key=lambda s: s.frame_idx):
+        detections.append(
+            {
+                "clip_frame_idx": sample.frame_idx - span.start_frame,
+                "source_frame_idx": sample.frame_idx,
+                "time_s": sample.time_s,
+                "track_id": span.track_id,
+                "bbox": _jsonify(sample.bbox),
+                "confidence": sample.confidence,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "span_id": span_id,
+        "source_id": source_id,
+        "source_path": source_id,
+        "source_start_utc": source_start_utc.isoformat(),
+        "source_span_start_utc": source_span_start_utc.isoformat(),
+        "source_span_end_utc": source_span_end_utc.isoformat(),
+        "fps": fps,
+        "frame_count": span.frame_count,
+        "width": width,
+        "height": height,
+        "timebase": TIME_BASIS_CLIP_FRAMES,
+        "sample_every": sample_every,
+        "track_id": span.track_id,
+        "source_start_frame": span.start_frame,
+        "source_end_frame": span.end_frame,
+        "start_s": span.start_s,
+        "end_s": span.end_s,
+        "detections": detections,
+        "checksum": _sha256_file(clip_dir / CLIP_NAME),
+    }
+
+    import json
+    import os
+
+    target = clip_dir / METADATA_NAME
+    tmp = target.parent / f".metadata.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _latest_detection_at(track: Any, frame_idx: int) -> Detection | None:
+    best: Detection | None = None
+    for det in track.detections:
+        if det.frame_idx == frame_idx:
+            if best is None or det.confidence > best.confidence:
+                best = det
+    return best
+
+
+def _capture_opened(capture: Any) -> bool:
+    is_opened = getattr(capture, "isOpened", None)
+    return bool(is_opened()) if callable(is_opened) else True
+
+
+def _capture_value(capture: Any, prop: int) -> float | None:
+    value = capture.get(prop)
+    return float(value) if value and value > 0 else None
+
+
+def _release(capture: Any) -> None:
+    release = getattr(capture, "release", None)
+    if callable(release):
+        release()
+
+
+def _track_sort_key(track_id: str) -> tuple[int, str]:
+    try:
+        return (int(track_id), track_id)
+    except ValueError:
+        return (0, track_id)

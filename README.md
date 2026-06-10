@@ -228,6 +228,30 @@ uv run detectivepotty list-cameras --config config.yaml
 
 Requires `protect.nvr_host` plus either `DETECTIVEPOTTY_NVR_API_KEY` or `DETECTIVEPOTTY_NVR_USERNAME`/`DETECTIVEPOTTY_NVR_PASSWORD`.
 
+### Build training data: harvest → label → export
+
+The data engine turns long recordings into a labeled image-classifier dataset (pee/poop and dog identity). Clips are written as **browser-playable H.264** so they scrub in the Label tab.
+
+1. **Harvest dog-present spans** from a recording into reviewable clip dirs (`<out>/<span_id>/clip.mp4` + `metadata.json`):
+
+   ```bash
+   # From a local file:
+   uv run detectivepotty harvest --input "<clip>.mp4" --out dataset/harvest
+
+   # From historical UNVR footage, a whole day in hourly chunks (skips failed/empty
+   # chunks; re-runs are idempotent). --camera takes an id or name (see list-cameras):
+   uv run detectivepotty harvest-camera --config config.yaml \
+     --camera "Backyard Grass" --date 2026-06-06 --utc-offset 10 --out dataset/harvest
+   ```
+
+2. **Label** each clip in the portal's **Label** tab (`serve` below): scrub, mark In/Out, pick behavior + dog, add ranges, save. Writes a `labels.json` sidecar per clip. Keyboard-driven (Space play · ←/→ step · I/O mark · 1–4 behavior · Enter add · S save · j/k clip).
+
+3. **Export** the labeled ranges to a YOLO-cls dataset (densely re-detects + crops the labeled dog per frame):
+
+   ```bash
+   uv run detectivepotty export-dataset --clips dataset/harvest --out dataset/export
+   ```
+
 ### Review and label events
 
 The review portal is a Svelte + Vite + TypeScript app that FastAPI serves from a prebuilt bundle (`src/detectivepotty/web/frontend/dist/`, gitignored). Build it once, and again after any frontend change:

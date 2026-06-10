@@ -1,8 +1,11 @@
 import type {
+  ClipLabelsBody,
   EventDetail,
   EventFilters,
   EventSummary,
   EventsPage,
+  LabelClipDetail,
+  LabelClipList,
   LabelPayload,
   TuneDetectRangeResult,
   TuneDetectResult,
@@ -216,4 +219,36 @@ export async function fetchTunePoseRange(
 export function tuneClipUrl(path: string): string {
   const params = new URLSearchParams({ path });
   return `/api/tune/clip?${params.toString()}`;
+}
+
+// --- Range labeling (/label) ---------------------------------------------
+
+export async function fetchLabelClips(): Promise<LabelClipList> {
+  const response = await fetch("/api/label/clips");
+  return jsonOrThrow<LabelClipList>(response);
+}
+
+export async function fetchLabelClipDetail(spanId: string): Promise<LabelClipDetail> {
+  const response = await fetch(`/api/label/clips/${encodeURIComponent(spanId)}`);
+  return jsonOrThrow<LabelClipDetail>(response);
+}
+
+export async function saveLabelClip(
+  spanId: string,
+  body: ClipLabelsBody,
+): Promise<LabelClipDetail> {
+  const response = await fetch(
+    `/api/label/clips/${encodeURIComponent(spanId)}/labels`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return jsonOrThrow<LabelClipDetail>(response);
+}
+
+/** URL for a harvested clip's video (Range-seekable, by span id). */
+export function labelClipVideoUrl(spanId: string): string {
+  return `/api/label/clips/${encodeURIComponent(spanId)}/video`;
 }

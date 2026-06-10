@@ -45,7 +45,7 @@ export function navigate(to: string, opts: { replace?: boolean } = {}): void {
   sync();
 }
 
-export type View = "review" | "live" | "tune";
+export type View = "review" | "live" | "tune" | "label";
 
 /** Map a pathname to a top-level view (trailing slashes tolerated). */
 export function routeToView(path: string): View {
@@ -55,6 +55,9 @@ export function routeToView(path: string): View {
   }
   if (normalized === "/tune") {
     return "tune";
+  }
+  if (normalized === "/label") {
+    return "label";
   }
   return "review";
 }

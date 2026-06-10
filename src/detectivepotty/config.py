@@ -33,6 +33,11 @@ class GlobalSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dataset_dir: Path = Path("dataset")
+    # Where ``detectivepotty harvest`` writes reviewable clip dirs and where the
+    # range-labeling UI (``/api/label``) discovers them. Added to the tuner's
+    # allowed browse roots so the same decode/detect scrub surface can serve
+    # harvested clips for labeling.
+    harvest_dir: Path = Path("dataset/harvest")
     model_name: str = "models/yolo11m.pt"
     inference_long_edge_px: int = Field(default=640, gt=0)
     device: Device = "auto"

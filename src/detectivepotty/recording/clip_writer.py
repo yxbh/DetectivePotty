@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from detectivepotty.sources.base import Frame
+from detectivepotty.video_encode import open_h264_writer
 
 DEFAULT_FPS = 5.0
 
@@ -51,12 +52,10 @@ def _open_video_writer(
     width: int,
     height: int,
     fps: float,
-) -> cv2.VideoWriter:
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(target), fourcc, fps, (width, height))
-    if not writer.isOpened():
-        raise OSError(f"failed to open video writer: {target}")
-    return writer
+):
+    """Open a browser-playable H.264 writer (see ``video_encode``)."""
+
+    return open_h264_writer(target, fps, (width, height))
 
 
 def _choose_fps(frames: Sequence[Frame], fps: float | None) -> float:

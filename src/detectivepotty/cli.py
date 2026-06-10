@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 from typing import Annotated
@@ -245,31 +245,62 @@ def list_cameras_command(
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
         return
 
-    async def _list() -> None:
-        try:
-            from detectivepotty.protect.client import ProtectClient
-        except Exception as exc:
-            typer.echo(f"Protect support is unavailable: {exc}", err=True)
-            raise typer.Exit(1) from exc
+    async def _list() -> list:
+        from detectivepotty.protect.client import ProtectClient
 
-        try:
-            async with ProtectClient(config) as client:
-                cameras = await client.list_cameras()
-        except Exception as exc:
+        async with ProtectClient(config) as client:
+            cameras = await client.list_cameras()
+            return [
+                (
+                    cam.id,
+                    cam.name,
+                    cam.is_connected,
+                    cam.animal_smart_detect_supported,
+                )
+                for cam in cameras
+            ]
+
+    try:
+        rows = asyncio.run(_list())
+    except Exception as exc:  # noqa: BLE001 - fall back to the curl transport
+        rows = _list_cameras_via_curl(config)
+        if rows is None:
             typer.echo(f"Could not list Protect cameras: {exc}", err=True)
             raise typer.Exit(1) from exc
 
-        if not cameras:
-            typer.echo("No Protect cameras found.")
-            return
-        for camera in cameras:
-            typer.echo(
-                f"{camera.id}\t{camera.name}\t"
-                f"connected={camera.is_connected}\t"
-                f"animal={camera.animal_smart_detect_supported}",
-            )
+    if not rows:
+        typer.echo("No Protect cameras found.")
+        return
+    for cam_id, name, connected, animal in rows:
+        typer.echo(f"{cam_id}\t{name}\tconnected={connected}\tanimal={animal}")
 
-    asyncio.run(_list())
+
+def _list_cameras_via_curl(config) -> list | None:
+    """List cameras via the curl transport; None if curl/creds are unavailable."""
+
+    from detectivepotty.protect.curl_download import (
+        CurlProtectDownloader,
+        curl_available,
+    )
+
+    username = config.resolve_secret("username")
+    password = config.resolve_secret("password")
+    if not curl_available() or not (username and password):
+        return None
+    try:
+        with CurlProtectDownloader(
+            config.protect.nvr_host,
+            username,
+            password,
+            verify_tls=config.protect.verify_tls,
+        ) as downloader:
+            cameras = downloader.list_cameras()
+    except Exception:  # noqa: BLE001 - caller reports the original error
+        return None
+    return [
+        (cam.get("id"), cam.get("name"), cam.get("state") == "CONNECTED", "?")
+        for cam in cameras
+    ]
 
 
 @app.command("detect-file")
@@ -561,6 +592,497 @@ def export_coreml_command(
         typer.echo(f"Exporting {pt} -> CoreML (imgsz={imgsz}, half={half}) ...")
         result = export_coreml(pt, out_path=out_path, imgsz=imgsz, half=half)
         typer.echo(f"  saved: {result}")
+
+
+@app.command("harvest")
+def harvest_command(
+    input_path: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Long recording to scan for dog-present spans.",
+        ),
+    ],
+    out_dir: Annotated[
+        Path,
+        typer.Option("--out", help="Directory to write harvested clip dirs into."),
+    ] = Path("dataset/harvest"),
+    model: Annotated[
+        str,
+        typer.Option("--model", help="YOLO model name/path."),
+    ] = "models/yolo11m.pt",
+    long_edge: Annotated[
+        int,
+        typer.Option("--long-edge", min=1, help="YOLO inference long edge (imgsz)."),
+    ] = 640,
+    conf: Annotated[
+        float,
+        typer.Option("--conf", min=0.0, max=1.0, help="Detection confidence threshold."),
+    ] = 0.25,
+    sample_every: Annotated[
+        int,
+        typer.Option("--sample-every", min=1, help="Run detection every N frames."),
+    ] = 5,
+    merge_gap_s: Annotated[
+        float,
+        typer.Option("--merge-gap", min=0.0, help="Merge same-track gaps up to N seconds."),
+    ] = 2.0,
+    pad_s: Annotated[
+        float,
+        typer.Option("--pad", min=0.0, help="Seconds of padding added to each span."),
+    ] = 1.0,
+    min_len_s: Annotated[
+        float,
+        typer.Option("--min-len", min=0.0, help="Drop spans shorter than N seconds."),
+    ] = 0.5,
+    max_len_s: Annotated[
+        float,
+        typer.Option("--max-len", min=0.0, help="Split spans longer than N seconds."),
+    ] = 60.0,
+) -> None:
+    """Cut dog-present spans out of a long recording into reviewable clip dirs.
+
+    Each span becomes ``<out>/<span_id>/`` with an immutable ``clip.mp4`` plus a
+    ``metadata.json`` (fps, frame count, checksum, source UTC range, per-sampled
+    detection boxes). Re-running on an unchanged clip is idempotent. Hand-write a
+    ``labels.json`` next to a clip, then ``export-dataset`` to build crops.
+    """
+
+    from detectivepotty.harvest import harvest_clips
+
+    detector = DogDetector(
+        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+    )
+    results = harvest_clips(
+        input_path,
+        out_dir,
+        detector=detector,
+        sample_every=sample_every,
+        merge_gap_s=merge_gap_s,
+        pad_s=pad_s,
+        min_len_s=min_len_s,
+        max_len_s=max_len_s,
+    )
+    if not results:
+        typer.echo("No dog spans found.")
+        return
+    typer.echo(f"Harvested {len(results)} span(s) into {out_dir}:")
+    for result in results:
+        span = result.span
+        typer.echo(
+            f"  {result.span_id}  frames {span.start_frame}-{span.end_frame} "
+            f"({span.start_s:.1f}-{span.end_s:.1f}s, track {span.track_id})"
+        )
+
+
+@app.command("harvest-camera")
+def harvest_camera_command(
+    config_path: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to DetectivePotty YAML config (for Protect host/creds).",
+        ),
+    ],
+    camera: Annotated[
+        str,
+        typer.Option("--camera", help="Protect camera id or name (see list-cameras)."),
+    ],
+    date: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            help="Day to harvest as YYYY-MM-DD (a 24h window at --utc-offset).",
+        ),
+    ] = None,
+    start: Annotated[
+        str | None,
+        typer.Option("--start", help="ISO-8601 start (overrides --date)."),
+    ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option("--end", help="ISO-8601 end (overrides --date)."),
+    ] = None,
+    utc_offset: Annotated[
+        float,
+        typer.Option(
+            "--utc-offset",
+            help="Hours offset from UTC for --date (e.g. 10 for AEST). Default 0.",
+        ),
+    ] = 0.0,
+    out_dir: Annotated[
+        Path,
+        typer.Option("--out", help="Directory to write harvested clip dirs into."),
+    ] = Path("dataset/harvest"),
+    model: Annotated[
+        str,
+        typer.Option("--model", help="YOLO model name/path."),
+    ] = "models/yolo11m.pt",
+    long_edge: Annotated[
+        int,
+        typer.Option("--long-edge", min=1, help="YOLO inference long edge (imgsz)."),
+    ] = 640,
+    conf: Annotated[
+        float,
+        typer.Option("--conf", min=0.0, max=1.0, help="Detection confidence threshold."),
+    ] = 0.25,
+    chunk_s: Annotated[
+        float,
+        typer.Option("--chunk", min=1.0, help="Download/process chunk length (seconds)."),
+    ] = 3600.0,
+    overlap_s: Annotated[
+        float,
+        typer.Option("--overlap", min=0.0, help="Overlap between chunks (seconds)."),
+    ] = 5.0,
+    sample_every: Annotated[
+        int,
+        typer.Option("--sample-every", min=1, help="Run detection every N frames."),
+    ] = 5,
+    merge_gap_s: Annotated[
+        float,
+        typer.Option("--merge-gap", min=0.0, help="Merge same-track gaps up to N seconds."),
+    ] = 2.0,
+    pad_s: Annotated[
+        float,
+        typer.Option("--pad", min=0.0, help="Seconds of padding added to each span."),
+    ] = 1.0,
+    min_len_s: Annotated[
+        float,
+        typer.Option("--min-len", min=0.0, help="Drop spans shorter than N seconds."),
+    ] = 0.5,
+    max_len_s: Annotated[
+        float,
+        typer.Option("--max-len", min=0.0, help="Split spans longer than N seconds."),
+    ] = 60.0,
+    keep_chunks: Annotated[
+        bool,
+        typer.Option("--keep-chunks", help="Keep downloaded chunk MP4s (debug)."),
+    ] = False,
+    downloader: Annotated[
+        str,
+        typer.Option(
+            "--downloader",
+            help=(
+                "Recording transport: 'auto' (probe LAN, fall back to curl), "
+                "'uiprotect' (in-process aiohttp), or 'curl' (shell out to the "
+                "curl binary — needed when macOS Local Network Privacy blocks the "
+                "Python interpreter from the LAN). Default: auto."
+            ),
+        ),
+    ] = "auto",
+) -> None:
+    """Pull historical UNVR footage for a camera/day in chunks and harvest spans.
+
+    Downloads ``[start, end)`` (or the ``--date`` day) off UniFi Protect in
+    ``--chunk``-second windows, runs dog detection on each, and cuts dog-present
+    spans into ``<out>/<span_id>/`` clip dirs (immutable H.264 ``clip.mp4`` +
+    ``metadata.json``) — ready to label via ``serve``'s Label tab and then
+    ``export-dataset``. Failed/empty chunks are skipped; re-runs are idempotent.
+    """
+
+    config = load_config(config_path)
+    if not _protect_configured(config):
+        typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
+        raise typer.Exit(1)
+
+    start_utc, end_utc = _resolve_harvest_window(date, start, end, utc_offset)
+
+    detector = DogDetector(
+        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+    )
+
+    harvest_kwargs = dict(
+        chunk_s=chunk_s,
+        overlap_s=overlap_s,
+        sample_every=sample_every,
+        merge_gap_s=merge_gap_s,
+        pad_s=pad_s,
+        min_len_s=min_len_s,
+        max_len_s=max_len_s,
+        keep_chunks=keep_chunks,
+    )
+
+    mode = _select_downloader(downloader, config)
+
+    try:
+        if mode == "curl":
+            results = _harvest_via_curl(
+                config, camera, start_utc, end_utc, out_dir, detector, harvest_kwargs
+            )
+        else:
+            results = asyncio.run(
+                _harvest_via_uiprotect(
+                    config,
+                    camera,
+                    start_utc,
+                    end_utc,
+                    out_dir,
+                    detector,
+                    harvest_kwargs,
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
+        typer.echo(f"Camera harvest failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    if not results:
+        typer.echo(
+            "No dog spans harvested (no recording in range, or no dogs present)."
+        )
+        return
+    typer.echo(
+        f"Harvested {len(results)} span(s) for {camera} "
+        f"[{start_utc.isoformat()} - {end_utc.isoformat()}] into {out_dir}:"
+    )
+    for result in results:
+        span = result.span
+        typer.echo(
+            f"  {result.span_id}  ({span.start_s:.1f}-{span.end_s:.1f}s, "
+            f"track {span.track_id})"
+        )
+
+
+def _select_downloader(mode: str, config) -> str:
+    """Resolve the harvest downloader mode; 'auto' probes LAN reachability.
+
+    macOS Local Network Privacy denies the uv-managed Python interpreter access to
+    peer LAN devices (the NVR) while leaving the Apple-signed ``curl`` binary
+    unaffected. In ``auto`` mode we attempt a direct socket connection from this
+    process and fall back to the curl transport when it is blocked.
+    """
+
+    mode = (mode or "auto").lower()
+    if mode in {"curl", "uiprotect"}:
+        return mode
+    if mode != "auto":
+        raise typer.BadParameter("--downloader must be auto, uiprotect, or curl")
+
+    import socket
+
+    from detectivepotty.protect.client import _parse_host_port
+
+    host, port = _parse_host_port(config.protect.nvr_host)
+    try:
+        socket.create_connection((host, port), timeout=4.0).close()
+        return "uiprotect"
+    except OSError:
+        from detectivepotty.protect.curl_download import curl_available
+
+        if curl_available():
+            typer.echo(
+                f"NVR {host}:{port} is unreachable from Python (likely macOS Local "
+                "Network Privacy); falling back to the curl downloader.",
+                err=True,
+            )
+            return "curl"
+        return "uiprotect"
+
+
+def _harvest_via_curl(
+    config, camera, start_utc, end_utc, out_dir, detector, harvest_kwargs
+) -> list:
+    """Harvest a camera window using the curl-based Protect downloader."""
+
+    from detectivepotty.harvest_unvr import harvest_camera_window
+    from detectivepotty.protect.curl_download import (
+        CurlProtectDownloader,
+        curl_available,
+    )
+
+    if not curl_available():
+        raise RuntimeError("curl binary not found on PATH for the curl downloader")
+    username = config.resolve_secret("username")
+    password = config.resolve_secret("password")
+    if not (username and password):
+        raise RuntimeError(
+            "curl downloader requires DETECTIVEPOTTY_NVR_USERNAME and "
+            "DETECTIVEPOTTY_NVR_PASSWORD env vars"
+        )
+    with CurlProtectDownloader(
+        config.protect.nvr_host,
+        username,
+        password,
+        verify_tls=config.protect.verify_tls,
+    ) as downloader:
+        camera_id = downloader.resolve_camera_id(camera)
+        return harvest_camera_window(
+            camera_id,
+            start_utc,
+            end_utc,
+            out_dir,
+            detector=detector,
+            download_fn=downloader.as_download_fn(),
+            **harvest_kwargs,
+        )
+
+
+async def _harvest_via_uiprotect(
+    config, camera, start_utc, end_utc, out_dir, detector, harvest_kwargs
+) -> list:
+    """Harvest a camera window using the in-process uiprotect client."""
+
+    from detectivepotty.harvest_unvr import harvest_camera_window
+    from detectivepotty.protect.client import ProtectClient
+
+    async with ProtectClient(config) as client:
+        camera_id = await _resolve_camera_id(client, camera)
+        loop = asyncio.get_running_loop()
+
+        def download_fn(cam_id, c_start, c_end, dest):
+            future = asyncio.run_coroutine_threadsafe(
+                client.download_recording(cam_id, c_start, c_end, dest), loop
+            )
+            return future.result()
+
+        return await asyncio.to_thread(
+            harvest_camera_window,
+            camera_id,
+            start_utc,
+            end_utc,
+            out_dir,
+            detector=detector,
+            download_fn=download_fn,
+            **harvest_kwargs,
+        )
+
+
+def _resolve_harvest_window(
+    date: str | None,
+    start: str | None,
+    end: str | None,
+    utc_offset: float,
+) -> tuple[datetime, datetime]:
+    """Resolve the harvest window from --start/--end or a --date day."""
+
+    if start is not None and end is not None:
+        start_dt = _parse_iso(start)
+        end_dt = _parse_iso(end)
+    elif date is not None:
+        tz = timezone(timedelta(hours=utc_offset))
+        try:
+            day = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise typer.BadParameter(f"--date must be YYYY-MM-DD: {date}") from exc
+        start_dt = datetime(day.year, day.month, day.day, tzinfo=tz)
+        end_dt = start_dt + timedelta(days=1)
+    else:
+        raise typer.BadParameter("provide --date, or both --start and --end")
+    if end_dt <= start_dt:
+        raise typer.BadParameter("end must be after start")
+    return start_dt.astimezone(timezone.utc), end_dt.astimezone(timezone.utc)
+
+
+def _parse_iso(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter(f"invalid ISO-8601 datetime: {value}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+async def _resolve_camera_id(client, camera: str) -> str:
+    """Match ``camera`` against Protect camera ids, then names (case-insensitive)."""
+
+    cameras = await client.list_cameras()
+    for cam in cameras:
+        if getattr(cam, "id", None) == camera:
+            return camera
+    lowered = camera.strip().lower()
+    for cam in cameras:
+        if (getattr(cam, "name", "") or "").strip().lower() == lowered:
+            return cam.id
+    raise typer.BadParameter(
+        f"camera not found: {camera!r}. Run 'list-cameras' to see ids/names."
+    )
+
+
+@app.command("export-dataset")
+def export_dataset_command(
+    clips_root: Annotated[
+        Path,
+        typer.Option(
+            "--clips",
+            exists=True,
+            file_okay=False,
+            help="Root of harvested clip dirs (each with clip.mp4 + labels.json).",
+        ),
+    ] = Path("dataset/harvest"),
+    out_dir: Annotated[
+        Path,
+        typer.Option("--out", help="Directory to write the classifier dataset into."),
+    ] = Path("dataset/export"),
+    model: Annotated[
+        str,
+        typer.Option("--model", help="YOLO model name/path for dense re-detection."),
+    ] = "models/yolo11m.pt",
+    long_edge: Annotated[
+        int,
+        typer.Option("--long-edge", min=1, help="YOLO inference long edge (imgsz)."),
+    ] = 640,
+    conf: Annotated[
+        float,
+        typer.Option("--conf", min=0.0, max=1.0, help="Detection confidence threshold."),
+    ] = 0.25,
+    stride_s: Annotated[
+        float,
+        typer.Option("--stride", min=0.0, help="Within-range sample stride (seconds)."),
+    ] = 0.3,
+    max_frames: Annotated[
+        int,
+        typer.Option("--max-frames", min=1, help="Max crops per labeled range."),
+    ] = 40,
+    margin: Annotated[
+        float,
+        typer.Option("--margin", min=0.0, help="Crop margin fraction around the box."),
+    ] = 0.35,
+    val_fraction: Annotated[
+        float,
+        typer.Option("--val-fraction", min=0.0, max=1.0, help="Day/source val split."),
+    ] = 0.2,
+    min_iou: Annotated[
+        float,
+        typer.Option("--min-iou", min=0.0, max=1.0, help="Track-binding IoU gate."),
+    ] = 0.3,
+) -> None:
+    """Build classifier crops + a CSV manifest from labeled harvested clips.
+
+    Re-detects densely on each sampled frame, binds the crop to the range's dog
+    track, and writes an image-classifier folder layout (``behavior/`` and
+    ``dog/`` trees split train/val by day+source) plus ``manifest.csv`` and
+    ``export_stats.json``.
+    """
+
+    from detectivepotty.dataset_export import export_dataset
+
+    detector = DogDetector(
+        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+    )
+    stats = export_dataset(
+        clips_root,
+        out_dir,
+        detector=detector,
+        sample_stride_s=stride_s,
+        max_frames_per_range=max_frames,
+        crop_margin_frac=margin,
+        val_fraction=val_fraction,
+        min_iou=min_iou,
+    )
+    typer.echo(f"Exported {stats.crops_written} crop(s) from {stats.clips} clip(s).")
+    typer.echo(f"  behavior: {stats.behavior_counts}")
+    typer.echo(f"  dog:      {stats.dog_counts}")
+    typer.echo(f"  split:    {stats.split_counts}")
+    if stats.dropped_unmatched:
+        typer.echo(f"  dropped (unmatched track): {stats.dropped_unmatched}")
+    typer.echo(f"  dataset:  {out_dir}")
 
 
 def _build_camera_provider(config, camera, file_provider_cls, live_provider_cls):

@@ -11,9 +11,14 @@ The fix is to rewrite that block with :func:`torch.nn.functional.scaled_dot_prod
 coremltools *decomposes* SDPA into a GPU-lowerable matmul ordering (at the
 default deployment target — Ultralytics deliberately omits
 ``minimum_deployment_target``, so the iOS18 native-SDPA op that would re-trigger
-the crash is never emitted). The exported ``mlprogram`` then runs on the GPU at
-roughly half the latency of the ``.pt`` MPS path, numerically identical to the
-original block (max abs diff ~5e-4, float rounding).
+the crash is never emitted). The exported ``mlprogram`` then runs on the GPU,
+numerically identical to the original block (max abs diff ~5e-4, float rounding).
+
+Single-frame CoreML latency is roughly on par with the ``.pt`` MPS path once the
+CPU letterbox/NMS at full camera resolution is included; the real throughput win
+(~3×) comes from a **batched** export (``export_coreml(..., batch=N)``), which
+lets :class:`~detectivepotty.detect.yolo.DogDetector` run a whole frame window in
+one GPU forward instead of one frame at a time.
 
 This is opt-in and tuner-only; the live pipeline still runs ``.pt`` on MPS via
 :class:`detectivepotty.detect.yolo.DogDetector`. See ``plan.md`` (ROUND 7c/8) for
@@ -25,12 +30,17 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
 import torch.nn.functional as F
 
-__all__ = ["patch_attention_sdpa", "export_coreml", "DEFAULT_COREML_DIR"]
+__all__ = [
+    "patch_attention_sdpa",
+    "export_coreml",
+    "coreml_max_batch",
+    "DEFAULT_COREML_DIR",
+]
 
 # Curated, committable exports live here (tracked via a .gitignore negation);
 # ad-hoc exports default next to the weights and stay ignored.
@@ -90,6 +100,7 @@ def export_coreml(
     out_path: str | Path | None = None,
     imgsz: int = 640,
     half: bool = True,
+    batch: int = 1,
 ) -> Path:
     """Export ``weights`` (a YOLO ``.pt``) to a GPU-safe CoreML ``.mlpackage``.
 
@@ -100,25 +111,42 @@ def export_coreml(
     ``out_path`` redirects/renames the export (e.g. into
     :data:`DEFAULT_COREML_DIR` for the committable set); when omitted, Ultralytics
     writes ``<weights stem>.mlpackage`` next to the weights. ``imgsz`` is baked
-    into the model's fixed input shape, so the tuner must run inference at the
-    same long edge. Heavy and macOS-only — never invoked by the offline test
-    suite (callers inject a fake).
+    into the model's input shape, so the tuner must run inference at the same long
+    edge. Heavy and macOS-only — never invoked by the offline test suite (callers
+    inject a fake).
+
+    ``batch`` controls whether the package can run **batched** inference:
+
+    * ``batch == 1`` (default) → a fixed single-image package (back-compat). It
+      can only ever process one frame per ``predict`` call, so the detector falls
+      back to serial per-frame inference and GPU utilisation stays low.
+    * ``batch > 1`` → a **dynamic** flexible-shape package that accepts any batch
+      in ``[1, batch]``. This is GPU-safe (verified on Apple MPS with the SDPA
+      attention rewrite) and unlocks ~3× detection throughput by letting
+      :class:`~detectivepotty.detect.yolo.DogDetector` submit whole frame windows
+      in one GPU forward. Export ``batch`` to match the largest batch the caller
+      submits (the tuner caps batches at ``tune_detection_batch_size``); larger
+      batches than baked simply fall back to per-frame on the same accelerator.
     """
 
     from ultralytics import YOLO
 
     weights = Path(weights)
     model = YOLO(str(weights))
+    export_kwargs: dict[str, Any] = dict(
+        format="coreml",
+        imgsz=imgsz,
+        half=half,
+        nms=False,
+        verbose=False,
+    )
+    # CoreML rejects a fixed ``batch > 1`` ("not supported without 'dynamic=True'");
+    # ``dynamic=True`` makes the input shape flexible so it accepts batches 1..N.
+    if batch > 1:
+        export_kwargs["batch"] = batch
+        export_kwargs["dynamic"] = True
     with patch_attention_sdpa():
-        exported = Path(
-            model.export(
-                format="coreml",
-                imgsz=imgsz,
-                half=half,
-                nms=False,
-                verbose=False,
-            )
-        )
+        exported = Path(model.export(**export_kwargs))
 
     if out_path is None:
         return exported
@@ -131,3 +159,57 @@ def export_coreml(
         shutil.rmtree(out_path)
     shutil.move(str(exported), str(out_path))
     return out_path
+
+
+def _max_batch_from_spec(spec: Any) -> int:
+    """Pull the max batch an exported CoreML ``spec`` accepts (1 if not batched).
+
+    A fixed single-image export uses an ``imageType`` input (no batch dimension →
+    1). A :func:`export_coreml` ``batch > 1`` export uses a ``multiArrayType``
+    whose leading dimension is flexible; its upper bound is the largest batch the
+    package can run. Pure (takes an already-loaded proto) so it is unit-testable
+    without ``coremltools`` or a real ``.mlpackage``.
+    """
+
+    inputs = getattr(spec.description, "input", None)
+    if not inputs:
+        return 1
+    inp = inputs[0]
+    if inp.type.WhichOneof("Type") != "multiArrayType":
+        return 1  # imageType (fixed single image) or other → no batching
+    ma = inp.type.multiArrayType
+    if ma.HasField("shapeRange") and len(ma.shapeRange.sizeRanges) > 0:
+        return int(ma.shapeRange.sizeRanges[0].upperBound)
+    if len(ma.shape) > 0:
+        return int(ma.shape[0])
+    return 1
+
+
+_BATCH_CACHE: dict[tuple[str, int], int] = {}
+
+
+def coreml_max_batch(path: str | Path) -> int:
+    """Return the largest batch the ``.mlpackage`` at ``path`` accepts (``1`` if
+    fixed single-image, unreadable, or ``coremltools`` is unavailable).
+
+    Reads the model *spec* only (a cheap protobuf parse — no compile/load), and
+    memoises the result per ``(path, mtime)`` so the model picker can label each
+    CoreML option with its baked batch size without repeated I/O.
+    """
+
+    p = Path(path)
+    try:
+        key = (str(p.resolve()), p.stat().st_mtime_ns)
+    except OSError:
+        return 1
+    cached = _BATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        import coremltools as ct
+
+        value = _max_batch_from_spec(ct.utils.load_spec(str(p)))
+    except Exception:  # noqa: BLE001 - any read failure → treat as un-batched
+        value = 1
+    _BATCH_CACHE[key] = value
+    return value

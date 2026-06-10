@@ -73,6 +73,15 @@ npm run build</pre>
 # recovered by lowering the slider — hence the slider can't go below it.
 TUNE_DETECTION_FLOOR = 0.05
 
+# Upper bound on total pose crops the batched pose pass (`POST /api/tune/pose_range`)
+# will run for one request, regardless of how many frames/boxes the client sends.
+# `estimate_batch` chunks by `classifier_batch_size` (the GPU forward size), so this
+# only bounds how long one request can hold `tune_infer_lock` (an AbortController
+# can't cancel an already-running server thread) — it stops a buggy/hostile client
+# from monopolizing the GPU after a scrub/model change. The normal client sends
+# ~8 frames x ~1 box, far under this.
+TUNE_POSE_MAX_CROPS = 64
+
 # Suffix -> MIME for the tuner clip endpoint. Browsers play mp4/mov/webm
 # natively; mkv/avi are served with a correct type even if a given browser
 # can't decode them.
@@ -108,6 +117,28 @@ class TunePoseRequest(BaseModel):
     path: str = Field(max_length=4096)
     index: int = Field(ge=0)
     boxes: list[list[float]] = Field(default_factory=list, max_length=64)
+
+
+class TunePoseRangeFrame(BaseModel):
+    """One frame's buffered boxes within a batched pose request."""
+
+    index: int = Field(ge=0)
+    boxes: list[list[float]] = Field(default_factory=list, max_length=64)
+
+
+class TunePoseRangeRequest(BaseModel):
+    """Body for ``POST /api/tune/pose_range`` — the batched pose pass.
+
+    Carries the buffered boxes for a run of frames so pose runs as **one batched
+    GPU forward across the whole window** instead of one request per frame (the
+    SuperAnimal backend measured ~9-14x faster batched than the batch-1 floor).
+    Bounded (frame count + per-frame boxes) so a hostile/buggy client can't
+    schedule unbounded work; the server further caps total crops
+    (``TUNE_POSE_MAX_CROPS``).
+    """
+
+    path: str = Field(max_length=4096)
+    frames: list[TunePoseRangeFrame] = Field(default_factory=list, max_length=64)
 
 
 class _ApiNoStoreMiddleware:
@@ -180,6 +211,23 @@ async def _event_stream(dataset_index, is_disconnected, *, sleep=asyncio.sleep, 
         # Always heartbeat (even after a failed scan) so proxies and the browser
         # don't idle the connection shut.
         yield ": ping\n\n"
+
+
+def _coreml_batch_map(models: list[str]) -> dict[str, int]:
+    """Map each ``.mlpackage`` in ``models`` to its baked max batch size.
+
+    Lets the model picker label CoreML options with the batch they run (e.g.
+    ``yolo11m (CoreML ×16)``) so it is obvious which exports are batched. Reads
+    each package's spec once (memoised by mtime); ``.pt`` weights are omitted.
+    """
+
+    from detectivepotty.detect import coreml_export
+
+    return {
+        m: coreml_export.coreml_max_batch(m)
+        for m in models
+        if m.endswith(".mlpackage")
+    }
 
 
 def create_app(
@@ -482,6 +530,67 @@ def create_app(
             payload["image"] = tune_mod.encode_jpeg_dataurl(frame)
         return payload
 
+    def _detect_range_payload(
+        file_path: Path,
+        start: int,
+        count: int,
+        model_name: str,
+    ) -> dict:
+        """Detections for a contiguous run of frames in one batched forward.
+
+        The tuner's background filler walks frames in order, so a window decodes
+        sequentially (cheap) and runs through ``detect_batch`` as a single GPU
+        forward under ``tune_infer_lock`` — the batched analogue of the per-frame
+        ``/api/tune/detect``. Returns ``{model, frames: [<per-frame payload>...]}``
+        with each entry shaped exactly like the boxes-only ``_detect_payload`` so
+        the client can buffer them identically. Pose is not run here; it stays on
+        the decoupled ``/api/tune/pose`` lane.
+        """
+
+        from detectivepotty.detect.yolo import FrameMeta
+        from detectivepotty.web import tune as tune_mod
+
+        frames, total, fps, width, height = tune_mod.read_frames(file_path, start, count)
+        detector, model_used = _get_tune_detector(model_name)
+        bgr_list = [frame for _idx, frame in frames]
+        wall = datetime.now(timezone.utc)
+        mono = time.monotonic()
+        metas = [
+            FrameMeta(frame_idx=idx, mono_ts=mono, wall_ts=wall) for idx, _frame in frames
+        ]
+        batch = getattr(detector, "detect_batch", None)
+        with app.state.tune_infer_lock:
+            if batch is not None:
+                results = batch(bgr_list, metas)
+            else:
+                # A detector predating ``detect_batch`` (e.g. a test fake): loop
+                # ``detect``; results are identical (per-image-independent boxes).
+                results = [
+                    detector.detect(
+                        frame, frame_idx=idx, mono_ts=mono, wall_ts=wall
+                    )
+                    for idx, frame in frames
+                ]
+        resolved = app.state.tune_pose_resolved
+        pose_available = resolved[1] if resolved is not None else True
+        out_frames = [
+            {
+                "path": str(file_path),
+                "index": idx,
+                "total_frames": total or None,
+                "fps": fps,
+                "width": width,
+                "height": height,
+                "model": model_used,
+                "detection_floor": TUNE_DETECTION_FLOOR,
+                "detections": tune_mod.detections_payload(detections),
+                "pose": [],
+                "pose_available": pose_available,
+            }
+            for (idx, _frame), detections in zip(frames, results)
+        ]
+        return {"model": model_used, "frames": out_frames}
+
     def _pose_payload(
         file_path: Path,
         index: int,
@@ -516,6 +625,58 @@ def create_app(
                 pose_list = []
         return {"index": idx, "pose": pose_list, "pose_available": pose_available}
 
+    def _pose_range_payload(
+        file_path: Path,
+        frames_in: list[tuple[int, list[list[float]]]],
+    ) -> dict:
+        """Batched pose over a run of frames — one ``estimate_batch`` GPU forward.
+
+        Drives ``POST /api/tune/pose_range``. Each frame is decoded *outside*
+        ``tune_infer_lock`` (CPU/IO shouldn't block the GPU); a frame that can't be
+        decoded is carried as ``None`` so it still appears in the response (with
+        empty pose) and the client can mark it terminal instead of retrying it
+        forever. Only the single combined ``estimate_batch`` is serialized by the
+        lock. Inference failure downgrades pose app-wide (same contract as
+        ``_pose_payload``). Returns ``{frames: [{index, pose, pose_available}...]}``
+        with one entry per requested frame, in request order.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        estimator, pose_available = _get_tune_pose()
+        if estimator is None:
+            return {
+                "frames": [
+                    {"index": index, "pose": [], "pose_available": False}
+                    for index, _boxes in frames_in
+                ]
+            }
+
+        items: list[tuple[int, object, list[list[float]]]] = []
+        for index, boxes in frames_in:
+            try:
+                frame, _idx, _total, _fps, _w, _h = tune_mod.read_frame(file_path, index)
+            except IndexError:
+                # Un-decodable (EOF / corrupt): keep the index but pose nothing, so
+                # the client marks it terminal rather than re-requesting forever.
+                frame = None
+            items.append((index, frame, boxes))
+
+        with app.state.tune_infer_lock:
+            try:
+                results = tune_mod.pose_payload_for_frames(estimator, items)
+            except Exception:
+                logger.warning("pose inference failed; disabling pose overlay")
+                app.state.tune_pose_resolved = (None, False)
+                pose_available = False
+                results = [(index, []) for index, _frame, _boxes in items]
+        return {
+            "frames": [
+                {"index": index, "pose": pose_list, "pose_available": pose_available}
+                for index, pose_list in results
+            ]
+        }
+
     @app.get("/api/tune/models")
     def tune_models() -> dict:
         """The model picker's allow-list: discovered weights + the configured one."""
@@ -523,6 +684,7 @@ def create_app(
         return {
             "models": list(app.state.tune_models),
             "default": app.state.tune_default_model,
+            "coreml_batch": _coreml_batch_map(app.state.tune_models),
         }
 
     @app.post("/api/tune/export-coreml")
@@ -550,6 +712,7 @@ def create_app(
                     coreml_export.export_coreml(
                         name,
                         imgsz=config.global_settings.inference_long_edge_px,
+                        batch=config.global_settings.tune_detection_batch_size,
                     )
                 )
 
@@ -565,6 +728,7 @@ def create_app(
             "model": result,
             "models": list(app.state.tune_models),
             "default": app.state.tune_default_model,
+            "coreml_batch": _coreml_batch_map(app.state.tune_models),
         }
 
     @app.get("/api/tune/meta")
@@ -665,6 +829,42 @@ def create_app(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
+    @app.get("/api/tune/detect_range")
+    async def tune_detect_range(
+        path: str,
+        start: Annotated[int, Query(ge=0)] = 0,
+        count: Annotated[int, Query(ge=1)] = 1,
+        model: str | None = None,
+    ) -> dict:
+        """Batched detections for a contiguous ``[start, start+count)`` window.
+
+        The filler's backfill source: one sequential decode + one ``detect_batch``
+        forward instead of ``count`` single-frame round-trips, which is what lifts
+        GPU utilization off the batch-1 floor. ``count`` is capped by
+        ``tune_detection_batch_size`` so a client can't request an unbounded run.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        model_name = _resolve_tune_model(model)
+        cap = max(1, app.state.config.global_settings.tune_detection_batch_size)
+        bounded = min(count, cap)
+
+        try:
+            return await run_in_threadpool(
+                _detect_range_payload,
+                file_path,
+                start,
+                bounded,
+                model_name,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
     @app.post("/api/tune/pose")
     async def tune_pose(req: TunePoseRequest) -> dict:
         """Pose keypoints for client-supplied boxes on one frame — no YOLO re-run.
@@ -689,6 +889,43 @@ def create_app(
                 file_path,
                 req.index,
                 req.boxes,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.post("/api/tune/pose_range")
+    async def tune_pose_range(req: TunePoseRangeRequest) -> dict:
+        """Batched pose for a run of frames' buffered boxes — one GPU forward.
+
+        The pose analogue of ``/api/tune/detect_range``: instead of one pose
+        request per frame (the batch-1 floor that measured ~9-14x slower on the
+        SuperAnimal backend), the tuner sends a window of frames + their boxes and
+        pose runs as a single batched ``estimate_batch``. Frames are capped by
+        ``tune_detection_batch_size`` and total crops by ``TUNE_POSE_MAX_CROPS`` so
+        one request can't monopolize the inference lock.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(req.path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+
+        frame_cap = max(1, app.state.config.global_settings.tune_detection_batch_size)
+        frames_in: list[tuple[int, list[list[float]]]] = []
+        crops = 0
+        for frame in req.frames[:frame_cap]:
+            frames_in.append((frame.index, frame.boxes))
+            crops += len(frame.boxes)
+            if crops >= TUNE_POSE_MAX_CROPS:
+                break
+
+        try:
+            return await run_in_threadpool(
+                _pose_range_payload,
+                file_path,
+                frames_in,
             )
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc

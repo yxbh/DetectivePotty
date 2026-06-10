@@ -4,13 +4,14 @@ import type {
   EventSummary,
   EventsPage,
   LabelPayload,
+  TuneDetectRangeResult,
   TuneDetectResult,
   TuneExportResult,
   TuneFrame,
   TuneListing,
   TuneMeta,
   TuneModelList,
-  TunePoseResult,
+  TunePoseRangeResult,
 } from "./types";
 
 const EVENTS_LIMIT = 200;
@@ -172,21 +173,43 @@ export async function fetchTuneDetect(
   return jsonOrThrow<TuneDetectResult>(response);
 }
 
-/** Pose pass for client-supplied boxes on one frame — no YOLO re-run. Drives the
- *  decoupled, proactive pose lane so flipping the overlay to pose is instant. */
-export async function fetchTunePose(
+/** Batched detections for a contiguous `[start, start+count)` frame window. One
+ *  sequential decode + one `detect_batch` forward replaces `count` single-frame
+ *  round-trips, which is what lifts GPU utilization off the batch-1 floor. The
+ *  backend caps `count` at `tune_detection_batch_size`, so the returned
+ *  `frames` may be shorter than requested (also at EOF). */
+export async function fetchTuneDetectRange(
   path: string,
-  index: number,
-  boxes: number[][],
+  start: number,
+  count: number,
+  model: string,
   signal?: AbortSignal,
-): Promise<TunePoseResult> {
-  const response = await fetch("/api/tune/pose", {
+): Promise<TuneDetectRangeResult> {
+  const params = new URLSearchParams({
+    path,
+    start: String(start),
+    count: String(count),
+    model,
+  });
+  const response = await fetch(`/api/tune/detect_range?${params.toString()}`, { signal });
+  return jsonOrThrow<TuneDetectRangeResult>(response);
+}
+
+/** Pose pass for client-supplied boxes across a contiguous run of frames — no
+ *  YOLO re-run. Drives the decoupled, proactive pose lane so flipping the overlay
+ *  to pose is instant, and batches the whole run into one server-side forward. */
+export async function fetchTunePoseRange(
+  path: string,
+  frames: { index: number; boxes: number[][] }[],
+  signal?: AbortSignal,
+): Promise<TunePoseRangeResult> {
+  const response = await fetch("/api/tune/pose_range", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, index, boxes }),
+    body: JSON.stringify({ path, frames }),
     signal,
   });
-  return jsonOrThrow<TunePoseResult>(response);
+  return jsonOrThrow<TunePoseRangeResult>(response);
 }
 
 /** URL for the raw clip the <video> element streams (Range-seekable). */

@@ -269,6 +269,29 @@ def read_frame(
     raise IndexError(f"no frame at index {index} (reader churn)") from last_exc
 
 
+def read_frames(
+    path: Path, start: int, count: int
+) -> tuple[list[tuple[int, np.ndarray]], int, float, int, int]:
+    """Decode a contiguous run of frames from ``path`` (the batched read path).
+
+    Returns ``(frames, total_frames, fps, width, height)`` where ``frames`` is a
+    list of ``(idx, frame_bgr)``. Backed by the same persistent
+    :class:`ClipFrameReader` cache as :func:`read_frame`; sequential decoding of
+    the run is far cheaper than ``count`` independent seeks, which is what makes
+    batched detection over a frame window worthwhile. Raises ``IndexError`` if the
+    starting frame cannot be read.
+    """
+
+    last_exc: _ReaderRetired | None = None
+    for _ in range(3):
+        reader = get_clip_reader(path)
+        try:
+            return reader.read_range(start, count)
+        except _ReaderRetired as exc:  # pragma: no cover - needs eviction race
+            last_exc = exc
+    raise IndexError(f"no frame at index {start} (reader churn)") from last_exc
+
+
 # --- persistent per-clip decoder cache -----------------------------------
 #
 # Opening a fresh ``cv2.VideoCapture`` and seeking by frame index re-decodes
@@ -340,6 +363,41 @@ class ClipFrameReader:
             self._next_pos = idx + 1
             height, width = frame.shape[:2]
             return frame, idx, self._total, self._fps, width, height
+
+    def read_range(
+        self, start: int, count: int
+    ) -> tuple[list[tuple[int, np.ndarray]], int, float, int, int]:
+        """Decode up to ``count`` contiguous frames starting at ``start``.
+
+        Returns ``(frames, total, fps, width, height)`` where ``frames`` is a list
+        of ``(idx, frame_bgr)`` in increasing index order. The run is read
+        sequentially (each decode advances ``_next_pos`` so the next is a cheap
+        sequential read) and stops short at EOF. Raises ``IndexError`` if not even
+        the first frame can be decoded.
+        """
+
+        with self._lock:
+            if self._retired:
+                raise _ReaderRetired
+            idx = start if start >= 0 else 0
+            if self._total > 0:
+                idx = min(idx, self._total - 1)
+            frames: list[tuple[int, np.ndarray]] = []
+            for _ in range(max(1, count)):
+                if self._total > 0 and idx > self._total - 1:
+                    break
+                ok, frame = self._decode_at(idx)
+                if not ok or frame is None:
+                    # A failed decode mid-run leaves the position untrustworthy;
+                    # stop here and let the caller use what we already have.
+                    self._next_pos = None
+                    break
+                self._next_pos = idx + 1
+                frames.append((idx, frame))
+                idx += 1
+            if not frames:
+                raise IndexError(f"no frame at index {start}")
+            return frames, self._total, self._fps, self._width, self._height
 
     def _decode_at(self, idx: int) -> tuple[bool, np.ndarray | None]:
         """Advance the capture to ``idx`` and decode it. Caller holds the lock."""
@@ -485,6 +543,34 @@ def pose_payload(
     return out
 
 
+def _clamp_valid_bboxes(
+    frame_bgr: np.ndarray, boxes: Sequence[Sequence[float]]
+) -> list[BBox]:
+    """Clamp client ``[x1, y1, x2, y2]`` boxes to the frame, in input order.
+
+    Malformed (not 4 numbers) and degenerate (zero/negative-area after clamping)
+    boxes are dropped. Shared by the single-frame and multi-frame pose payloads so
+    both validate identically.
+    """
+
+    from detectivepotty.geometry import BBox
+
+    height, width = frame_bgr.shape[:2]
+    out: list[BBox] = []
+    for box in boxes:
+        if len(box) != 4:
+            continue
+        x1 = min(max(float(box[0]), 0.0), float(width))
+        y1 = min(max(float(box[1]), 0.0), float(height))
+        x2 = min(max(float(box[2]), 0.0), float(width))
+        y2 = min(max(float(box[3]), 0.0), float(height))
+        bbox = BBox(x1, y1, x2, y2)
+        if bbox.width <= 0 or bbox.height <= 0:
+            continue
+        out.append(bbox)
+    return out
+
+
 def pose_payload_for_boxes(
     estimator: PoseEstimator,
     frame_bgr: np.ndarray,
@@ -496,33 +582,83 @@ def pose_payload_for_boxes(
     Drives the decoupled pose pass (``POST /api/tune/pose``): the tuner sends the
     detection boxes it already buffered, so pose runs **without re-running YOLO**.
     Boxes are clamped to the frame and degenerate (zero/negative-area) boxes are
-    skipped; one entry is returned per box that yields keypoints.
+    skipped. All valid boxes on the frame are submitted to ``estimate_batch`` as a
+    single batch (one GPU forward where the backend supports it); one entry is
+    returned per box that yields keypoints, in input order.
     """
 
-    from detectivepotty.geometry import BBox
+    from detectivepotty.pose.base import PoseRequest
 
-    height, width = frame_bgr.shape[:2]
-    out: list[dict[str, Any]] = []
-    for box in boxes:
-        if len(box) != 4:
-            continue
-        x1 = min(max(float(box[0]), 0.0), float(width))
-        y1 = min(max(float(box[1]), 0.0), float(height))
-        x2 = min(max(float(box[2]), 0.0), float(width))
-        y2 = min(max(float(box[3]), 0.0), float(height))
-        bbox = BBox(x1, y1, x2, y2)
-        if bbox.width <= 0 or bbox.height <= 0:
-            continue
-        keypoints = estimator.estimate(
-            frame_bgr,
-            bbox,
+    valid_bboxes = _clamp_valid_bboxes(frame_bgr, boxes)
+    if not valid_bboxes:
+        return []
+
+    requests = [
+        PoseRequest(
+            frame_bgr_original=frame_bgr,
+            bbox=bbox,
             frame_idx=frame_idx,
             source_id="tune",
         )
+        for bbox in valid_bboxes
+    ]
+    keypoints_list = estimator.estimate_batch(requests)
+    out: list[dict[str, Any]] = []
+    for bbox, keypoints in zip(valid_bboxes, keypoints_list):
         if keypoints is None:
             continue
         out.append(_pose_entry(bbox, keypoints))
     return out
+
+
+def pose_payload_for_frames(
+    estimator: PoseEstimator,
+    items: Sequence[tuple[int, np.ndarray | None, Sequence[Sequence[float]]]],
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    """Estimate pose across **multiple frames** in one ``estimate_batch`` forward.
+
+    Drives the batched pose pass (``POST /api/tune/pose_range``). ``items`` is a
+    sequence of ``(index, frame_bgr_or_None, boxes)``. Every frame's valid boxes
+    are collected into a **single** ``estimate_batch`` call so the backend runs one
+    batched GPU forward for the whole window (the SuperAnimal backend measured
+    ~9-14x faster than the batch-1 per-frame path), then keypoints are distributed
+    back to their source frame in input order.
+
+    A ``None`` frame (e.g. one that failed to decode) contributes no crops but is
+    still returned with an empty entry list, so **every requested index appears in
+    the output exactly once**. That lets the caller mark un-decodable frames
+    terminal instead of retrying them forever. Returns ``list[(index, entries)]``
+    aligned 1:1 with ``items``.
+    """
+
+    from detectivepotty.pose.base import PoseRequest
+
+    owners: list[int] = []
+    bboxes: list[BBox] = []
+    requests: list[PoseRequest] = []
+    for pos, (index, frame_bgr, boxes) in enumerate(items):
+        if frame_bgr is None:
+            continue
+        for bbox in _clamp_valid_bboxes(frame_bgr, boxes):
+            owners.append(pos)
+            bboxes.append(bbox)
+            requests.append(
+                PoseRequest(
+                    frame_bgr_original=frame_bgr,
+                    bbox=bbox,
+                    frame_idx=index,
+                    source_id="tune",
+                )
+            )
+
+    entries_per_item: list[list[dict[str, Any]]] = [[] for _ in items]
+    if requests:
+        keypoints_list = estimator.estimate_batch(requests)
+        for pos, bbox, keypoints in zip(owners, bboxes, keypoints_list):
+            if keypoints is None:
+                continue
+            entries_per_item[pos].append(_pose_entry(bbox, keypoints))
+    return [(items[pos][0], entries_per_item[pos]) for pos in range(len(items))]
 
 
 def build_tune_pose_estimator(config: Config) -> tuple[PoseEstimator | None, bool]:

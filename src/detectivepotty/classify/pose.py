@@ -22,7 +22,7 @@ from typing import ContextManager, Sequence
 from detectivepotty.classify.base import ClassifierResult, PottyClassifier
 from detectivepotty.config import PoseConfig
 from detectivepotty.events import ClassifierGuess, Detection, Track
-from detectivepotty.pose.base import PoseEstimator
+from detectivepotty.pose.base import PoseEstimator, PoseRequest
 from detectivepotty.pose.features import PoseFeatures, extract_pose_features
 from detectivepotty.pose.keypoints import PoseKeypoints
 from detectivepotty.sources.base import Frame
@@ -124,10 +124,12 @@ class PosePottyClassifier(PottyClassifier):
         self._fallback = fallback
         # Pose inference shares the accelerator with detection; the pipeline passes
         # its inference lock so a finalization-time pose pass on one camera does not
-        # run concurrently with another camera's detection. Lock is acquired per
-        # frame (not for the whole window) so detection can still interleave.
+        # run concurrently with another camera's detection. The lock is acquired per
+        # CHUNK (a batched forward), not for the whole window, so detection can still
+        # interleave between chunks.
         self._lock: ContextManager = nullcontext() if inference_lock is None else inference_lock
         self._max_pose_frames = max_pose_frames
+        self._batch_size = max(1, pose_config.classifier_batch_size)
         self._thresholds = thresholds or PoseDecisionThresholds()
 
     def classify(self, track: Track, frames: Sequence[Frame]) -> ClassifierResult:
@@ -191,7 +193,11 @@ class PosePottyClassifier(PottyClassifier):
             return []
         detections = sorted(by_frame.values(), key=lambda det: det.frame_idx)
 
-        poses: list[PoseKeypoints] = []
+        # Build one pose request per sampled detection (lock-free), then run the
+        # model in batched chunks. Each crop is independent, so a chunked batch
+        # yields the same per-frame poses as the old per-frame loop, just with one
+        # GPU forward per chunk for higher utilization.
+        requests: list[PoseRequest] = []
         for detection in _evenly_sample(detections, self._max_pose_frames):
             frame = frames_by_idx[detection.frame_idx]
             # Recover full dog extent from a short trailing window so an
@@ -203,15 +209,23 @@ class PosePottyClassifier(PottyClassifier):
                 detection,
                 self._pose.box_union_window_s,
             )
-            with self._lock:
-                pose = self._estimator.estimate(
-                    frame.bgr,
-                    pose_bbox,
+            requests.append(
+                PoseRequest(
+                    frame_bgr_original=frame.bgr,
+                    bbox=pose_bbox,
                     frame_idx=detection.frame_idx,
                     mono_ts=detection.mono_ts,
                     wall_ts=detection.wall_ts,
                     source_id=frame.source_id,
                 )
-            if pose is not None:
-                poses.append(pose)
+            )
+
+        poses: list[PoseKeypoints] = []
+        for start in range(0, len(requests), self._batch_size):
+            chunk = requests[start : start + self._batch_size]
+            # Lock per chunk (not per window) so detection on another camera can
+            # interleave between chunks.
+            with self._lock:
+                chunk_poses = self._estimator.estimate_batch(chunk)
+            poses.extend(pose for pose in chunk_poses if pose is not None)
         return poses

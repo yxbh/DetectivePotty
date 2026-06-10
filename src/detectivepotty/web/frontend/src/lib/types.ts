@@ -125,6 +125,8 @@ export interface TuneFrame {
 export interface TuneModelList {
   models: string[];
   default: string;
+  /** Per-`.mlpackage` baked max batch size (e.g. 16 = batched, 1 = single-frame). */
+  coreml_batch?: Record<string, number>;
 }
 
 /** Result of a one-off CoreML export: the new model + refreshed allow-list. */
@@ -132,6 +134,8 @@ export interface TuneExportResult {
   model: string;
   models: string[];
   default: string;
+  /** Per-`.mlpackage` baked max batch size (e.g. 16 = batched, 1 = single-frame). */
+  coreml_batch?: Record<string, number>;
 }
 
 /** Result of the decoupled pose pass (`POST /api/tune/pose`). */
@@ -139,6 +143,12 @@ export interface TunePoseResult {
   index: number;
   pose: TunePose[];
   pose_available: boolean;
+}
+
+/** Batched pose results for a contiguous run of frames
+ *  (`POST /api/tune/pose_range`). Each entry is shaped like {@link TunePoseResult}. */
+export interface TunePoseRangeResult {
+  frames: TunePoseResult[];
 }
 
 /** Clip properties for index<->time mapping (no inference). */
@@ -165,4 +175,11 @@ export interface TuneDetectResult {
   detections: TuneDetection[];
   pose: TunePose[];
   pose_available: boolean;
+}
+
+/** Batched detections for a contiguous frame window — the backfill filler's
+ *  payload. Each entry is shaped like {@link TuneDetectResult}. */
+export interface TuneDetectRangeResult {
+  model: string;
+  frames: TuneDetectResult[];
 }

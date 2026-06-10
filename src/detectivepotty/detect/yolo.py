@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import logging
 import threading
 import time
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 
@@ -44,6 +44,44 @@ class InferenceInfo:
     device: str
 
 
+@dataclass(frozen=True, slots=True)
+class FrameMeta:
+    """Per-frame identity/timestamps for batched detection.
+
+    Mirrors the optional args of :meth:`DogDetector.detect` so a batch entry
+    carries the same context a single ``detect`` call would.
+    """
+
+    frame_idx: int = 0
+    mono_ts: float | None = None
+    wall_ts: datetime | None = None
+
+
+@dataclass
+class BatchStats:
+    """Cumulative batch-inference telemetry for interpreting throughput.
+
+    Lets the operator see whether batches are actually forming on the
+    accelerator (vs silently falling back to per-frame) and the effective
+    batch size achieved.
+    """
+
+    calls: int = 0
+    frames: int = 0
+    batched_calls: int = 0
+    per_frame_fallback_calls: int = 0
+    total_latency_ms: float = 0.0
+    max_effective_batch: int = 0
+
+    @property
+    def mean_batch_latency_ms(self) -> float:
+        return self.total_latency_ms / self.calls if self.calls else 0.0
+
+    @property
+    def mean_effective_batch(self) -> float:
+        return self.frames / self.calls if self.calls else 0.0
+
+
 class DogDetector:
     """YOLO wrapper that returns dog boxes in original-resolution pixels."""
 
@@ -65,6 +103,11 @@ class DogDetector:
         self._candidates: tuple[str, ...] = (model_name, "yolov8n.pt")
         self.model = self._acquire_model(self.device)
         self.last_inference: InferenceInfo | None = None
+        # Set once a batched predict raises on this accelerator (e.g. a
+        # fixed-batch=1 CoreML package): we then submit frames one-at-a-time on
+        # the SAME accelerator rather than forcing CPU.
+        self._batch_unsupported = False
+        self.batch_stats = BatchStats()
 
     def _acquire_model(self, device: str):
         """Return a model for ``device``, sharing one cached instance when enabled."""
@@ -100,6 +143,68 @@ class DogDetector:
         results = self._predict(frame_bgr_original)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
+        self.last_inference = self._inference_info(original_w, original_h, latency_ms)
+        result = results[0] if len(results) else None
+        return self._result_to_detections(
+            result, original_w, original_h, frame_idx, mono_ts, wall_ts
+        )
+
+    def detect_batch(
+        self,
+        frames: Sequence[np.ndarray],
+        metas: Sequence[FrameMeta] | None = None,
+    ) -> list[list[Detection]]:
+        """Run one batched forward over ``frames``; return per-frame detections.
+
+        Detections are per-image-independent (same weights, per-image NMS), so the
+        result for ``frames[i]`` is identical to calling :meth:`detect` on it. The
+        fallback ladder is: batched on the accelerator → per-frame on the SAME
+        accelerator (handles a fixed-batch=1 CoreML package) → CPU only if a single
+        frame also fails (delegated to :meth:`_predict`). We never force CPU just
+        because batching is unsupported.
+        """
+
+        frames = list(frames)
+        if not frames:
+            return []
+        if metas is None:
+            metas = [FrameMeta(frame_idx=i) for i in range(len(frames))]
+        if len(metas) != len(frames):
+            raise ValueError("metas length must match frames length")
+        for frame in frames:
+            if frame.ndim < 2:
+                raise ValueError("each frame must be an image array")
+
+        resolved: list[tuple[int, float, datetime]] = []
+        for meta in metas:
+            mono = time.monotonic() if meta.mono_ts is None else meta.mono_ts
+            wall = datetime.now(timezone.utc) if meta.wall_ts is None else meta.wall_ts
+            resolved.append((meta.frame_idx, mono, wall))
+
+        started = time.perf_counter()
+        results, batched = self._predict_batch(frames)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+
+        self._record_batch_stats(len(frames), latency_ms, batched)
+
+        # Telemetry reflects the last frame's geometry (uniform within a camera);
+        # latency is the whole-batch time.
+        last_h, last_w = frames[-1].shape[:2]
+        self.last_inference = self._inference_info(last_w, last_h, latency_ms)
+
+        outputs: list[list[Detection]] = []
+        for frame, result, (frame_idx, mono, wall) in zip(frames, results, resolved):
+            original_h, original_w = frame.shape[:2]
+            outputs.append(
+                self._result_to_detections(
+                    result, original_w, original_h, frame_idx, mono, wall
+                )
+            )
+        return outputs
+
+    def _inference_info(
+        self, original_w: int, original_h: int, latency_ms: float
+    ) -> InferenceInfo:
         # Ultralytics letterboxes the frame to ``imgsz`` (``self.long_edge``)
         # internally and returns boxes already in original-image coordinates, so
         # no manual rescale is needed. ``inference_wh`` is the effective network
@@ -107,7 +212,7 @@ class DogDetector:
         scale = self.long_edge / max(original_w, original_h)
         inference_w = max(1, round(original_w * scale))
         inference_h = max(1, round(original_h * scale))
-        self.last_inference = InferenceInfo(
+        return InferenceInfo(
             original_wh=(original_w, original_h),
             inference_wh=(inference_w, inference_h),
             original_to_inference_scale=(
@@ -122,8 +227,19 @@ class DogDetector:
             device=self.device,
         )
 
+    def _result_to_detections(
+        self,
+        result: object | None,
+        original_w: int,
+        original_h: int,
+        frame_idx: int,
+        mono_ts: float,
+        wall_ts: datetime,
+    ) -> list[Detection]:
         detections: list[Detection] = []
-        for xyxy, confidence, class_name in self._iter_boxes(results):
+        if result is None:
+            return detections
+        for xyxy, confidence, class_name in self._iter_boxes([result]):
             if class_name.lower() != DOG_CLASS_NAME:
                 continue
             if confidence < self.conf_threshold:
@@ -140,6 +256,19 @@ class DogDetector:
                 )
             )
         return sorted(detections, key=lambda item: item.confidence, reverse=True)
+
+    def _record_batch_stats(
+        self, n_frames: int, latency_ms: float, batched: bool
+    ) -> None:
+        stats = self.batch_stats
+        stats.calls += 1
+        stats.frames += n_frames
+        stats.total_latency_ms += latency_ms
+        if batched:
+            stats.batched_calls += 1
+            stats.max_effective_batch = max(stats.max_effective_batch, n_frames)
+        else:
+            stats.per_frame_fallback_calls += 1
 
     def _predict(self, inference_frame: np.ndarray):
         try:
@@ -168,6 +297,40 @@ class DogDetector:
                 device=self.device,
                 verbose=False,
             )
+
+    def _predict_batch(self, frames: Sequence[np.ndarray]) -> tuple[list, bool]:
+        """Return (results, batched). ``batched`` is False when we submitted the
+        frames one-at-a-time (fixed-batch accelerator) so telemetry stays honest.
+
+        A single-element batch is still issued as one ``predict`` call (cheap, and
+        lets a one-frame tail reuse the batched path)."""
+
+        if not self._batch_unsupported:
+            try:
+                results = self.model.predict(
+                    list(frames),
+                    imgsz=self.long_edge,
+                    conf=self.conf_threshold,
+                    device=self.device,
+                    verbose=False,
+                )
+                return list(results), True
+            except Exception:
+                logger.warning(
+                    "Batched YOLO inference failed on device %s; falling back to "
+                    "per-frame on the same accelerator.",
+                    self.device,
+                )
+                self._batch_unsupported = True
+        return self._predict_per_frame(frames), False
+
+    def _predict_per_frame(self, frames: Sequence[np.ndarray]) -> list:
+        results: list = []
+        for frame in frames:
+            # ``_predict`` itself handles the accelerator -> CPU fallback if a
+            # single frame fails, so CPU is only reached when per-frame also fails.
+            results.extend(self._predict(frame))
+        return results
 
     def _iter_boxes(self, results: Iterable[object]):
         for result in results:

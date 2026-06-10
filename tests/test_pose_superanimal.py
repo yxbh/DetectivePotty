@@ -218,11 +218,15 @@ def test_lazy_build_happens_once() -> None:
     est = SuperAnimalPoseEstimator(_config())
     builds = {"n": 0}
 
-    def fake_build() -> FakeInfer:
+    def fake_build():
         builds["n"] += 1
-        return infer
 
-    est._build_dlc_infer_fn = fake_build  # type: ignore[method-assign]
+        def infer_batch(crops):
+            return [infer(rgb, box) for rgb, box in crops]
+
+        return infer_batch
+
+    est._build_dlc_infer_batch_fn = fake_build  # type: ignore[method-assign]
     est.estimate(FRAME, BBox(200, 150, 300, 250))
     est.estimate(FRAME, BBox(200, 150, 300, 250))
     assert builds["n"] == 1
@@ -237,7 +241,7 @@ def test_build_failure_disables_backend_without_retry(caplog) -> None:
         builds["n"] += 1
         raise ImportError("no deeplabcut")
 
-    est._build_dlc_infer_fn = failing_build  # type: ignore[method-assign]
+    est._build_dlc_infer_batch_fn = failing_build  # type: ignore[method-assign]
     with caplog.at_level(logging.ERROR):
         assert est.estimate(FRAME, BBox(200, 150, 300, 250)) is None
     assert est.estimate(FRAME, BBox(200, 150, 300, 250)) is None
@@ -361,7 +365,9 @@ def test_telemetry_records_cold_start_on_lazy_build() -> None:
     rows = np.zeros((N_KPTS, 3), dtype=float)
     rows[:, 2] = 0.9
     est = SuperAnimalPoseEstimator(_config())
-    est._build_dlc_infer_fn = lambda: FakeInfer(array=rows)  # type: ignore[method-assign]
+    est._build_dlc_infer_batch_fn = lambda: (  # type: ignore[method-assign]
+        lambda crops: [rows for _ in crops]
+    )
     est.estimate(FRAME, BBox(200, 150, 300, 250))
 
     snap = est.telemetry_snapshot()
@@ -376,7 +382,7 @@ def test_telemetry_records_cold_start_failure_on_build_error() -> None:
     def boom() -> object:
         raise ImportError("no deeplabcut")
 
-    est._build_dlc_infer_fn = boom  # type: ignore[method-assign]
+    est._build_dlc_infer_batch_fn = boom  # type: ignore[method-assign]
     est.estimate(FRAME, BBox(200, 150, 300, 250))
     est.estimate(FRAME, BBox(200, 150, 300, 250))
 

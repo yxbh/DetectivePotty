@@ -288,6 +288,21 @@ def test_tune_models_endpoint_lists_default(tmp_path: Path) -> None:
     assert body["models"] == ["models/yolo11m.pt"]
 
 
+def test_tune_models_endpoint_reports_coreml_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    client.app.state.tune_models.append("models/yolo11m.mlpackage")
+    # Avoid touching coremltools / a real package in the offline suite.
+    monkeypatch.setattr(
+        "detectivepotty.detect.coreml_export.coreml_max_batch", lambda _p: 16
+    )
+    body = client.get("/api/tune/models").json()
+    # Only `.mlpackage` entries get a batch; `.pt` weights are omitted.
+    assert body["coreml_batch"] == {"models/yolo11m.mlpackage": 16}
+
+
 def test_tune_export_coreml_adds_model_and_refreshes_allowlist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -296,15 +311,20 @@ def test_tune_export_coreml_adds_model_and_refreshes_allowlist(
 
     calls: dict = {}
 
-    def fake_export(weights, out_path=None, imgsz=640, half=True):
+    def fake_export(weights, out_path=None, imgsz=640, half=True, batch=1):
         calls["weights"] = str(weights)
         calls["imgsz"] = imgsz
+        calls["batch"] = batch
         return "models/yolo11m.mlpackage"
 
     # The endpoint resolves export_coreml off the module at call time, so patching
     # the module attribute keeps the test fully offline (no real CoreML export).
     monkeypatch.setattr(
         "detectivepotty.detect.coreml_export.export_coreml", fake_export
+    )
+    # Reading the batch label off the (fake) result must not touch coremltools.
+    monkeypatch.setattr(
+        "detectivepotty.detect.coreml_export.coreml_max_batch", lambda _p: 16
     )
 
     resp = client.post("/api/tune/export-coreml", json={"model": "models/yolo11m.pt"})
@@ -314,6 +334,13 @@ def test_tune_export_coreml_adds_model_and_refreshes_allowlist(
     assert "models/yolo11m.mlpackage" in body["models"]
     assert calls["weights"] == "models/yolo11m.pt"
     assert calls["imgsz"] == client.app.state.config.global_settings.inference_long_edge_px
+    # The export is batched to the tuner's batch size so detection can run a whole
+    # frame window in one GPU forward.
+    assert calls["batch"] == (
+        client.app.state.config.global_settings.tune_detection_batch_size
+    )
+    # The response advertises the new package's baked batch for the picker label.
+    assert body["coreml_batch"]["models/yolo11m.mlpackage"] == 16
     # Allow-list now includes the new model so it is selectable.
     listed = client.get("/api/tune/models").json()["models"]
     assert "models/yolo11m.mlpackage" in listed
@@ -418,6 +445,158 @@ def test_tune_detect_includes_pose_when_requested(tmp_path: Path) -> None:
     assert {kp["name"] for kp in body["pose"][0]["keypoints"]}
 
 
+class FrameKeyedBatchDetector:
+    """Per-frame-varying detector exposing ``detect`` and ``detect_batch``.
+
+    The box position depends on ``frame_idx`` so a range result can be checked
+    frame-for-frame against the single-frame endpoint. ``batch_calls`` records the
+    size of every ``detect_batch`` call so a test can prove a real batch formed.
+    """
+
+    device = "cpu"
+    last_inference = None
+
+    def __init__(self) -> None:
+        self.batch_calls: list[int] = []
+
+    @staticmethod
+    def _dets(frame_idx: int, wall_ts) -> list[Detection]:  # noqa: ANN001
+        return [
+            Detection(
+                bbox=BBox(10.0 + frame_idx, 10.0, 80.0 + frame_idx, 90.0),
+                confidence=0.7,
+                class_name="dog",
+                frame_idx=frame_idx,
+                mono_ts=0.0,
+                wall_ts=wall_ts or datetime.now(timezone.utc),
+            )
+        ]
+
+    def detect(self, frame, frame_idx=0, mono_ts=None, wall_ts=None):  # noqa: ANN001
+        del frame, mono_ts
+        return self._dets(frame_idx, wall_ts)
+
+    def detect_batch(self, frames, metas):  # noqa: ANN001
+        del frames
+        self.batch_calls.append(len(metas))
+        return [self._dets(m.frame_idx, m.wall_ts) for m in metas]
+
+
+def test_tune_detect_range_matches_single_frame_calls(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4", frames=8)
+    detector = FrameKeyedBatchDetector()
+    client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
+
+    ranged = client.get(
+        "/api/tune/detect_range",
+        params={"path": str(clip), "start": 1, "count": 4},
+    ).json()
+    assert [f["index"] for f in ranged["frames"]] == [1, 2, 3, 4]
+
+    # One batched forward of 4 frames, not four single-frame calls.
+    assert detector.batch_calls == [4]
+
+    # Each frame's boxes match the dedicated single-frame endpoint exactly.
+    for entry in ranged["frames"]:
+        single = client.get(
+            "/api/tune/detect",
+            params={"path": str(clip), "index": entry["index"], "pose": 0},
+        ).json()
+        assert entry["detections"] == single["detections"]
+        assert entry["total_frames"] == single["total_frames"]
+        assert entry["width"] == single["width"]
+        assert entry["height"] == single["height"]
+
+
+def test_tune_detect_range_caps_count_to_batch_size(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4", frames=40)
+    config = make_config(tmp_path, clip)
+    config.global_settings.tune_detection_batch_size = 5
+    detector = FrameKeyedBatchDetector()
+    client = TestClient(create_app(config, tune_detector=detector))
+
+    ranged = client.get(
+        "/api/tune/detect_range",
+        params={"path": str(clip), "start": 0, "count": 50},
+    ).json()
+    # The request asked for 50 but the configured cap is 5.
+    assert len(ranged["frames"]) == 5
+    assert detector.batch_calls == [5]
+
+
+def test_tune_detect_range_clamps_at_eof(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4", frames=6)
+    detector = FrameKeyedBatchDetector()
+    client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
+
+    ranged = client.get(
+        "/api/tune/detect_range",
+        params={"path": str(clip), "start": 4, "count": 8},
+    ).json()
+    # Only frames 4 and 5 exist; the run stops at EOF rather than erroring.
+    assert [f["index"] for f in ranged["frames"]] == [4, 5]
+
+
+def test_tune_detect_range_falls_back_without_detect_batch(tmp_path: Path) -> None:
+    # The plain FakeDetector has no detect_batch; the endpoint must still work by
+    # looping detect, returning one entry per frame.
+    clip = write_clip(tmp_path / "c.mp4", frames=8)
+    client = make_client(tmp_path, clip)
+    ranged = client.get(
+        "/api/tune/detect_range",
+        params={"path": str(clip), "start": 0, "count": 3},
+    ).json()
+    assert [f["index"] for f in ranged["frames"]] == [0, 1, 2]
+    for entry in ranged["frames"]:
+        assert entry["detections"][0]["class_name"] == "dog"
+
+
+def test_tune_detect_range_rejects_unknown_model(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.get(
+        "/api/tune/detect_range",
+        params={"path": str(clip), "start": 0, "count": 2, "model": "models/bogus.pt"},
+    )
+    assert resp.status_code == 400
+
+
+class _BatchRecordingEstimator(MockPoseEstimator):
+    """MockPoseEstimator that records ``estimate_batch`` sizes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_sizes: list[int] = []
+
+    def estimate_batch(self, requests):  # noqa: ANN001
+        self.batch_sizes.append(len(requests))
+        return super().estimate_batch(requests)
+
+
+def test_tune_pose_batches_boxes_through_estimate_batch(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    estimator = _BatchRecordingEstimator()
+    client = TestClient(
+        create_app(
+            make_config(tmp_path, clip),
+            tune_detector=FakeDetector(),
+            tune_pose_estimator=estimator,
+        )
+    )
+    body = client.post(
+        "/api/tune/pose",
+        json={
+            "path": str(clip),
+            "index": 0,
+            "boxes": [[10, 10, 80, 90], [20, 20, 100, 110], [5, 5, 50, 60]],
+        },
+    ).json()
+    assert body["pose_available"] is True
+    assert len(body["pose"]) == 3
+    # All three boxes went through a single estimate_batch call.
+    assert estimator.batch_sizes == [3]
+
+
 def test_tune_detect_rejects_unknown_model(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
@@ -426,6 +605,148 @@ def test_tune_detect_rejects_unknown_model(tmp_path: Path) -> None:
         params={"path": str(clip), "index": 0, "model": "models/bogus.pt"},
     )
     assert resp.status_code == 400
+
+
+# --- batched pose pass (POST /api/tune/pose_range) ------------------------
+
+
+def test_tune_pose_range_matches_per_frame_pose(tmp_path: Path) -> None:
+    """Batched multi-frame pose == repeated single-frame /api/tune/pose."""
+    clip = write_clip(tmp_path / "c.mp4")
+    boxes = [[10.0, 10.0, 80.0, 90.0]]
+    indices = [0, 1, 2]
+
+    per_frame = make_client(tmp_path, clip)
+    expected = {}
+    for idx in indices:
+        body = per_frame.post(
+            "/api/tune/pose", json={"path": str(clip), "index": idx, "boxes": boxes}
+        ).json()
+        expected[idx] = body["pose"]
+
+    batched = make_client(tmp_path, clip)
+    body = batched.post(
+        "/api/tune/pose_range",
+        json={"path": str(clip), "frames": [{"index": i, "boxes": boxes} for i in indices]},
+    ).json()
+    got = {f["index"]: f["pose"] for f in body["frames"]}
+    assert [f["index"] for f in body["frames"]] == indices  # request order preserved
+    assert got == expected
+
+
+def test_tune_pose_range_single_estimate_batch_across_frames(tmp_path: Path) -> None:
+    """All boxes from all frames go through ONE estimate_batch forward."""
+    clip = write_clip(tmp_path / "c.mp4")
+    estimator = _BatchRecordingEstimator()
+    client = TestClient(
+        create_app(
+            make_config(tmp_path, clip),
+            tune_detector=FakeDetector(),
+            tune_pose_estimator=estimator,
+        )
+    )
+    box = [[10.0, 10.0, 80.0, 90.0]]
+    body = client.post(
+        "/api/tune/pose_range",
+        json={"path": str(clip), "frames": [{"index": i, "boxes": box} for i in (0, 1, 2)]},
+    ).json()
+    assert len(body["frames"]) == 3
+    # 3 frames x 1 box = a single batched forward of 3 (not 3 batch-1 forwards).
+    assert estimator.batch_sizes == [3]
+
+
+def test_tune_pose_range_skips_degenerate_boxes_without_misalign(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    body = client.post(
+        "/api/tune/pose_range",
+        json={
+            "path": str(clip),
+            "frames": [
+                {"index": 0, "boxes": [[10, 10, 80, 90], [5, 5, 5, 60]]},  # 2nd zero-width
+                {"index": 1, "boxes": [[20, 20, 100, 110]]},
+            ],
+        },
+    ).json()
+    by_idx = {f["index"]: f["pose"] for f in body["frames"]}
+    assert len(by_idx[0]) == 1  # degenerate box dropped, valid one kept
+    assert len(by_idx[1]) == 1
+
+
+def test_tune_pose_range_caps_frames_by_batch_size(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4", frames=8)
+    config = make_config(tmp_path, clip)
+    config.global_settings.tune_detection_batch_size = 2
+    estimator = _BatchRecordingEstimator()
+    client = TestClient(
+        create_app(config, tune_detector=FakeDetector(), tune_pose_estimator=estimator)
+    )
+    box = [[10.0, 10.0, 80.0, 90.0]]
+    body = client.post(
+        "/api/tune/pose_range",
+        json={"path": str(clip), "frames": [{"index": i, "boxes": box} for i in range(4)]},
+    ).json()
+    assert [f["index"] for f in body["frames"]] == [0, 1]  # capped to 2 frames
+    assert estimator.batch_sizes == [2]
+
+
+def test_tune_pose_range_caps_total_crops(tmp_path: Path) -> None:
+    from detectivepotty.web.app import TUNE_POSE_MAX_CROPS
+
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    full_boxes = [[10.0, 10.0, 80.0, 90.0]] * TUNE_POSE_MAX_CROPS  # one frame hits cap
+    body = client.post(
+        "/api/tune/pose_range",
+        json={
+            "path": str(clip),
+            "frames": [{"index": 0, "boxes": full_boxes}, {"index": 1, "boxes": full_boxes}],
+        },
+    ).json()
+    assert [f["index"] for f in body["frames"]] == [0]  # 2nd frame dropped by crop cap
+
+
+def test_tune_pose_range_unavailable_without_estimator(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip, with_pose=False)
+    client.app.state.tune_pose_resolved = (None, False)
+    body = client.post(
+        "/api/tune/pose_range",
+        json={
+            "path": str(clip),
+            "frames": [{"index": 0, "boxes": [[10, 10, 80, 90]]}, {"index": 1, "boxes": []}],
+        },
+    ).json()
+    assert [f["index"] for f in body["frames"]] == [0, 1]
+    assert all(f["pose_available"] is False and f["pose"] == [] for f in body["frames"])
+
+
+def test_tune_pose_range_rejects_invalid_path(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.post(
+        "/api/tune/pose_range",
+        json={"path": "/etc/passwd", "frames": [{"index": 0, "boxes": [[0, 0, 1, 1]]}]},
+    )
+    assert resp.status_code == 400
+
+
+def test_pose_payload_for_frames_handles_none_frame_terminal() -> None:
+    """A None (un-decodable) frame still returns its index with empty entries."""
+    estimator = _BatchRecordingEstimator()
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    results = tune_mod.pose_payload_for_frames(
+        estimator,
+        [
+            (5, None, [[10.0, 10.0, 80.0, 90.0]]),  # decode failed
+            (6, frame, [[10.0, 10.0, 80.0, 90.0]]),
+        ],
+    )
+    assert [idx for idx, _ in results] == [5, 6]  # every requested index present, in order
+    assert results[0][1] == []  # None frame -> no entries (terminal, not retried)
+    assert len(results[1][1]) == 1
+    # The None frame contributed no crops: a single batched forward of just 1.
+    assert estimator.batch_sizes == [1]
 
 
 def test_tune_frame_rejects_unknown_model(tmp_path: Path) -> None:

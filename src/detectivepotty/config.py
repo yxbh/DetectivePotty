@@ -40,6 +40,23 @@ class GlobalSettings(BaseModel):
     dogs: list[str] = Field(default_factory=list)
     dedupe_reruns: bool = True
     rerun_match_tolerance_s: float = Field(default=5.0, ge=0)
+    # Batched detection raises GPU utilization on recorded files: the file backfill
+    # reads a short segment ahead, runs one batched forward over its sampled frames,
+    # then replays the segment in order (events are unchanged — YOLO detections are
+    # per-image-independent). Default is a real batch; set to 1 for exact, frame-by-
+    # frame reproduction. ``max_lookahead_frames`` caps how many decoded frames a
+    # single segment may hold (memory safety).
+    file_detection_batch_size: int = Field(default=8, ge=1)
+    max_lookahead_frames: int = Field(default=256, ge=1)
+    # Live detection batches sampled frames before inferring. Default 1 keeps live
+    # latency-optimal (no waiting to fill a batch); raise it to trade a little
+    # latency for higher GPU utilization. ``max_batch_wait_s`` bounds how long a
+    # partial live batch waits before being flushed.
+    live_detection_batch_size: int = Field(default=1, ge=1)
+    max_batch_wait_s: float = Field(default=0.5, gt=0.0)
+    # The tune UI is file-based with no event-output constraint, so it can batch
+    # aggressively to keep the scrub buffer warm.
+    tune_detection_batch_size: int = Field(default=16, ge=1)
 
     @field_validator("dogs")
     @classmethod
@@ -82,6 +99,16 @@ class PoseConfig(BaseModel):
     # tracking/posture/recorder boxes are untouched.
     box_union_window_s: float = Field(default=0.0, ge=0.0)
     enable_pose_classifier: bool = False
+    # How many pose crops to submit to the model in one batched forward. The pose
+    # classifier runs over an event's frame window at finalization time; batching
+    # the crops raises GPU utilization. The pipeline's shared inference lock is held
+    # per chunk (not per frame), so a larger batch trades a little detection-
+    # interleave latency for throughput. Only active when pose is enabled. Default
+    # 16 from a measured MPS sweep of the SuperAnimal HRNet backend: batch-1 ~22
+    # img/s, batch-8 ~9x, batch-16 ~12x (still climbing at 32). 16 captures most of
+    # the win at a modest crop-memory cost. Also sets the tune UI pose runner's
+    # GPU chunk size (build_tune_pose_estimator reads this config).
+    classifier_batch_size: int = Field(default=16, ge=1)
     # Experimental: additive pose augmentation of the detection gate. Validated only
     # with the mock backend so far (wiring + gate-OFF byte-identical baseline); keep
     # off until validated end-to-end against the real superanimal backend.

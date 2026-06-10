@@ -19,7 +19,7 @@ from detectivepotty.classify.base import ClassifierResult, PottyClassifier
 from detectivepotty.classify.heuristic import HeuristicPottyClassifier
 from detectivepotty.classify.pose import PosePottyClassifier
 from detectivepotty.config import CameraConfig, Config
-from detectivepotty.detect.yolo import DogDetector
+from detectivepotty.detect.yolo import DogDetector, FrameMeta
 from detectivepotty.events import Detection, Track
 from detectivepotty.pose.base import PoseEstimator
 from detectivepotty.pose.factory import build_pose_estimator
@@ -73,6 +73,41 @@ def _redact_url(message: str, url: str) -> str:
     """Keep a resolved RTSP URL (which embeds credentials) out of log text."""
 
     return message.replace(url, "<rtsp-url>") if url else message
+
+
+def _detect_frames_batched(
+    detector: Detector,
+    frames: Sequence[Frame],
+    *,
+    lock: Any,
+) -> list[list[Detection]]:
+    """Detect over ``frames`` in one batched forward, holding ``lock`` once.
+
+    Falls back to a per-frame loop when the detector predates ``detect_batch``
+    (e.g. a test fake), keeping the result identical — detections are per-image-
+    independent, so the batched and per-frame results match frame-for-frame.
+    Returns one detection list per input frame, in order.
+    """
+
+    if not frames:
+        return []
+    batch = getattr(detector, "detect_batch", None)
+    with lock:
+        if batch is not None:
+            metas = [
+                FrameMeta(frame_idx=f.frame_idx, mono_ts=f.mono_ts, wall_ts=f.wall_ts)
+                for f in frames
+            ]
+            return batch([f.bgr for f in frames], metas)
+        return [
+            detector.detect(
+                f.bgr,
+                frame_idx=f.frame_idx,
+                mono_ts=f.mono_ts,
+                wall_ts=f.wall_ts,
+            )
+            for f in frames
+        ]
 
 
 @dataclass(slots=True)
@@ -306,39 +341,67 @@ class PottyPipeline:
             sample_every = _sample_every(source_fps, camera_config.sample_rate_fps)
             history = _FrameHistory(buffer_window_s, max_frames=_history_max_frames(source_fps, buffer_window_s))
             base_mono: float | None = None
+            batch_size = max(1, self.config.global_settings.file_detection_batch_size)
+            max_lookahead = max(1, self.config.global_settings.max_lookahead_frames)
 
             while True:
-                raw_frame = source.read()
-                if raw_frame is None:
+                # Read a bounded segment ahead WITHOUT touching buffer/history/state
+                # so its sampled frames can be detected in one batched forward. The
+                # segment ends once it holds ``batch_size`` sampled frames, hits the
+                # lookahead cap, or reaches EOF.
+                segment: list[Frame] = []
+                sampled_in_segment = 0
+                while sampled_in_segment < batch_size and len(segment) < max_lookahead:
+                    raw_frame = source.read()
+                    if raw_frame is None:
+                        break
+                    if base_mono is None:
+                        base_mono = raw_frame.mono_ts
+                    frame = _retimestamp_file_frame(raw_frame, base_mono, source_fps)
+                    segment.append(frame)
+                    if frame.frame_idx % sample_every == 0:
+                        sampled_in_segment += 1
+
+                if not segment:
                     break
-                if base_mono is None:
-                    base_mono = raw_frame.mono_ts
-                frame = _retimestamp_file_frame(raw_frame, base_mono, source_fps)
-                buffer.append(frame)
-                history.append(frame)
 
-                if frame.frame_idx % sample_every == 0:
-                    with self._inference_lock:
-                        detections = detector.detect(
-                            frame.bgr,
-                            frame_idx=frame.frame_idx,
-                            mono_ts=frame.mono_ts,
-                            wall_ts=frame.wall_ts,
+                sampled = [f for f in segment if f.frame_idx % sample_every == 0]
+                detections_by_idx: dict[int, list[Detection]] = {}
+                if sampled:
+                    batch_results = _detect_frames_batched(
+                        detector, sampled, lock=self._inference_lock
+                    )
+                    detections_by_idx = {
+                        f.frame_idx: dets for f, dets in zip(sampled, batch_results)
+                    }
+
+                # Replay the segment in frame order: this reproduces the original
+                # per-frame loop exactly (buffer/history/state/recording advance in
+                # order, up to the processed point), only the detections were
+                # precomputed in a batch.
+                for frame in segment:
+                    buffer.append(frame)
+                    history.append(frame)
+
+                    if frame.frame_idx % sample_every == 0:
+                        emitted = state_machine.process(
+                            frame, detections_by_idx[frame.frame_idx]
                         )
-                    emitted = state_machine.process(frame, detections)
-                    pending.extend(_PendingCandidate(candidate) for candidate in emitted)
+                        pending.extend(
+                            _PendingCandidate(candidate) for candidate in emitted
+                        )
 
-                event_dirs.extend(
-                    self._record_ready_pending(
-                        pending,
-                        current_wall_ts=frame.wall_ts,
-                        buffer=buffer,
-                        history=history,
-                        camera_config=camera_config,
-                        classifier=classifier,
-                        recorder=recorder,
-                    ),
-                )
+                    event_dirs.extend(
+                        self._record_ready_pending(
+                            pending,
+                            current_wall_ts=frame.wall_ts,
+                            buffer=buffer,
+                            history=history,
+                            camera_config=camera_config,
+                            classifier=classifier,
+                            recorder=recorder,
+                        ),
+                    )
 
             pending.extend(_PendingCandidate(candidate) for candidate in state_machine.flush())
             event_dirs.extend(
@@ -478,6 +541,28 @@ class PottyPipeline:
         last_detection_mono = -math.inf
         processed = 0
         sample_interval_s = 1.0 / camera_config.sample_rate_fps
+        live_batch_size = max(1, self.config.global_settings.live_detection_batch_size)
+        max_batch_wait_s = self.config.global_settings.max_batch_wait_s
+
+        # Sampled frames accumulate here until the batch is full or has waited
+        # ``max_batch_wait_s``; then they are detected in one forward and replayed
+        # through the state machine in order. ``live_batch_size == 1`` (default)
+        # flushes immediately, i.e. exactly the original per-frame behavior.
+        batch: list[Frame] = []
+        batch_started_mono: float | None = None
+
+        def flush_live_batch() -> None:
+            nonlocal batch_started_mono
+            if not batch:
+                return
+            results = _detect_frames_batched(
+                detector, batch, lock=self._inference_lock
+            )
+            for batched_frame, detections in zip(batch, results):
+                emitted = state_machine.process(batched_frame, detections)
+                pending.extend(_PendingCandidate(candidate) for candidate in emitted)
+            batch.clear()
+            batch_started_mono = None
 
         while not self._stop_event.is_set() and (
             self.max_live_frames is None or processed < self.max_live_frames
@@ -497,15 +582,14 @@ class PottyPipeline:
 
             if frame.mono_ts - last_detection_mono >= sample_interval_s:
                 last_detection_mono = frame.mono_ts
-                with self._inference_lock:
-                    detections = detector.detect(
-                        frame.bgr,
-                        frame_idx=frame.frame_idx,
-                        mono_ts=frame.mono_ts,
-                        wall_ts=frame.wall_ts,
-                    )
-                emitted = state_machine.process(frame, detections)
-                pending.extend(_PendingCandidate(candidate) for candidate in emitted)
+                batch.append(frame)
+                if batch_started_mono is None:
+                    batch_started_mono = frame.mono_ts
+                if (
+                    len(batch) >= live_batch_size
+                    or frame.mono_ts - batch_started_mono >= max_batch_wait_s
+                ):
+                    flush_live_batch()
 
             event_dirs.extend(
                 self._record_ready_pending(
@@ -519,6 +603,9 @@ class PottyPipeline:
                 ),
             )
 
+        # Drain any partial batch accumulated before the loop exited so its frames
+        # still reach the state machine before the final flush.
+        flush_live_batch()
         pending.extend(_PendingCandidate(candidate) for candidate in state_machine.flush())
         event_dirs.extend(
             self._record_all_pending(

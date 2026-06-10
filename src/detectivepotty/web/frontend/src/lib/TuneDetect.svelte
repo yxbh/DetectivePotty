@@ -3,10 +3,11 @@
   import {
     exportCoreml,
     fetchTuneDetect,
+    fetchTuneDetectRange,
     fetchTuneFiles,
     fetchTuneMeta,
     fetchTuneModels,
-    fetchTunePose,
+    fetchTunePoseRange,
     tuneClipUrl,
   } from "./api";
   import type {
@@ -24,9 +25,21 @@
   // a fresh seek's frame can still jump the queue within one inference slot.
   // This budget is shared by the YOLO detect filler AND the pose filler.
   const MAX_INFLIGHT = 2;
+  // Backfill (non-urgent) YOLO is fetched a contiguous window at a time so the
+  // server runs one batched `detect_batch` forward instead of N batch-1 calls —
+  // the whole point of lifting GPU utilization off the batch-1 floor. Kept modest
+  // so a near-cursor "urgent" frame queued behind an in-flight batch waits at most
+  // RANGE_BATCH frames of inference; the server also caps this at its configured
+  // `tune_detection_batch_size`, returning fewer frames when smaller or at EOF.
+  const RANGE_BATCH = 8;
   // Pose trails YOLO: at most one pose pass in flight, and only when YOLO has no
   // urgent (near-cursor) work, so detection always wins the GPU lock.
   const MAX_POSE_INFLIGHT = 1;
+  // Pose is batched across a contiguous run of detected frames in one request so
+  // the SuperAnimal backend runs a single multi-frame forward (measured ~9-14x
+  // faster than the batch-1 per-frame floor). Kept modest so one pose batch can't
+  // hog the GPU lock for long; the server also caps frames + total crops.
+  const POSE_RANGE_BATCH = 8;
   // A YOLO-needed index this close to the playhead anchor is "urgent" and always
   // preempts pose (so stepping/scrubbing stays snappy while pose backfills).
   const URGENT_WINDOW = 30;
@@ -88,6 +101,7 @@
   let listingError = $state<string | null>(null);
 
   let models = $state<string[]>([]);
+  let coremlBatch = $state<Record<string, number>>({});
   let selectedModel = $state<string>("");
   // One-off CoreML export (the "Export to CoreML (GPU)" button) state.
   let exporting = $state(false);
@@ -147,8 +161,17 @@
   // (path, model) scope it was fetched under so a stale draw is impossible.
   const buffer = new Map<number, BufferEntry>();
   const inFlight = new Map<number, AbortController>();
-  // Decoupled pose passes in flight (POST /api/tune/pose), keyed by frame index.
+  // In-flight YOLO *requests* (a range request covers many indices but counts
+  // once). The filler budgets on this, not `inFlight.size`, so a batched backfill
+  // request occupies a single slot and an urgent near-cursor frame still gets one.
+  let detectRequests = 0;
+  // Decoupled pose passes in flight, keyed by frame index (for per-index dedup +
+  // abort). A single pose *request* now covers a run of frames.
   const poseInFlight = new Map<number, AbortController>();
+  // In-flight pose *requests* (a range request covers many indices but counts
+  // once). Pose gates on this, not `poseInFlight.size`, so one batched pose
+  // request occupies a single slot and never starves an urgent YOLO fetch.
+  let poseRequests = 0;
   // Bumped on every scope change (clip / model). In-flight fetches whose
   // token is stale are dropped; a new clip selection also bumps selectSeq.
   let scopeToken = 0;
@@ -207,7 +230,7 @@
 
   // Scope is (clip, model) only — NOT overlay mode. Box detections don't change
   // when the user toggles the pose overlay, so the buffer stays valid and pose
-  // is filled in proactively by the decoupled pose pass (see fetchPoseInto),
+  // is filled in proactively by the decoupled pose pass (see fetchPoseRangeInto),
   // never rebuffering on toggle.
   function currentScopeKey(): string {
     return `${selectedPath}|${selectedModel}`;
@@ -231,6 +254,7 @@
     try {
       const data = await fetchTuneModels();
       models = data.models;
+      coremlBatch = data.coreml_batch ?? {};
       selectedModel = data.default || data.models[0] || "";
     } catch {
       // Non-fatal: the picker just stays empty; detection still uses the default.
@@ -290,10 +314,12 @@
       controller.abort();
     }
     inFlight.clear();
+    detectRequests = 0;
     for (const controller of poseInFlight.values()) {
       controller.abort();
     }
     poseInFlight.clear();
+    poseRequests = 0;
     buffer.clear();
     bufferedCount = 0;
     detectedCount = 0;
@@ -591,12 +617,14 @@
     resetScope();
   }
 
-  // Dropdown label: ".../yolo11m.mlpackage" -> "yolo11m (CoreML)"; ".pt" -> basename.
+  // Dropdown label: ".../yolo11m.mlpackage" -> "yolo11m (CoreML ×16)" (batched)
+  // or "yolo11m (CoreML)" when single-frame; ".pt" -> basename.
   function modelOptionLabel(model: string): string {
     const base = model.split("/").pop() ?? model;
-    return base.endsWith(".mlpackage")
-      ? `${base.slice(0, -".mlpackage".length)} (CoreML)`
-      : base;
+    if (!base.endsWith(".mlpackage")) return base;
+    const stem = base.slice(0, -".mlpackage".length);
+    const batch = coremlBatch[model] ?? 1;
+    return batch > 1 ? `${stem} (CoreML ×${batch})` : `${stem} (CoreML)`;
   }
 
   function modelStem(model: string): string {
@@ -626,6 +654,7 @@
     try {
       const result = await exportCoreml(selectedModel);
       models = result.models;
+      coremlBatch = result.coreml_batch ?? coremlBatch;
       setModel(result.model);
     } catch (err) {
       exportError = err instanceof Error ? err.message : "CoreML export failed";
@@ -747,15 +776,18 @@
       void fetchInto(y);
       return true;
     }
-    if (poseAvailable && poseInFlight.size < MAX_POSE_INFLIGHT) {
+    if (poseAvailable && poseRequests < MAX_POSE_INFLIGHT) {
       const p = nextPoseNeeded();
       if (p !== null) {
-        void fetchPoseInto(p);
+        void fetchPoseRangeInto(p);
         return true;
       }
     }
     if (y !== null) {
-      void fetchInto(y);
+      // Non-urgent backfill: pull a contiguous window in one batched request so
+      // the server runs a single multi-frame forward (urgent frames above still
+      // go single for latency).
+      void fetchRangeInto(y);
       return true;
     }
     return false;
@@ -765,15 +797,31 @@
     if (!selectedPath || !meta) {
       return;
     }
-    while (inFlight.size + poseInFlight.size < MAX_INFLIGHT) {
+    while (detectRequests + poseRequests < MAX_INFLIGHT) {
       if (!scheduleOne()) {
         break;
       }
     }
   }
 
+  // The contiguous run of still-needed indices starting at `start` (which
+  // nextNeeded already proved missing + not in flight), capped at RANGE_BATCH and
+  // the clip end. Stops at the first index already buffered or in flight so a
+  // batch never re-decodes/re-fetches work another slot owns.
+  function rangeRunFrom(start: number): number[] {
+    const total = totalFrames;
+    const run: number[] = [];
+    for (let idx = start; idx < total && run.length < RANGE_BATCH; idx++) {
+      if (inFlight.has(idx) || hasEntry(idx)) {
+        break;
+      }
+      run.push(idx);
+    }
+    return run;
+  }
+
   // YOLO detect pass — boxes only (always pose=0). Pose is filled separately by
-  // fetchPoseInto so flipping the overlay never rebuffers boxes.
+  // fetchPoseRangeInto so flipping the overlay never rebuffers boxes.
   async function fetchInto(idx: number): Promise<void> {
     if (!selectedPath) return;
     const path = selectedPath;
@@ -782,6 +830,7 @@
     const token = scopeToken;
     const controller = new AbortController();
     inFlight.set(idx, controller);
+    detectRequests++;
     const started = performance.now();
     try {
       const res = await fetchTuneDetect(path, idx, model, false, controller.signal);
@@ -819,54 +868,171 @@
       // surfacing per-frame noise. The frame can be retried on the next pass.
     } finally {
       inFlight.delete(idx);
+      detectRequests = Math.max(0, detectRequests - 1);
       if (token === scopeToken) {
         pump();
       }
     }
   }
 
-  // Decoupled pose pass: run pose for a detected frame's already-buffered boxes
-  // (no YOLO re-run). Mutates the existing buffer entry in place and marks it
-  // posed (even when no keypoints come back) so it isn't retried forever.
-  async function fetchPoseInto(idx: number): Promise<void> {
+  // Batched backfill: detect a contiguous window in one request, buffering each
+  // returned frame exactly as fetchInto does. The server caps the count and may
+  // return fewer frames (smaller cap / EOF); any unreturned indices are simply
+  // re-picked on the next pump. Falls back to a single fetch for a 1-frame run.
+  async function fetchRangeInto(start: number): Promise<void> {
     if (!selectedPath) return;
-    const entry = buffer.get(idx);
-    const scopeKey = currentScopeKey();
-    if (!entry || entry.scopeKey !== scopeKey || entry.detections.length === 0) {
+    const run = rangeRunFrom(start);
+    if (run.length === 0) return;
+    if (run.length === 1) {
+      void fetchInto(start);
       return;
     }
     const path = selectedPath;
+    const model = selectedModel;
+    const scopeKey = currentScopeKey();
     const token = scopeToken;
-    const boxes = entry.detections.map((d) => [d.x1, d.y1, d.x2, d.y2]);
     const controller = new AbortController();
-    poseInFlight.set(idx, controller);
+    for (const idx of run) {
+      inFlight.set(idx, controller);
+    }
+    detectRequests++;
+    const started = performance.now();
     try {
-      const res = await fetchTunePose(path, idx, boxes, controller.signal);
+      const res = await fetchTuneDetectRange(
+        path,
+        run[0],
+        run.length,
+        model,
+        controller.signal,
+      );
       if (token !== scopeToken) {
         return; // scope changed while in flight -> drop
       }
-      if (!res.pose_available) {
-        poseAvailable = false;
-      }
-      const cur = buffer.get(idx);
-      if (cur && cur.scopeKey === scopeKey && !cur.posed) {
-        cur.pose = res.pose;
-        cur.posed = true;
-        posedCount++;
-        if (idx === presentedIndex) {
+      // Amortize the batch latency per frame so the play-ahead EMA still tracks
+      // per-frame inference cost (it leads the playhead by frames, not requests).
+      const elapsed = performance.now() - started;
+      const per = res.frames.length > 0 ? elapsed / res.frames.length : elapsed;
+      detectMsEma = detectMsEma * 0.7 + per * 0.3;
+      for (const frame of res.frames) {
+        if (threshold < frame.detection_floor) {
+          threshold = frame.detection_floor;
+        }
+        floor = frame.detection_floor;
+        if (!frame.pose_available) {
+          poseAvailable = false;
+        }
+        if (hasEntry(frame.index)) {
+          continue; // already buffered in this scope -> don't double-count
+        }
+        buffer.set(frame.index, {
+          scopeKey,
+          detections: frame.detections,
+          pose: [],
+          posed: false,
+        });
+        if (frame.detections.length > 0) {
+          detectedCount++;
+        }
+        if (frame.index === presentedIndex) {
           syncView();
         }
-        updateStrip();
       }
+      bufferedCount = buffer.size;
+      updateStrip();
     } catch {
-      // Aborted or a transient pose error: leave the frame un-posed; it'll be
-      // retried on the next pass (unless pose got disabled above).
+      // Aborted or transient: the run's indices get retried on the next pass.
     } finally {
-      poseInFlight.delete(idx);
+      for (const idx of run) {
+        if (inFlight.get(idx) === controller) {
+          inFlight.delete(idx);
+        }
+      }
+      detectRequests = Math.max(0, detectRequests - 1);
       if (token === scopeToken) {
         pump();
       }
     }
+  }
+
+  // Decoupled pose pass: run pose for a contiguous run of detected frames'
+  // already-buffered boxes (no YOLO re-run) in ONE batched request, so the server
+  // runs a single multi-frame forward. Mutates each buffer entry in place and
+  // marks it posed (even with no keypoints) so it isn't retried forever.
+  async function fetchPoseRangeInto(start: number): Promise<void> {
+    if (!selectedPath) return;
+    const run = poseRunFrom(start);
+    if (run.length === 0) return;
+    const path = selectedPath;
+    const scopeKey = currentScopeKey();
+    const token = scopeToken;
+    const frames = run.map((idx) => ({
+      index: idx,
+      boxes: (buffer.get(idx)?.detections ?? []).map((d) => [d.x1, d.y1, d.x2, d.y2]),
+    }));
+    const controller = new AbortController();
+    for (const idx of run) {
+      poseInFlight.set(idx, controller);
+    }
+    poseRequests++;
+    try {
+      const res = await fetchTunePoseRange(path, frames, controller.signal);
+      if (token !== scopeToken) {
+        return; // scope changed while in flight -> drop
+      }
+      for (const frame of res.frames) {
+        if (!frame.pose_available) {
+          poseAvailable = false;
+        }
+        const cur = buffer.get(frame.index);
+        if (cur && cur.scopeKey === scopeKey && !cur.posed) {
+          cur.pose = frame.pose;
+          cur.posed = true;
+          posedCount++;
+          if (frame.index === presentedIndex) {
+            syncView();
+          }
+        }
+      }
+      updateStrip();
+    } catch {
+      // Aborted or a transient pose error: leave the run un-posed; it'll be
+      // retried on the next pass (unless pose got disabled above).
+    } finally {
+      for (const idx of run) {
+        if (poseInFlight.get(idx) === controller) {
+          poseInFlight.delete(idx);
+        }
+      }
+      poseRequests = Math.max(0, poseRequests - 1);
+      if (token === scopeToken) {
+        pump();
+      }
+    }
+  }
+
+  // The contiguous run of pose-needed indices starting at `start` (which
+  // nextPoseNeeded already proved buffered + detected + un-posed + not in flight),
+  // capped at POSE_RANGE_BATCH. Stops at the first index that isn't pose-needed
+  // (no entry, wrong scope, no detections, already posed, or in flight) so a batch
+  // never re-poses work another slot owns.
+  function poseRunFrom(start: number): number[] {
+    const key = currentScopeKey();
+    const total = totalFrames;
+    const run: number[] = [];
+    for (let idx = start; idx < total && run.length < POSE_RANGE_BATCH; idx++) {
+      const entry = buffer.get(idx);
+      if (
+        poseInFlight.has(idx) ||
+        !entry ||
+        entry.scopeKey !== key ||
+        entry.detections.length === 0 ||
+        entry.posed
+      ) {
+        break;
+      }
+      run.push(idx);
+    }
+    return run;
   }
 
 
@@ -1412,7 +1578,7 @@
               disabled={exporting}
               title={existingCoreml
                 ? "Use the already-exported CoreML (GPU) model"
-                : "Export this model to a GPU-safe CoreML model (runs on the GPU, ~2x faster). Takes ~1 min."}
+                : "Export this model to a GPU-safe, batched CoreML model (runs on the GPU, ~3x faster on recorded clips). Takes ~1 min."}
             >
               {exporting
                 ? "Exporting… (~1 min)"

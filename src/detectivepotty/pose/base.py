@@ -11,8 +11,9 @@ pose dependencies.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -35,6 +36,22 @@ from detectivepotty.pose.keypoints import (
 from detectivepotty.pose.telemetry import PoseTelemetrySnapshot
 
 
+@dataclass(frozen=True, eq=False)
+class PoseRequest:
+    """One pose estimation request for batched inference.
+
+    ``eq=False`` because the frame is an ``np.ndarray`` (generated ``__eq__`` would
+    raise on the ambiguous truth value); identity equality is all callers need.
+    """
+
+    frame_bgr_original: np.ndarray
+    bbox: BBox
+    frame_idx: int = 0
+    mono_ts: float | None = None
+    wall_ts: datetime | None = None
+    source_id: str | None = None
+
+
 class PoseEstimator(ABC):
     """Estimate dog keypoints for one detection in original-resolution pixels."""
 
@@ -51,6 +68,28 @@ class PoseEstimator(ABC):
         """Return keypoints for the dog in ``bbox`` or ``None`` if none produced."""
 
         raise NotImplementedError
+
+    def estimate_batch(
+        self, requests: Sequence[PoseRequest]
+    ) -> list[PoseKeypoints | None]:
+        """Estimate poses for a batch of requests, aligned 1:1 with ``requests``.
+
+        Default impl loops :meth:`estimate` so the mock and any backend without a
+        real batched path work unchanged. Backends with GPU batching (e.g.
+        SuperAnimal/DeepLabCut) override this to submit crops in one forward.
+        """
+
+        return [
+            self.estimate(
+                request.frame_bgr_original,
+                request.bbox,
+                frame_idx=request.frame_idx,
+                mono_ts=request.mono_ts,
+                wall_ts=request.wall_ts,
+                source_id=request.source_id,
+            )
+            for request in requests
+        ]
 
     def telemetry_snapshot(self) -> PoseTelemetrySnapshot | None:
         """Return perf/health telemetry if the backend tracks it, else ``None``."""

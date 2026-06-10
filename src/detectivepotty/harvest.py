@@ -35,6 +35,8 @@ from detectivepotty.events import Detection, _jsonify
 from detectivepotty.geometry import BBox
 from detectivepotty.sources.base import sanitize_source_id
 from detectivepotty.sources.file import derive_base_wall_ts
+from detectivepotty.sources.prefetch import prefetch
+from detectivepotty.sources.pyav_capture import open_capture
 from detectivepotty.tracking import Tracker
 from detectivepotty.video_encode import open_h264_writer
 
@@ -256,9 +258,11 @@ def harvest_clips(
     max_len_s: float = DEFAULT_MAX_LEN_S,
     source_start_utc: datetime | None = None,
     source_id: str | None = None,
+    camera_name: str | None = None,
+    detect_conf: float | None = None,
     iou_threshold: float = 0.3,
     max_age_frames: int = 5,
-    capture_factory: Callable[[str], Any] = cv2.VideoCapture,
+    capture_factory: Callable[[str], Any] = open_capture,
     clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter] = (
         _default_clip_writer_factory
     ),
@@ -272,6 +276,9 @@ def harvest_clips(
     ``source_id`` overrides the provenance/span-id key (derived from
     ``input_path`` when omitted); pass a stable value for chunked sources so
     span ids stay deterministic regardless of the temp file path.
+    ``camera_name`` (friendly NVR name) and ``detect_conf`` (the detector's
+    confidence gate) are recorded verbatim in each span's ``metadata.json`` for
+    the labeling UI; both are optional provenance and never affect span math.
     """
 
     input_path = Path(input_path)
@@ -318,6 +325,8 @@ def harvest_clips(
         source_id=source_id,
         source_start_utc=source_start_utc,
         sample_every=sample_every,
+        camera_name=camera_name,
+        detect_conf=detect_conf,
         capture_factory=capture_factory,
         clip_writer_factory=clip_writer_factory,
     )
@@ -341,12 +350,19 @@ def _scan_for_dogs(
     tracker = Tracker(iou_threshold=iou_threshold, max_age_frames=max_age_frames)
     presence: dict[str, list[FrameSample]] = {}
 
-    decoded_idx = 0
-    try:
+    def _decode_frames():
         while True:
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
+            yield frame
+
+    decoded_idx = 0
+    try:
+        # Pipeline decode against detect+track: a background thread reads ahead
+        # while the (GIL-releasing) detector runs, turning a decode-bound scan into
+        # an inference-bound one. Tracking stays sequential on this thread.
+        for frame in prefetch(_decode_frames()):
             if decoded_idx % sample_every == 0:
                 detections = detector.detect(frame, frame_idx=decoded_idx)
                 tracks = tracker.update(list(detections))
@@ -379,6 +395,8 @@ def _write_spans(
     source_id: str,
     source_start_utc: datetime,
     sample_every: int,
+    camera_name: str | None = None,
+    detect_conf: float | None = None,
     capture_factory: Callable[[str], Any],
     clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter],
 ) -> list[HarvestResult]:
@@ -412,6 +430,8 @@ def _write_spans(
             width=width,
             height=height,
             sample_every=sample_every,
+            camera_name=camera_name,
+            detect_conf=detect_conf,
         )
         results.append(
             HarvestResult(
@@ -484,6 +504,8 @@ def _write_clip_metadata(
     width: int,
     height: int,
     sample_every: int,
+    camera_name: str | None = None,
+    detect_conf: float | None = None,
 ) -> Path:
     source_span_start_utc = source_start_utc + timedelta(seconds=span.start_s)
     source_span_end_utc = source_start_utc + timedelta(seconds=span.end_s)
@@ -506,6 +528,8 @@ def _write_clip_metadata(
         "span_id": span_id,
         "source_id": source_id,
         "source_path": source_id,
+        "camera_name": camera_name,
+        "detect_conf": detect_conf,
         "source_start_utc": source_start_utc.isoformat(),
         "source_span_start_utc": source_span_start_utc.isoformat(),
         "source_span_end_utc": source_span_end_utc.isoformat(),

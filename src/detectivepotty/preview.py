@@ -164,7 +164,12 @@ class FrameProvider(Protocol):
 
 
 class FileFrameProvider:
-    """Seekable file provider backed by ``cv2.VideoCapture`` (supports step/restart)."""
+    """Seekable file provider backed by ``cv2.VideoCapture`` (supports step/restart).
+
+    Stays on ``cv2`` rather than the PyAV decode backend used by the harvest/export
+    seams because it seeks/steps by frame index, which ``PyAvCapture`` does not
+    support (it is sequential-only).
+    """
 
     is_live = False
 

@@ -11,6 +11,7 @@ from typing import Any, Callable, Self
 import cv2
 
 from detectivepotty.sources.base import Frame, VideoSource
+from detectivepotty.sources.pyav_capture import open_capture
 
 # UniFi Protect exports embed the real recording time in the filename, e.g.
 # ``Backyard Grass 6-6-2026, 19.46.40 GMT+10 - 6-6-2026, 19.47.05 GMT+10.mp4``.
@@ -104,7 +105,7 @@ class FileSource(VideoSource):
         *,
         target_fps: float | None = None,
         base_wall_ts: datetime | None = None,
-        capture_factory: Callable[[str], Any] = cv2.VideoCapture,
+        capture_factory: Callable[[str], Any] = open_capture,
     ) -> None:
         if target_fps is not None and target_fps <= 0:
             raise ValueError("target_fps must be positive")

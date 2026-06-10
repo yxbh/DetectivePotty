@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
-from typing import Annotated
+from typing import Annotated, Optional
 
 import cv2
 import numpy as np
@@ -340,7 +340,9 @@ def detect_file(
         typer.Option("--model", help="YOLO model name/path."),
     ] = "models/yolo11m.pt",
 ) -> None:
-    cap = cv2.VideoCapture(str(input_path))
+    from detectivepotty.sources.pyav_capture import open_capture
+
+    cap = open_capture(str(input_path))
     if not cap.isOpened():
         raise typer.BadParameter(f"Could not open input video: {input_path}")
 
@@ -572,6 +574,16 @@ def export_coreml_command(
         bool,
         typer.Option("--half/--no-half", help="Export FP16 (default, GPU-fast) vs FP32."),
     ] = True,
+    batch: Annotated[
+        int,
+        typer.Option(
+            "--batch",
+            min=1,
+            help="Max batch the package accepts. 1 (default) = fixed single-image "
+            "package; >1 = dynamic flexible-shape package that batches 1..N in one "
+            "GPU forward (the fast ground-truth backend — match the caller's batch).",
+        ),
+    ] = 1,
 ) -> None:
     """Export YOLO11 ``.pt`` weights to a GPU-safe CoreML ``.mlpackage``.
 
@@ -580,7 +592,7 @@ def export_coreml_command(
     path) instead of crashing the MPSGraph compiler — numerically identical to the
     original weights. macOS-only. The result is auto-discovered by the ``/tune``
     model picker; pass ``--out models/coreml`` to produce the curated, committable
-    set.
+    set. Use ``--batch 32`` for a batched package (fastest dense-detection backend).
     """
 
     from detectivepotty.detect.coreml_export import export_coreml
@@ -589,8 +601,10 @@ def export_coreml_command(
         if not pt.is_file():
             raise typer.BadParameter(f"Weights not found: {pt}")
         out_path = (out_dir / f"{pt.stem}.mlpackage") if out_dir is not None else None
-        typer.echo(f"Exporting {pt} -> CoreML (imgsz={imgsz}, half={half}) ...")
-        result = export_coreml(pt, out_path=out_path, imgsz=imgsz, half=half)
+        typer.echo(
+            f"Exporting {pt} -> CoreML (imgsz={imgsz}, half={half}, batch={batch}) ..."
+        )
+        result = export_coreml(pt, out_path=out_path, imgsz=imgsz, half=half, batch=batch)
         typer.echo(f"  saved: {result}")
 
 
@@ -622,6 +636,13 @@ def harvest_command(
         float,
         typer.Option("--conf", min=0.0, max=1.0, help="Detection confidence threshold."),
     ] = 0.25,
+    camera_name: Annotated[
+        Optional[str],
+        typer.Option(
+            "--camera-name",
+            help="Friendly camera name recorded in metadata for the labeling UI.",
+        ),
+    ] = None,
     sample_every: Annotated[
         int,
         typer.Option("--sample-every", min=1, help="Run detection every N frames."),
@@ -665,6 +686,8 @@ def harvest_command(
         pad_s=pad_s,
         min_len_s=min_len_s,
         max_len_s=max_len_s,
+        camera_name=camera_name,
+        detect_conf=conf,
     )
     if not results:
         typer.echo("No dog spans found.")
@@ -807,6 +830,7 @@ def harvest_camera_command(
         min_len_s=min_len_s,
         max_len_s=max_len_s,
         keep_chunks=keep_chunks,
+        detect_conf=conf,
     )
 
     mode = _select_downloader(downloader, config)
@@ -911,7 +935,12 @@ def _harvest_via_curl(
         password,
         verify_tls=config.protect.verify_tls,
     ) as downloader:
+        cameras = downloader.list_cameras()
         camera_id = downloader.resolve_camera_id(camera)
+        camera_name = _camera_name_for(
+            [(str(c.get("id", "")), str(c.get("name", ""))) for c in cameras],
+            camera_id,
+        )
         return harvest_camera_window(
             camera_id,
             start_utc,
@@ -919,6 +948,7 @@ def _harvest_via_curl(
             out_dir,
             detector=detector,
             download_fn=downloader.as_download_fn(),
+            camera_name=camera_name,
             **harvest_kwargs,
         )
 
@@ -932,7 +962,12 @@ async def _harvest_via_uiprotect(
     from detectivepotty.protect.client import ProtectClient
 
     async with ProtectClient(config) as client:
+        cameras = await client.list_cameras()
         camera_id = await _resolve_camera_id(client, camera)
+        camera_name = _camera_name_for(
+            [(str(getattr(c, "id", "")), str(getattr(c, "name", "") or "")) for c in cameras],
+            camera_id,
+        )
         loop = asyncio.get_running_loop()
 
         def download_fn(cam_id, c_start, c_end, dest):
@@ -949,8 +984,18 @@ async def _harvest_via_uiprotect(
             out_dir,
             detector=detector,
             download_fn=download_fn,
+            camera_name=camera_name,
             **harvest_kwargs,
         )
+
+
+def _camera_name_for(pairs: list[tuple[str, str]], camera_id: str) -> str | None:
+    """Pick the friendly name for ``camera_id`` from ``(id, name)`` pairs."""
+
+    for cam_id, name in pairs:
+        if cam_id == camera_id and name:
+            return name
+    return None
 
 
 def _resolve_harvest_window(
@@ -1083,6 +1128,303 @@ def export_dataset_command(
     if stats.dropped_unmatched:
         typer.echo(f"  dropped (unmatched track): {stats.dropped_unmatched}")
     typer.echo(f"  dataset:  {out_dir}")
+
+
+@app.command("experiment-bakeoff")
+def experiment_bakeoff_command(
+    input_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--input",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="A single acquired window video to score strategies over.",
+        ),
+    ] = None,
+    input_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--input-dir",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="A directory of chunk videos (experiment-acquire output) scored and "
+            "aggregated into one window-wide report. Use instead of --input.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(
+            "--model",
+            help="Ground-truth detector. A batched CoreML .mlpackage "
+            "(export-coreml --batch 32) is fastest; .pt also works.",
+        ),
+    ] = "models/yolo11m.pt",
+    long_edge: Annotated[
+        int,
+        typer.Option("--long-edge", min=1, help="YOLO inference long edge (imgsz)."),
+    ] = 640,
+    conf: Annotated[
+        float,
+        typer.Option("--conf", min=0.0, max=1.0, help="Detection confidence threshold."),
+    ] = 0.25,
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", min=1, help="Ground-truth detect batch size (CoreML fastest at 32)."),
+    ] = 32,
+    thresholds: Annotated[
+        str,
+        typer.Option(
+            "--thresholds",
+            help="Comma-separated motion thresholds (fraction of peak second) to sweep.",
+        ),
+    ] = "0.05,0.10,0.15,0.25,0.40",
+    min_dog_frames: Annotated[
+        int,
+        typer.Option("--min-dog-frames", min=1, help="Dog frames/second to count as a dog-second."),
+    ] = 1,
+    pad_s: Annotated[
+        int,
+        typer.Option("--pad-s", min=0, help="Seconds to dilate each motion hit (recall guard)."),
+    ] = 1,
+) -> None:
+    """Score retro-harvest window strategies against an exhaustive dense-YOLO truth.
+
+    Runs the detector on EVERY frame of the input (one ``--input`` file, or every
+    chunk under ``--input-dir`` aggregated) to build the ground-truth dog-seconds
+    (this is the ``blind-scrub`` baseline), then scores the compressed-domain motion
+    pre-filter (swept across ``--thresholds``) on recall of those dog-seconds vs the
+    compute it saves. Prints a bake-off table; pick the greediest threshold that
+    still holds recall near 1.0. Offline/local — no NVR.
+    """
+
+    from detectivepotty.experiment import find_chunk_videos, run_bakeoff, run_bakeoff_dir
+
+    if (input_path is None) == (input_dir is None):
+        raise typer.BadParameter("provide exactly one of --input or --input-dir")
+
+    try:
+        threshold_vals = tuple(
+            float(t) for t in thresholds.split(",") if t.strip()
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(f"--thresholds must be comma-separated floats: {exc}")
+    if not threshold_vals:
+        raise typer.BadParameter("--thresholds must contain at least one value")
+
+    if input_dir is not None:
+        chunks = find_chunk_videos(input_dir)
+        if not chunks:
+            raise typer.BadParameter(f"no chunk videos found in {input_dir}")
+
+    detector = DogDetector(
+        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+    )
+    typer.echo(
+        f"Building ground truth (model={detector.model_name}, device={detector.device}, "
+        f"batch={batch_size}) — this runs YOLO on every frame ..."
+    )
+    started = time.perf_counter()
+    if input_dir is not None:
+        def _progress(i: int, n: int, path: Path) -> None:
+            typer.echo(f"  chunk {i + 1}/{n}: {path.name}")
+
+        report = run_bakeoff_dir(
+            chunks,
+            detector,
+            source=f"{input_dir} ({len(chunks)} chunks)",
+            thresholds=threshold_vals,
+            min_dog_frames=min_dog_frames,
+            pad_s=pad_s,
+            batch_size=batch_size,
+            progress=_progress,
+        )
+    else:
+        report = run_bakeoff(
+            str(input_path),
+            detector,
+            source=input_path.name,
+            thresholds=threshold_vals,
+            min_dog_frames=min_dog_frames,
+            pad_s=pad_s,
+            batch_size=batch_size,
+        )
+    elapsed_s = time.perf_counter() - started
+    typer.echo("")
+    typer.echo(report.format_table())
+    typer.echo("")
+    typer.echo(f"# ground truth built in {elapsed_s:.1f}s")
+
+
+@app.command("experiment-acquire")
+def experiment_acquire_command(
+    config_path: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Path to DetectivePotty YAML config (for Protect host/creds).",
+        ),
+    ],
+    camera: Annotated[
+        str,
+        typer.Option("--camera", help="Protect camera id or name (see list-cameras)."),
+    ],
+    date: Annotated[
+        Optional[str],
+        typer.Option("--date", help="Day to acquire as YYYY-MM-DD (24h at --utc-offset)."),
+    ] = None,
+    start: Annotated[
+        Optional[str],
+        typer.Option("--start", help="ISO-8601 start (overrides --date)."),
+    ] = None,
+    end: Annotated[
+        Optional[str],
+        typer.Option("--end", help="ISO-8601 end (overrides --date)."),
+    ] = None,
+    utc_offset: Annotated[
+        float,
+        typer.Option("--utc-offset", help="Hours offset from UTC for --date. Default 0."),
+    ] = 0.0,
+    out_dir: Annotated[
+        Path,
+        typer.Option("--out", help="Directory to write raw chunk MP4s into (gitignored)."),
+    ] = Path("data/experiment"),
+    chunk_s: Annotated[
+        float,
+        typer.Option("--chunk", min=1.0, help="Chunk length in seconds. Default 3600 (1h)."),
+    ] = 3600.0,
+    downloader: Annotated[
+        str,
+        typer.Option(
+            "--downloader",
+            help="Recording transport: 'auto' (probe LAN, fall back to curl), "
+            "'uiprotect' (in-process), or 'curl' (shell out).",
+        ),
+    ] = "auto",
+) -> None:
+    """Download a raw camera window in chunks for the bake-off (NO dog detection).
+
+    Unlike ``harvest-camera`` (which cuts dog spans), this pulls the *whole* window
+    unmodified into ``--out`` as contiguous, non-overlapping chunk MP4s named by UTC
+    start (so they sort chronologically). Feed the directory to
+    ``experiment-bakeoff --input-dir`` to measure how much of it a motion pre-filter
+    can skip. Acquisition is bandwidth/disk-heavy — start with a 2–4h window.
+    """
+
+    config = load_config(config_path)
+    if not _protect_configured(config):
+        typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
+        raise typer.Exit(1)
+
+    start_utc, end_utc = _resolve_harvest_window(date, start, end, utc_offset)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mode = _select_downloader(downloader, config)
+
+    typer.echo(
+        f"Acquiring {camera} [{start_utc.isoformat()} - {end_utc.isoformat()}] "
+        f"in {chunk_s:.0f}s chunks via {mode} -> {out_dir}"
+    )
+    try:
+        if mode == "curl":
+            paths = _acquire_via_curl(
+                config, camera, start_utc, end_utc, out_dir, chunk_s
+            )
+        else:
+            paths = asyncio.run(
+                _acquire_via_uiprotect(
+                    config, camera, start_utc, end_utc, out_dir, chunk_s
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - surface a clean CLI error
+        typer.echo(f"Acquire failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    if not paths:
+        typer.echo("No footage acquired (no recording in range).")
+        return
+    total_bytes = sum(p.stat().st_size for p in paths if p.exists())
+    typer.echo(
+        f"Acquired {len(paths)} chunk(s), {total_bytes / 1e9:.2f} GB into {out_dir}. "
+        f"Run: detectivepotty experiment-bakeoff --input-dir {out_dir}"
+    )
+
+
+def _download_chunks(chunks, camera_id, download_fn, out_dir: Path) -> list[Path]:
+    """Download each planned chunk to ``out_dir``; skip empty/failed ones."""
+
+    from detectivepotty.harvest_unvr import _safe
+
+    written: list[Path] = []
+    for index, (chunk_start, chunk_end) in enumerate(chunks):
+        dest = out_dir / f"{_safe(camera_id)}_{chunk_start:%Y%m%dT%H%M%SZ}.mp4"
+        typer.echo(
+            f"  chunk {index + 1}/{len(chunks)} "
+            f"{chunk_start.isoformat()}..{chunk_end.isoformat()} -> {dest.name}"
+        )
+        try:
+            path = download_fn(camera_id, chunk_start, chunk_end, dest)
+        except Exception as exc:  # noqa: BLE001 - one bad chunk must not abort the run
+            typer.echo(f"    download failed: {exc}", err=True)
+            continue
+        if path is None or not Path(path).exists() or Path(path).stat().st_size == 0:
+            typer.echo("    no recording / empty chunk")
+            continue
+        written.append(Path(path))
+    return written
+
+
+def _acquire_via_curl(config, camera, start_utc, end_utc, out_dir, chunk_s) -> list[Path]:
+    from detectivepotty.harvest_unvr import plan_chunks
+    from detectivepotty.protect.curl_download import (
+        CurlProtectDownloader,
+        curl_available,
+    )
+
+    if not curl_available():
+        raise RuntimeError("curl binary not found on PATH for the curl downloader")
+    username = config.resolve_secret("username")
+    password = config.resolve_secret("password")
+    if not (username and password):
+        raise RuntimeError(
+            "curl downloader requires DETECTIVEPOTTY_NVR_USERNAME and "
+            "DETECTIVEPOTTY_NVR_PASSWORD env vars"
+        )
+    with CurlProtectDownloader(
+        config.protect.nvr_host,
+        username,
+        password,
+        verify_tls=config.protect.verify_tls,
+    ) as dl:
+        camera_id = dl.resolve_camera_id(camera)
+        chunks = plan_chunks(start_utc, end_utc, chunk_s=chunk_s, overlap_s=0.0)
+        return _download_chunks(chunks, camera_id, dl.as_download_fn(), out_dir)
+
+
+async def _acquire_via_uiprotect(
+    config, camera, start_utc, end_utc, out_dir, chunk_s
+) -> list[Path]:
+    from detectivepotty.harvest_unvr import plan_chunks
+    from detectivepotty.protect.client import ProtectClient
+
+    async with ProtectClient(config) as client:
+        camera_id = await _resolve_camera_id(client, camera)
+        loop = asyncio.get_running_loop()
+
+        def download_fn(cam_id, c_start, c_end, dest):
+            future = asyncio.run_coroutine_threadsafe(
+                client.download_recording(cam_id, c_start, c_end, dest), loop
+            )
+            return future.result()
+
+        chunks = plan_chunks(start_utc, end_utc, chunk_s=chunk_s, overlap_s=0.0)
+        return await asyncio.to_thread(
+            _download_chunks, chunks, camera_id, download_fn, out_dir
+        )
 
 
 def _build_camera_provider(config, camera, file_provider_cls, live_provider_cls):

@@ -270,3 +270,31 @@ def test_harvest_camera_window_cleans_temp_chunks(tmp_path: Path) -> None:
         **_kwargs(60),
     )
     assert not (out / ".chunks").exists()  # temp dir removed by default
+
+
+def test_harvest_camera_window_records_camera_name_and_conf(tmp_path: Path) -> None:
+    import json
+
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    out = tmp_path / "harvest"
+    calls: list[Any] = []
+    results = harvest_camera_window(
+        "6695ef21030c4603e400040d",
+        start,
+        end,
+        out,
+        download_fn=_make_download_fn(60, calls),
+        camera_name="Backyard Grass",
+        detect_conf=0.25,
+        chunk_s=3600.0,
+        overlap_s=0.0,
+        **_kwargs(60),
+    )
+    assert results
+    meta = json.loads(results[0].metadata_path.read_text(encoding="utf-8"))
+    assert meta["camera_name"] == "Backyard Grass"
+    assert meta["detect_conf"] == 0.25
+    # The id->name sidecar is written at the harvest root for later resolution.
+    cameras = json.loads((out / "cameras.json").read_text(encoding="utf-8"))
+    assert cameras["6695ef21030c4603e400040d"] == "Backyard Grass"

@@ -410,6 +410,7 @@ name = "detectivepotty"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "av" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "numpy" },
@@ -437,6 +438,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = ">=12,<18" },
     { name = "deeplabcut", marker = "extra == 'pose'", specifier = ">=3.0" },
     { name = "fastapi", specifier = ">=0.136.3" },
     { name = "httpx", specifier = ">=0.28.1" },

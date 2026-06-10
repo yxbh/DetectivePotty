@@ -24,14 +24,13 @@ idempotent — unchanged chunks reproduce the same span dirs.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-
-import cv2
 
 from detectivepotty.harvest import (
     DEFAULT_MAX_LEN_S,
@@ -45,12 +44,18 @@ from detectivepotty.harvest import (
     _default_clip_writer_factory,
     harvest_clips,
 )
+from detectivepotty.sources.pyav_capture import open_capture
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHUNK_S = 3600.0
 DEFAULT_OVERLAP_S = 5.0
 DEFAULT_DEDUP_TIME_IOU = 0.5
+
+# Sidecar at the harvest root mapping camera_id -> friendly NVR name, so the
+# labeling UI can show a human name even for clips harvested before a name was
+# known (their metadata carries the id; this map resolves it).
+CAMERAS_NAME = "cameras.json"
 
 # download_fn(camera_id, start_utc, end_utc, dest) -> written path or None.
 DownloadFn = Callable[[str, datetime, datetime, Path], Path | None]
@@ -99,6 +104,8 @@ def harvest_camera_window(
     *,
     detector: DetectorLike,
     download_fn: DownloadFn,
+    camera_name: str | None = None,
+    detect_conf: float | None = None,
     chunk_s: float = DEFAULT_CHUNK_S,
     overlap_s: float = DEFAULT_OVERLAP_S,
     dedup_time_iou: float = DEFAULT_DEDUP_TIME_IOU,
@@ -111,7 +118,7 @@ def harvest_camera_window(
     iou_threshold: float = 0.3,
     max_age_frames: int = 5,
     keep_chunks: bool = False,
-    capture_factory: Callable[[str], Any] = cv2.VideoCapture,
+    capture_factory: Callable[[str], Any] = open_capture,
     clip_writer_factory: Callable[
         [Path, float, tuple[int, int]], ClipWriter
     ] = _default_clip_writer_factory,
@@ -129,6 +136,9 @@ def harvest_camera_window(
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_root = Path(tmp_dir) if tmp_dir is not None else out_dir / ".chunks"
     tmp_root.mkdir(parents=True, exist_ok=True)
+
+    if camera_name:
+        _record_camera_name(out_dir, camera_id, camera_name)
 
     chunks = plan_chunks(start, end, chunk_s=chunk_s, overlap_s=overlap_s)
     if not chunks:
@@ -167,6 +177,8 @@ def harvest_camera_window(
                 max_len_s=max_len_s,
                 source_start_utc=chunk_start,
                 source_id=source_id,
+                camera_name=camera_name,
+                detect_conf=detect_conf,
                 iou_threshold=iou_threshold,
                 max_age_frames=max_age_frames,
                 capture_factory=capture_factory,
@@ -220,6 +232,32 @@ def _as_utc(value: datetime) -> datetime:
 
 def _safe(name: str) -> str:
     return "".join(c if (c.isalnum() or c in "-_") else "_" for c in name) or "camera"
+
+
+def _record_camera_name(out_dir: Path, camera_id: str, camera_name: str) -> None:
+    """Merge ``{camera_id: camera_name}`` into ``<out_dir>/cameras.json``.
+
+    Best-effort and idempotent: a corrupt/unreadable sidecar is treated as empty
+    and overwritten, and any write error is swallowed (the name is a UI nicety,
+    never load-bearing for harvest correctness).
+    """
+
+    path = out_dir / CAMERAS_NAME
+    mapping: dict[str, str] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                mapping = {str(k): str(v) for k, v in loaded.items()}
+        except (OSError, ValueError):
+            mapping = {}
+    if mapping.get(camera_id) == camera_name:
+        return
+    mapping[camera_id] = camera_name
+    try:
+        path.write_text(json.dumps(mapping, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("harvest-unvr: could not write %s: %s", path, exc)
 
 
 def _unlink(path: Path) -> None:

@@ -322,6 +322,12 @@ class ClipFrameReader:
     0-based index the next ``read()`` would return; it is set to ``None``
     ("unknown") after any decode/seek failure so the following read forces a hard
     seek instead of silently returning the wrong frame.
+
+    This surface deliberately stays on ``cv2`` (not the faster PyAV decode backend
+    used by the harvest/export/ground-truth seams): the tuner does random
+    frame-index *seeking*, which ``PyAvCapture`` does not support — and this path is
+    latency-bound on single on-demand frames, not throughput-bound on a dense scan,
+    so PyAV's multithreaded-decode advantage would not apply here anyway.
     """
 
     def __init__(self, path: Path, mtime_ns: int) -> None:

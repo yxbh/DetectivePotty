@@ -44,6 +44,7 @@ from detectivepotty.labels import (
     load_labels,
 )
 from detectivepotty.recording.dataset import sanitize_path_component
+from detectivepotty.sources.pyav_capture import open_capture
 from detectivepotty.tracking import iou
 
 logger = logging.getLogger(__name__)
@@ -251,7 +252,7 @@ def export_dataset(
     val_fraction: float = DEFAULT_VAL_FRACTION,
     min_iou: float = DEFAULT_MIN_IOU,
     jpeg_quality: int = DEFAULT_JPEG_QUALITY,
-    capture_factory: Callable[[str], Any] = cv2.VideoCapture,
+    capture_factory: Callable[[str], Any] = open_capture,
 ) -> ExportStats:
     """Export classifier crops + a CSV manifest from labeled harvested clips."""
 

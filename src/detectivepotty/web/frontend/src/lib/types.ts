@@ -191,12 +191,17 @@ export interface LabelClipSummary {
   span_id: string;
   clip_path: string;
   source_id: string;
+  camera_id: string | null;
+  camera_name: string | null;
   date: string;
+  span_start_utc: string | null;
+  span_end_utc: string | null;
   fps: number;
   frame_count: number;
   width: number;
   height: number;
   duration_s: number;
+  detect_conf: number | null;
   track_id: string | null;
   n_detections: number;
   labeled: boolean;
@@ -204,6 +209,8 @@ export interface LabelClipSummary {
   n_trainable_ranges: number;
   behaviors: string[];
   dogs: string[];
+  scene_id: string | null;
+  scene_size: number;
 }
 
 /** A recorded detection box for a track at one clip frame. */
@@ -211,6 +218,15 @@ export interface LabelTrackBox {
   clip_frame_idx: number;
   bbox: { x1: number; y1: number; x2: number; y2: number };
   confidence: number;
+}
+
+/** A dog track present in a clip's window (own track or a sibling's). */
+export interface LabelPresentTrack {
+  span_id: string;
+  track_id: string;
+  is_self: boolean;
+  camera_name: string | null;
+  boxes: LabelTrackBox[];
 }
 
 /** One labeled frame range bound to a dog track (mirrors `LabelRange`). */
@@ -236,6 +252,8 @@ export interface ClipLabelsBody {
 /** Full payload for the labeling screen (summary + tracks + existing labels). */
 export interface LabelClipDetail extends LabelClipSummary {
   tracks: Record<string, LabelTrackBox[]>;
+  present_tracks: Record<string, LabelPresentTrack>;
+  n_tracks: number;
   labels: ClipLabelsBody;
 }
 

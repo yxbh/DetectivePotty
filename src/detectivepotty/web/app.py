@@ -955,7 +955,7 @@ def create_app(
             clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="clip not found") from exc
-        return labeling.clip_detail(clip_dir)
+        return labeling.clip_detail(clip_dir, app.state.harvest_root)
 
     @app.put("/api/label/clips/{span_id}/labels")
     def label_clip_save(span_id: str, payload: dict = Body(...)) -> dict:
@@ -968,7 +968,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="clip not found") from exc
         try:
-            return labeling.save_clip_labels(clip_dir, payload)
+            return labeling.save_clip_labels(clip_dir, payload, app.state.harvest_root)
         except (ValueError, KeyError, TypeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

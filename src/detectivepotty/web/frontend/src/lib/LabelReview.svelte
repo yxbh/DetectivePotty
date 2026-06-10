@@ -10,9 +10,12 @@
     ClipLabelsBody,
     LabelClipDetail,
     LabelClipSummary,
+    LabelPresentTrack,
     LabelRangeItem,
     LabelVocabulary,
   } from "./types";
+  import { boxAtFrame } from "./labelBox";
+  import { formatClock } from "./format";
 
   const BEHAVIOR_KEYS: Record<string, string> = {
     "1": "pee",
@@ -20,6 +23,13 @@
     "3": "not_potty",
     "4": "excluded",
   };
+  const BEH_COLOR: Record<string, string> = {
+    pee: "#2d6cdf",
+    poop: "#8a5a2b",
+    not_potty: "#444c5a",
+    excluded: "#7a3550",
+  };
+  const MAX_FILMSTRIP = 24;
 
   let clips = $state<LabelClipSummary[]>([]);
   let vocabulary = $state<LabelVocabulary>({ behaviors: [], dogs: [] });
@@ -38,12 +48,18 @@
   let saveStatus = $state<string | null>(null);
 
   let videoEl = $state<HTMLVideoElement | null>(null);
+  let thumbEl = $state<HTMLVideoElement | null>(null);
+  let laneEl = $state<HTMLCanvasElement | null>(null);
   let currentFrame = $state(0);
   let playing = $state(false);
   let markIn = $state<number | null>(null);
   let markOut = $state<number | null>(null);
   let pendingBehavior = $state("pee");
   let pendingDog = $state("unknown");
+
+  // Per-detection crop thumbnails for the active (own) track.
+  let crops = $state<{ frame: number; url: string | null }[]>([]);
+  let filmstripToken = 0;
 
   const fps = $derived(detail && detail.fps > 0 ? detail.fps : 30);
   const totalFrames = $derived(detail ? Math.max(1, detail.frame_count) : 1);
@@ -52,22 +68,68 @@
     typeof window !== "undefined" &&
     "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
-  // The recorded detection box nearest the current frame for the span's track,
-  // so the labeler always sees which dog the range will bind to.
-  const activeBox = $derived.by(() => {
-    if (!detail || trackId == null) return null;
-    const boxes = detail.tracks[trackId];
-    if (!boxes || boxes.length === 0) return null;
-    let best = boxes[0];
-    let bestDist = Math.abs(best.clip_frame_idx - currentFrame);
-    for (const box of boxes) {
-      const dist = Math.abs(box.clip_frame_idx - currentFrame);
-      if (dist < bestDist) {
-        best = box;
-        bestDist = dist;
-      }
+  // The own track's sampled detection boxes (what a new range binds to).
+  const ownBoxes = $derived.by(() => {
+    if (!detail || trackId == null) return [];
+    return detail.tracks[trackId] ?? [];
+  });
+
+  // Other track segments overlapping this clip's window (often the same dog
+  // re-detected after the tracker lost it), for context + jump.
+  const siblingTracks = $derived.by<LabelPresentTrack[]>(() => {
+    if (!detail) return [];
+    return Object.values(detail.present_tracks).filter((t) => !t.is_self);
+  });
+
+  // Interpolated box for the track this clip follows (Workstream D).
+  const activeBox = $derived(boxAtFrame(ownBoxes, currentFrame));
+
+  // Sibling boxes at the current frame (dimmed, click to jump).
+  const siblingBoxes = $derived.by(() => {
+    const out: { track: LabelPresentTrack; bbox: { x1: number; y1: number; x2: number; y2: number } }[] = [];
+    for (const t of siblingTracks) {
+      const b = boxAtFrame(t.boxes, currentFrame);
+      if (b && !b.extrapolated) out.push({ track: t, bbox: b.bbox });
     }
-    return best;
+    return out;
+  });
+
+  // Group the clip list into scenes (siblings clustered, first-appearance order).
+  interface ClipGroup {
+    key: string;
+    scene: string | null;
+    size: number;
+    camera: string | null;
+    items: LabelClipSummary[];
+  }
+  const clipGroups = $derived.by<ClipGroup[]>(() => {
+    const groups: ClipGroup[] = [];
+    const byKey = new Map<string, ClipGroup>();
+    for (const c of clips) {
+      const key = c.scene_size > 1 && c.scene_id ? `scene:${c.scene_id}` : `solo:${c.span_id}`;
+      let g = byKey.get(key);
+      if (!g) {
+        g = {
+          key,
+          scene: c.scene_size > 1 ? c.scene_id : null,
+          size: c.scene_size,
+          camera: c.camera_name,
+          items: [],
+        };
+        byKey.set(key, g);
+        groups.push(g);
+      }
+      g.items.push(c);
+    }
+    return groups;
+  });
+
+  const dogKeyHint = $derived.by<Record<string, string>>(() => {
+    const map: Record<string, string> = {};
+    vocabulary.dogs.forEach((d, i) => {
+      if (i < 9) map[d] = `\u21e7${i + 1}`;
+    });
+    return map;
   });
 
   onMount(loadClips);
@@ -97,6 +159,7 @@
     detailLoading = true;
     detailError = null;
     detail = null;
+    crops = [];
     try {
       const data = await fetchLabelClipDetail(spanId);
       detail = data;
@@ -152,6 +215,167 @@
     }
   }
 
+  // --- detection filmstrip (per-detection crop thumbnails) ----------------
+
+  function seekThumb(time: number): Promise<void> {
+    return new Promise((resolve) => {
+      const v = thumbEl;
+      if (!v) {
+        resolve();
+        return;
+      }
+      const on = (): void => {
+        v.removeEventListener("seeked", on);
+        resolve();
+      };
+      v.addEventListener("seeked", on);
+      v.currentTime = time;
+    });
+  }
+
+  async function buildFilmstrip(): Promise<void> {
+    const token = ++filmstripToken;
+    const boxes = ownBoxes;
+    if (!detail || boxes.length === 0) {
+      crops = [];
+      return;
+    }
+    // Stride down to a manageable number of cards.
+    const stride = Math.max(1, Math.ceil(boxes.length / MAX_FILMSTRIP));
+    const picked = boxes.filter((_, i) => i % stride === 0);
+    crops = picked.map((b) => ({ frame: b.clip_frame_idx, url: null }));
+
+    const v = thumbEl;
+    if (!v) return;
+    if (v.readyState < 1) {
+      await new Promise<void>((r) => {
+        const on = (): void => {
+          v.removeEventListener("loadedmetadata", on);
+          r();
+        };
+        v.addEventListener("loadedmetadata", on);
+      });
+    }
+    if (token !== filmstripToken) return;
+
+    const natW = v.videoWidth || detail.width || 1;
+    const natH = v.videoHeight || detail.height || 1;
+    const sx = natW / (detail.width || natW);
+    const sy = natH / (detail.height || natH);
+    const oc = document.createElement("canvas");
+    const ctx = oc.getContext("2d");
+    if (!ctx) return;
+
+    for (let i = 0; i < picked.length; i += 1) {
+      if (token !== filmstripToken) return;
+      const b = picked[i];
+      await seekThumb((b.clip_frame_idx + 0.5) / fps);
+      if (token !== filmstripToken) return;
+      const bw = b.bbox.x2 - b.bbox.x1;
+      const bh = b.bbox.y2 - b.bbox.y1;
+      const mx = bw * 0.15;
+      const my = bh * 0.15;
+      const cropX = Math.max(0, (b.bbox.x1 - mx)) * sx;
+      const cropY = Math.max(0, (b.bbox.y1 - my)) * sy;
+      const cropW = Math.min(natW - cropX, (bw + 2 * mx) * sx);
+      const cropH = Math.min(natH - cropY, (bh + 2 * my) * sy);
+      const outW = 96;
+      const outH = Math.max(48, Math.round((cropH / Math.max(1, cropW)) * outW));
+      oc.width = outW;
+      oc.height = outH;
+      try {
+        ctx.drawImage(v, cropX, cropY, Math.max(1, cropW), Math.max(1, cropH), 0, 0, outW, outH);
+        const url = oc.toDataURL("image/jpeg", 0.6);
+        if (token !== filmstripToken) return;
+        crops[i] = { frame: b.clip_frame_idx, url };
+        crops = [...crops];
+      } catch {
+        // CORS/decoding hiccup — leave the placeholder.
+      }
+    }
+  }
+
+  $effect(() => {
+    const id = detail?.span_id;
+    // Re-extract when the clip (and therefore its own track) changes.
+    void id;
+    void trackId;
+    void buildFilmstrip();
+  });
+
+  // --- detection / confidence lane ----------------------------------------
+
+  function drawLane(): void {
+    const canvas = laneEl;
+    if (!canvas || !detail) return;
+    const w = canvas.clientWidth || 1;
+    const h = canvas.clientHeight || 1;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const total = Math.max(1, totalFrames - 1);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#0a0e16";
+    ctx.fillRect(0, 0, w, h);
+
+    // Labeled range bands (behind the detection ticks).
+    for (const r of ranges) {
+      const x0 = (r.start_frame / total) * w;
+      const x1 = (r.end_frame / total) * w;
+      ctx.fillStyle = (BEH_COLOR[r.behavior] ?? "#444") + "55";
+      ctx.fillRect(x0, 0, Math.max(2, x1 - x0), h);
+    }
+
+    // Confidence gate line.
+    const gate = detail.detect_conf;
+    if (gate != null && gate > 0) {
+      const gy = h - gate * h;
+      ctx.strokeStyle = "#5b6b80";
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(0, gy);
+      ctx.lineTo(w, gy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Detection ticks: height + colour by confidence, gated green/amber.
+    for (const b of ownBoxes) {
+      const x = (b.clip_frame_idx / total) * w;
+      const conf = Math.max(0, Math.min(1, b.confidence));
+      const bh = Math.max(2, conf * h);
+      const passed = gate == null || conf >= gate;
+      ctx.fillStyle = passed ? "#36d07a" : "#c79a3a";
+      ctx.fillRect(x, h - bh, 2, bh);
+    }
+
+    // Playhead.
+    const px = (currentFrame / total) * w;
+    ctx.strokeStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, h);
+    ctx.stroke();
+  }
+
+  $effect(() => {
+    // Redraw on frame/track/range/clip changes.
+    void currentFrame;
+    void ownBoxes;
+    void ranges;
+    void detail;
+    drawLane();
+  });
+
+  function laneSeek(event: MouseEvent): void {
+    const canvas = laneEl;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const t = (event.clientX - rect.left) / Math.max(1, rect.width);
+    seekToFrame(Math.round(t * (totalFrames - 1)));
+  }
+
   // --- range editing ------------------------------------------------------
 
   function setMarkIn(): void {
@@ -190,6 +414,12 @@
 
   function deleteRange(idx: number): void {
     ranges = ranges.filter((_, i) => i !== idx);
+    dirty = true;
+    saveStatus = null;
+  }
+
+  function updateRange(idx: number, patch: Partial<LabelRangeItem>): void {
+    ranges = ranges.map((r, i) => (i === idx ? { ...r, ...patch } : r));
     dirty = true;
     saveStatus = null;
   }
@@ -233,7 +463,7 @@
   }
 
   function fmtFrame(frame: number): string {
-    return `${frame} · ${(frame / fps).toFixed(2)}s`;
+    return `${frame} \u00b7 ${(frame / fps).toFixed(2)}s`;
   }
 
   // --- keyboard -----------------------------------------------------------
@@ -242,6 +472,15 @@
     const target = event.target as HTMLElement | null;
     if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) {
       if (event.key === "Escape") target.blur();
+      return;
+    }
+    // Dog hotkeys: Shift+1..9 map to the vocabulary's dogs (use physical key).
+    if (event.shiftKey && /^Digit[1-9]$/.test(event.code)) {
+      const idx = Number(event.code.slice(5)) - 1;
+      if (idx < vocabulary.dogs.length) {
+        event.preventDefault();
+        pendingDog = vocabulary.dogs[idx];
+      }
       return;
     }
     switch (event.key) {
@@ -299,7 +538,7 @@
   <aside class="clip-list">
     <div class="list-head">
       <h2>Harvested clips</h2>
-      <button type="button" class="ghost" onclick={() => void loadClips()} title="Reload">↻</button>
+      <button type="button" class="ghost" onclick={() => void loadClips()} title="Reload clip list">↻</button>
     </div>
     {#if listLoading}
       <p class="muted pad">Loading clips…</p>
@@ -311,27 +550,49 @@
         harvest dir.
       </p>
     {:else}
-      <ul>
-        {#each clips as clip (clip.span_id)}
-          <li>
-            <button
-              type="button"
-              class:active={clip.span_id === selectedId}
-              onclick={() => void selectClip(clip.span_id)}
-            >
-              <span class="row1">
-                <span class="src">{clip.source_id}</span>
-                <span class="badge" class:done={clip.labeled}>
-                  {clip.labeled ? `${clip.n_trainable_ranges}✓` : "·"}
+      {#each clipGroups as group (group.key)}
+        {#if group.scene}
+          <div class="scene-head" title="Same camera + overlapping time window — {group.size} detection segments (often the same dog re-detected after the tracker lost it, not confirmed separate dogs). Label each on its own clip.">
+            <span class="scene-cam">{group.camera ?? "camera"}</span>
+            <span class="scene-when">{formatClock(group.items[0].span_start_utc)}</span>
+            <span class="scene-badge">×{group.size} segments</span>
+          </div>
+        {/if}
+        <ul class:scene-group={group.scene}>
+          {#each group.items as clip (clip.span_id)}
+            <li>
+              <button
+                type="button"
+                class:active={clip.span_id === selectedId}
+                onclick={() => void selectClip(clip.span_id)}
+                title={`${clip.camera_name ?? clip.camera_id ?? "unknown camera"}\n${clip.source_id}\n${formatClock(clip.span_start_utc)} → ${formatClock(clip.span_end_utc)}`}
+              >
+                <span class="row1">
+                  <span class="cam">{clip.camera_name ?? clip.camera_id ?? clip.source_id}</span>
+                  <span class="badge" class:done={clip.labeled} title={clip.labeled ? `${clip.n_trainable_ranges} trainable / ${clip.n_ranges} ranges` : "Not labeled yet"}>
+                    {clip.labeled ? `✓${clip.n_trainable_ranges}` : "·"}
+                  </span>
                 </span>
-              </span>
-              <span class="row2 mono">
-                {clip.date} · {clip.duration_s.toFixed(1)}s · t{clip.track_id ?? "?"}
-              </span>
-            </button>
-          </li>
-        {/each}
-      </ul>
+                <span class="row2">
+                  <span class="when" title="Clip start (local time)">{formatClock(clip.span_start_utc)}</span>
+                  <span class="dur" title="Clip duration">{clip.duration_s.toFixed(1)}s</span>
+                  <span class="trk" title="Track segment this clip follows — its boxes/labels bind to this track">T{clip.track_id ?? "?"}</span>
+                </span>
+                {#if clip.labeled && (clip.behaviors.length || clip.dogs.length)}
+                  <span class="row3">
+                    {#each clip.behaviors as b (b)}
+                      <span class="chip b-{b}">{b}</span>
+                    {/each}
+                    {#each clip.dogs as d (d)}
+                      <span class="chip dog">{d}</span>
+                    {/each}
+                  </span>
+                {/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/each}
     {/if}
   </aside>
 
@@ -343,7 +604,32 @@
     {:else if !detail}
       <p class="muted pad">Select a clip to start labeling.</p>
     {:else}
-      <div class="player">
+      <!-- hidden video used only to extract per-detection crop thumbnails -->
+      <video
+        bind:this={thumbEl}
+        class="thumb-src"
+        src={labelClipVideoUrl(detail.span_id)}
+        preload="auto"
+        muted
+        playsinline
+      ></video>
+
+      <div class="player-col">
+        <div class="clip-head">
+          <div class="ch-main">
+            <strong title={detail.source_id}>{detail.camera_name ?? detail.camera_id ?? "Unknown camera"}</strong>
+            <span class="ch-when" title="Clip window (local time)">
+              {formatClock(detail.span_start_utc)} → {formatClock(detail.span_end_utc)}
+            </span>
+          </div>
+          <div class="ch-meta">
+            <span class="pill" title="The single track segment this clip follows. Its boxes/labels bind to this track.">Following Track {trackId ?? "?"}</span>
+            <span class="pill" class:multi={detail.n_tracks > 1} title="Distinct track segments in this clip's time window (including siblings from overlapping clips). These are often the same dog re-detected after the tracker lost it — not confirmed separate dogs.">
+              {detail.n_tracks} segment{detail.n_tracks === 1 ? "" : "s"} in window
+            </span>
+          </div>
+        </div>
+
         <div class="video-wrap" style="aspect-ratio: {detail.width || 16} / {detail.height || 9}">
           <!-- svelte-ignore a11y_media_has_caption -->
           <video
@@ -356,32 +642,57 @@
             onplay={() => (playing = true)}
             onpause={() => (playing = false)}
           ></video>
-          {#if activeBox}
-            <svg
-              class="overlay"
-              viewBox="0 0 {detail.width} {detail.height}"
-              preserveAspectRatio="xMidYMid meet"
-            >
+          <svg
+            class="overlay"
+            viewBox="0 0 {detail.width} {detail.height}"
+            preserveAspectRatio="xMidYMid meet"
+          >
+            {#each siblingBoxes as sb (sb.track.span_id + ':' + sb.track.track_id)}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <rect
+                x={sb.bbox.x1}
+                y={sb.bbox.y1}
+                width={sb.bbox.x2 - sb.bbox.x1}
+                height={sb.bbox.y2 - sb.bbox.y1}
+                class="box sibling"
+                role="button"
+                tabindex="-1"
+                onclick={() => void selectClip(sb.track.span_id)}
+              ><title>Other segment (Track {sb.track.track_id}) — may be the same dog; click to open its clip</title></rect>
+            {/each}
+            {#if activeBox && !activeBox.extrapolated}
               <rect
                 x={activeBox.bbox.x1}
                 y={activeBox.bbox.y1}
                 width={activeBox.bbox.x2 - activeBox.bbox.x1}
                 height={activeBox.bbox.y2 - activeBox.bbox.y1}
-                class="box"
+                class="box active"
               />
-            </svg>
+            {/if}
+          </svg>
+          {#if activeBox && activeBox.extrapolated}
+            <div class="no-detect" title="This frame is in the clip's padding, before/after this track's first/last detection. No box is drawn rather than freeze a stale one.">no detection at this frame</div>
+          {/if}
+        </div>
+
+        <div class="box-legend mono" aria-label="Box legend">
+          <span class="lg"><span class="sw own"></span>followed track (this clip)</span>
+          {#if siblingTracks.length}
+            <span class="lg"><span class="sw sib"></span>other segment — click to open</span>
           {/if}
         </div>
 
         <div class="transport">
-          <button type="button" onclick={() => stepFrame(-10)} title="Back 10 (Shift+←)">⏪</button>
-          <button type="button" onclick={() => stepFrame(-1)} title="Back 1 (←)">◀</button>
-          <button type="button" class="play" onclick={togglePlay} title="Play/Pause (Space)">
+          <button type="button" onclick={() => stepFrame(-10)} title="Back 10 frames (Shift+←)">⏪</button>
+          <button type="button" onclick={() => stepFrame(-1)} title="Back 1 frame (←)">◀</button>
+          <button type="button" class="play" onclick={togglePlay} title="Play / Pause (Space)">
             {playing ? "❚❚" : "►"}
           </button>
-          <button type="button" onclick={() => stepFrame(1)} title="Forward 1 (→)">▶</button>
-          <button type="button" onclick={() => stepFrame(10)} title="Forward 10 (Shift+→)">⏩</button>
-          <span class="frame-readout mono">f{currentFrame} / {totalFrames - 1} · {(currentFrame / fps).toFixed(2)}s</span>
+          <button type="button" onclick={() => stepFrame(1)} title="Forward 1 frame (→)">▶</button>
+          <button type="button" onclick={() => stepFrame(10)} title="Forward 10 frames (Shift+→)">⏩</button>
+          <span class="frame-readout mono" title="Current frame / last frame · time">
+            f{currentFrame} / {totalFrames - 1} · {(currentFrame / fps).toFixed(2)}s
+          </span>
         </div>
 
         <input
@@ -392,14 +703,67 @@
           value={currentFrame}
           oninput={(e) => seekToFrame(Number((e.target as HTMLInputElement).value))}
         />
+
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+        <canvas
+          bind:this={laneEl}
+          class="lane"
+          title="Detection confidence over the clip. Bars = sampled detections (height/colour = confidence); dashed line = harvest detect gate; tinted bands = your labeled ranges. Click to seek."
+          onclick={laneSeek}
+          role="slider"
+          tabindex="-1"
+          aria-label="Detection confidence timeline"
+          aria-valuenow={currentFrame}
+        ></canvas>
+
+        <div class="filmstrip" title="Every sampled detection of the followed track — click a crop to seek there.">
+          {#if crops.length === 0}
+            <span class="muted small">No detections sampled for this track.</span>
+          {:else}
+            {#each crops as c, i (i)}
+              <button
+                type="button"
+                class="film-card"
+                class:cur={Math.abs(c.frame - currentFrame) < (fps / 2)}
+                onclick={() => seekToFrame(c.frame)}
+                title={`Frame ${c.frame} · ${(c.frame / fps).toFixed(2)}s`}
+              >
+                {#if c.url}
+                  <img src={c.url} alt={`detection at frame ${c.frame}`} />
+                {:else}
+                  <span class="film-ph"></span>
+                {/if}
+                <span class="film-f mono">f{c.frame}</span>
+              </button>
+            {/each}
+          {/if}
+        </div>
       </div>
 
-      <div class="editor">
+      <div class="editor-col">
+        {#if siblingTracks.length}
+          <div class="siblings">
+            <span class="lbl" title="Other track segments overlapping this clip's window — often the same dog re-detected, not confirmed separate dogs.">Other segments here</span>
+            <div class="sib-chips">
+              {#each siblingTracks as t (t.span_id + ':' + t.track_id)}
+                <button
+                  type="button"
+                  class="sib-chip"
+                  onclick={() => void selectClip(t.span_id)}
+                  title="Open the clip that follows this segment (labels bind to a clip's own track)"
+                >
+                  → Track {t.track_id}
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
         <div class="marks">
-          <button type="button" onclick={setMarkIn} title="Mark in (I)">
+          <button type="button" onclick={setMarkIn} title="Mark range start at current frame (I)">
             In <span class="mono">{markIn ?? "—"}</span>
           </button>
-          <button type="button" onclick={setMarkOut} title="Mark out (O)">
+          <button type="button" onclick={setMarkOut} title="Mark range end at current frame (O)">
             Out <span class="mono">{markOut ?? "—"}</span>
           </button>
         </div>
@@ -408,13 +772,14 @@
           <div class="picker">
             <span class="lbl">Behavior</span>
             <div class="seg">
-              {#each vocabulary.behaviors as b (b)}
+              {#each vocabulary.behaviors as b, i (b)}
                 <button
                   type="button"
                   class:active={pendingBehavior === b}
                   onclick={() => (pendingBehavior = b)}
+                  title={`Set behavior to ${b}${i < 9 ? ` (${i + 1})` : ""}`}
                 >
-                  {b}
+                  {b}{#if i < 9}<span class="kh">{i + 1}</span>{/if}
                 </button>
               {/each}
             </div>
@@ -427,8 +792,9 @@
                   type="button"
                   class:active={pendingDog === d}
                   onclick={() => (pendingDog = d)}
+                  title={`Set dog to ${d}${dogKeyHint[d] ? ` (${dogKeyHint[d]})` : ""}`}
                 >
-                  {d}
+                  {d}{#if dogKeyHint[d]}<span class="kh">{dogKeyHint[d]}</span>{/if}
                 </button>
               {/each}
             </div>
@@ -436,8 +802,8 @@
         </div>
 
         <div class="actions">
-          <button type="button" class="primary" onclick={addRange}>
-            + Add range (Enter)
+          <button type="button" class="primary" onclick={addRange} title="Add a range from In→Out (Enter)">
+            + Add range
           </button>
           <button
             type="button"
@@ -445,33 +811,49 @@
             class:dirty
             disabled={saving || !dirty}
             onclick={() => void save()}
+            title="Save labels.json (S)"
           >
-            {saving ? "Saving…" : dirty ? "Save labels (S)" : "Saved"}
+            {saving ? "Saving…" : dirty ? "Save (S)" : "Saved"}
           </button>
           {#if saveStatus && saveStatus !== "saved"}
-            <span class="error">{saveStatus}</span>
+            <span class="error small">{saveStatus}</span>
           {:else if saveStatus === "saved"}
-            <span class="ok">✓ saved</span>
+            <span class="ok small">✓ saved</span>
           {/if}
         </div>
 
         <div class="ranges">
           <h3>Ranges ({ranges.length})</h3>
           {#if ranges.length === 0}
-            <p class="muted">No ranges yet. Mark In/Out, pick behavior + dog, then Add.</p>
+            <p class="muted small">No ranges yet. Mark In/Out, pick behavior + dog, then Add.</p>
           {:else}
             <ul>
               {#each ranges as r, idx (idx)}
                 <li>
-                  <button type="button" class="seek" onclick={() => seekToRange(r)} title="Seek to start">
+                  <button type="button" class="seek" onclick={() => seekToRange(r)} title="Seek to range start">
                     <span class="r-frames mono">{fmtFrame(r.start_frame)} → {fmtFrame(r.end_frame)}</span>
-                    <span class="r-tags">
-                      <span class="tag b-{r.behavior}">{r.behavior}</span>
-                      <span class="tag dog">{r.dog}</span>
-                      <span class="tag mono">t{r.track_id ?? "?"}</span>
-                    </span>
                   </button>
-                  <button type="button" class="del" onclick={() => deleteRange(idx)} aria-label="Delete range">×</button>
+                  <select
+                    class="r-sel"
+                    value={r.behavior}
+                    onchange={(e) => updateRange(idx, { behavior: (e.target as HTMLSelectElement).value })}
+                    title="Behavior for this range"
+                  >
+                    {#each vocabulary.behaviors as b (b)}
+                      <option value={b}>{b}</option>
+                    {/each}
+                  </select>
+                  <select
+                    class="r-sel"
+                    value={r.dog}
+                    onchange={(e) => updateRange(idx, { dog: (e.target as HTMLSelectElement).value })}
+                    title="Dog for this range"
+                  >
+                    {#each vocabulary.dogs as d (d)}
+                      <option value={d}>{d}</option>
+                    {/each}
+                  </select>
+                  <button type="button" class="del" onclick={() => deleteRange(idx)} aria-label="Delete range" title="Delete range">×</button>
                 </li>
               {/each}
             </ul>
@@ -479,7 +861,7 @@
         </div>
 
         <p class="legend mono">
-          Space play · ←/→ step (Shift ×10) · I/O mark · 1-4 behavior · Enter add · S save · j/k clip
+          Space play · ←/→ step (⇧×10) · I/O mark · 1-4 behavior · ⇧1-4 dog · Enter add · S save · j/k clip
         </p>
       </div>
     {/if}
@@ -489,7 +871,7 @@
 <style>
   .label-root {
     display: grid;
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: 256px 1fr;
     gap: 0;
     height: 100%;
     min-height: 0;
@@ -503,14 +885,15 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.5rem 0.75rem;
+    padding: 0.4rem 0.6rem;
     position: sticky;
     top: 0;
     background: var(--bg, #0c1018);
     border-bottom: 1px solid var(--border, #243042);
+    z-index: 1;
   }
   .list-head h2 {
-    font-size: 0.8rem;
+    font-size: 0.78rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin: 0;
@@ -521,71 +904,142 @@
     margin: 0;
     padding: 0;
   }
+  .scene-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    padding: 0.3rem 0.6rem 0.15rem;
+    font-size: 0.68rem;
+    color: var(--muted, #8aa);
+    border-top: 1px solid var(--border, #1b2433);
+  }
+  .scene-cam { font-weight: 600; color: #b9c6d6; }
+  .scene-when { margin-left: auto; }
+  .scene-badge {
+    background: #3a2c12;
+    color: #f0c869;
+    border-radius: 999px;
+    padding: 0.02rem 0.4rem;
+  }
+  ul.scene-group {
+    border-left: 2px solid #3a2c12;
+    margin-left: 0.35rem;
+  }
+  .clip-list li { margin: 0; }
   .clip-list li button {
+    display: flex;
+    flex-direction: column;
+    gap: 0.12rem;
     width: 100%;
     text-align: left;
     background: transparent;
     border: none;
     border-bottom: 1px solid var(--border, #1b2433);
-    padding: 0.5rem 0.75rem;
-    cursor: pointer;
     color: inherit;
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
+    padding: 0.32rem 0.6rem;
+    cursor: pointer;
   }
+  .clip-list li button:hover { background: var(--hover, #131c28); }
   .clip-list li button.active {
-    background: var(--accent-soft, #16314d);
-  }
-  .clip-list li button:hover {
-    background: var(--hover, #131c28);
+    background: var(--hover, #16202e);
+    box-shadow: inset 3px 0 0 var(--accent, #2d6cdf);
   }
   .row1 {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    gap: 0.5rem;
+    justify-content: space-between;
+    gap: 0.4rem;
   }
-  .src {
+  .cam {
+    font-size: 0.82rem;
     font-weight: 600;
-    font-size: 0.85rem;
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
   }
   .row2 {
-    font-size: 0.72rem;
-    color: var(--muted, #7e8ea0);
-  }
-  .badge {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
     font-size: 0.7rem;
-    padding: 0.05rem 0.4rem;
+    color: var(--muted, #9ab);
+  }
+  .row2 .trk { margin-left: auto; }
+  .row3 {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem;
+    margin-top: 0.1rem;
+  }
+  .chip {
+    font-size: 0.62rem;
+    padding: 0.02rem 0.32rem;
+    border-radius: 4px;
+    background: var(--border, #243042);
+    color: #cdd;
+  }
+  .chip.b-pee { background: #2d6cdf; color: #fff; }
+  .chip.b-poop { background: #8a5a2b; color: #fff; }
+  .chip.b-not_potty { background: #444c5a; color: #cdd; }
+  .chip.b-excluded { background: #7a3550; color: #fdd; }
+  .chip.dog { background: #2f5d4a; color: #dfe; }
+  .badge {
+    font-size: 0.66rem;
+    padding: 0.03rem 0.38rem;
     border-radius: 999px;
     background: var(--border, #243042);
     color: var(--muted, #9ab);
+    flex: none;
   }
-  .badge.done {
-    background: #1f7a3f;
-    color: #d6ffe2;
-  }
+  .badge.done { background: #1f7a3f; color: #d6ffe2; }
 
   .stage {
-    overflow-y: auto;
-    min-height: 0;
-    padding: 0.75rem 1rem;
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.85fr);
     gap: 0.75rem;
+    min-height: 0;
+    padding: 0.6rem 0.8rem;
+    overflow: hidden;
   }
-  .player {
+  .thumb-src {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+    left: -9999px;
+  }
+  .player-col {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.4rem;
+    min-width: 0;
+    min-height: 0;
   }
+  .clip-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .ch-main { display: flex; flex-direction: column; min-width: 0; }
+  .ch-main strong { font-size: 0.95rem; }
+  .ch-when { font-size: 0.72rem; color: var(--muted, #9ab); }
+  .ch-meta { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+  .pill {
+    font-size: 0.68rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    background: var(--border, #243042);
+    color: #bcd;
+    white-space: nowrap;
+  }
+  .pill.multi { background: #3a2c12; color: #f0c869; }
   .video-wrap {
     position: relative;
     width: 100%;
-    max-height: 56vh;
+    max-height: 52vh;
     background: #000;
     border-radius: 8px;
     overflow: hidden;
@@ -606,47 +1060,131 @@
     height: 100%;
     pointer-events: none;
   }
-  .overlay .box {
-    fill: none;
-    stroke: #36d07a;
-    stroke-width: 3;
-    vector-effect: non-scaling-stroke;
+  .overlay .box { fill: none; vector-effect: non-scaling-stroke; }
+  .overlay .box.active { stroke: #36d07a; stroke-width: 3; }
+  .no-detect {
+    position: absolute;
+    left: 50%;
+    bottom: 8px;
+    transform: translateX(-50%);
+    padding: 0.15rem 0.5rem;
+    border-radius: 6px;
+    background: rgba(20, 26, 36, 0.72);
+    color: #9fb0c4;
+    font-size: 0.7rem;
+    letter-spacing: 0.02em;
+    pointer-events: none;
+  }
+  .box-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    padding: 0.2rem 0.1rem 0;
+    font-size: 0.7rem;
+    color: var(--muted, #8aa);
+  }
+  .box-legend .lg { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .box-legend .sw { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
+  .box-legend .sw.own { border-top-color: #36d07a; }
+  .box-legend .sw.sib { border-top-color: #f0a93a; border-top-style: dashed; }
+  .overlay .box.sibling {
+    stroke: #f0a93a;
+    stroke-width: 2;
+    stroke-dasharray: 5 4;
+    opacity: 0.8;
+    pointer-events: auto;
+    cursor: pointer;
+    fill: rgba(240, 169, 58, 0.06);
   }
   .transport {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: 0.3rem;
   }
   .transport button {
     background: var(--border, #243042);
     border: none;
     color: inherit;
     border-radius: 6px;
-    padding: 0.3rem 0.6rem;
+    padding: 0.25rem 0.55rem;
     cursor: pointer;
     font-size: 0.85rem;
   }
   .transport button.play {
     background: var(--accent, #2d6cdf);
-    min-width: 3rem;
+    min-width: 2.8rem;
   }
   .frame-readout {
     margin-left: auto;
-    font-size: 0.8rem;
+    font-size: 0.76rem;
     color: var(--muted, #9ab);
   }
-  .scrub {
+  .scrub { width: 100%; }
+  .lane {
     width: 100%;
+    height: 44px;
+    border-radius: 6px;
+    border: 1px solid var(--border, #243042);
+    cursor: pointer;
+    display: block;
   }
-
-  .editor {
+  .filmstrip {
+    display: flex;
+    gap: 0.3rem;
+    overflow-x: auto;
+    padding-bottom: 0.2rem;
+  }
+  .film-card {
+    flex: none;
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
+    align-items: center;
+    gap: 0.1rem;
+    background: var(--border, #1b2433);
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 0.15rem;
+    cursor: pointer;
+  }
+  .film-card.cur { border-color: #36d07a; }
+  .film-card img {
+    width: 72px;
+    height: 54px;
+    object-fit: cover;
+    border-radius: 3px;
+    background: #000;
+    display: block;
+  }
+  .film-ph {
+    width: 72px;
+    height: 54px;
+    border-radius: 3px;
+    background: #0a0e16;
+    display: block;
+  }
+  .film-f { font-size: 0.6rem; color: var(--muted, #9ab); }
+
+  .editor-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .siblings { display: flex; flex-direction: column; gap: 0.25rem; }
+  .sib-chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .sib-chip {
+    background: #3a2c12;
+    border: 1px solid #5a4520;
+    color: #f0c869;
+    border-radius: 6px;
+    padding: 0.2rem 0.5rem;
+    cursor: pointer;
+    font-size: 0.74rem;
   }
   .marks {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.4rem;
   }
   .marks button {
     flex: 1;
@@ -654,22 +1192,29 @@
     border: none;
     color: inherit;
     border-radius: 6px;
-    padding: 0.4rem;
+    padding: 0.35rem;
     cursor: pointer;
   }
   .pickers {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.4rem;
   }
   .picker {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 0.5rem;
   }
   .picker .lbl {
-    width: 4.5rem;
-    font-size: 0.75rem;
+    width: 4rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted, #9ab);
+    flex: none;
+  }
+  .lbl {
+    font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted, #9ab);
@@ -680,29 +1225,40 @@
     gap: 0.3rem;
   }
   .seg button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
     background: var(--border, #243042);
     border: 1px solid transparent;
     color: inherit;
     border-radius: 6px;
-    padding: 0.25rem 0.6rem;
+    padding: 0.22rem 0.5rem;
     cursor: pointer;
-    font-size: 0.8rem;
+    font-size: 0.78rem;
   }
   .seg button.active {
     background: var(--accent, #2d6cdf);
     border-color: #5b8cf0;
   }
+  .kh {
+    font-size: 0.6rem;
+    opacity: 0.7;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 3px;
+    padding: 0 0.2rem;
+  }
   .actions {
     display: flex;
     align-items: center;
-    gap: 0.6rem;
+    gap: 0.5rem;
+    flex-wrap: wrap;
   }
   .actions .primary {
     background: #2f7d4f;
     border: none;
     color: #eafff2;
     border-radius: 6px;
-    padding: 0.45rem 0.8rem;
+    padding: 0.4rem 0.7rem;
     cursor: pointer;
     font-weight: 600;
   }
@@ -711,23 +1267,18 @@
     border: none;
     color: inherit;
     border-radius: 6px;
-    padding: 0.45rem 0.8rem;
+    padding: 0.4rem 0.7rem;
     cursor: pointer;
   }
-  .actions .save.dirty {
-    background: var(--accent, #2d6cdf);
-    color: #fff;
-  }
-  .actions .save:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
+  .actions .save.dirty { background: var(--accent, #2d6cdf); color: #fff; }
+  .actions .save:disabled { opacity: 0.6; cursor: default; }
+  .ranges { display: flex; flex-direction: column; min-height: 0; }
   .ranges h3 {
-    font-size: 0.8rem;
+    font-size: 0.74rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted, #9ab);
-    margin: 0.4rem 0;
+    margin: 0.2rem 0;
   }
   .ranges ul {
     list-style: none;
@@ -735,61 +1286,54 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.3rem;
+    gap: 0.25rem;
   }
   .ranges li {
     display: flex;
     align-items: stretch;
-    gap: 0.3rem;
+    gap: 0.25rem;
   }
   .ranges .seek {
     flex: 1;
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    gap: 0.5rem;
     background: var(--hover, #131c28);
     border: 1px solid var(--border, #243042);
     border-radius: 6px;
-    padding: 0.35rem 0.6rem;
+    padding: 0.3rem 0.45rem;
     cursor: pointer;
     color: inherit;
+    min-width: 0;
   }
-  .r-frames {
-    font-size: 0.75rem;
-  }
-  .r-tags {
-    display: flex;
-    gap: 0.3rem;
-  }
-  .tag {
-    font-size: 0.7rem;
-    padding: 0.05rem 0.4rem;
-    border-radius: 4px;
+  .r-frames { font-size: 0.7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .r-sel {
     background: var(--border, #243042);
+    color: inherit;
+    border: 1px solid var(--border, #2a3850);
+    border-radius: 6px;
+    font-size: 0.7rem;
+    padding: 0.15rem 0.2rem;
+    max-width: 5.5rem;
   }
-  .tag.b-pee { background: #2d6cdf; color: #fff; }
-  .tag.b-poop { background: #8a5a2b; color: #fff; }
-  .tag.b-not_potty { background: #444c5a; color: #cdd; }
-  .tag.b-excluded { background: #5a2b3a; color: #fdd; }
-  .tag.dog { background: #2f5d4a; color: #dfe; }
   .ranges .del {
     background: transparent;
     border: 1px solid var(--border, #243042);
     color: var(--muted, #c88);
     border-radius: 6px;
-    width: 2rem;
+    width: 1.8rem;
     cursor: pointer;
     font-size: 1rem;
   }
   .legend {
-    font-size: 0.72rem;
+    font-size: 0.68rem;
     color: var(--muted, #7e8ea0);
     border-top: 1px solid var(--border, #1b2433);
-    padding-top: 0.5rem;
+    padding-top: 0.4rem;
+    margin-top: auto;
   }
 
   .pad { padding: 1rem; }
+  .small { font-size: 0.72rem; }
   .muted { color: var(--muted, #7e8ea0); }
   .error { color: #ff6b6b; }
   .ok { color: #36d07a; }
@@ -799,12 +1343,16 @@
     color: inherit;
     border-radius: 6px;
     cursor: pointer;
-    padding: 0.15rem 0.4rem;
+    padding: 0.12rem 0.38rem;
   }
   code {
     background: var(--border, #243042);
     padding: 0.05rem 0.3rem;
     border-radius: 4px;
     font-size: 0.85em;
+  }
+
+  @media (max-width: 1100px) {
+    .stage { grid-template-columns: 1fr; overflow-y: auto; }
   }
 </style>

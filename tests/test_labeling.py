@@ -40,6 +40,14 @@ def _make_clip_dir(
     track_id: str = "1",
     date: str = "2026-06-08",
     n_det: int = 4,
+    source_id: str = "cam_backyard",
+    camera_name: str | None = None,
+    detect_conf: float | None = None,
+    span_start_utc: str | None = None,
+    span_end_utc: str | None = None,
+    source_start_utc: str | None = None,
+    start_s: float | None = None,
+    det_time_s: list[float] | None = None,
 ) -> Path:
     clip_dir = root / span_id
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -48,18 +56,18 @@ def _make_clip_dir(
         {
             "clip_frame_idx": i * 2,
             "source_frame_idx": 100 + i * 2,
-            "time_s": float(i),
+            "time_s": (det_time_s[i] if det_time_s is not None else float(i)),
             "track_id": track_id,
             "bbox": {"x1": 10.0 + i, "y1": 12.0, "x2": 80.0 + i, "y2": 90.0},
             "confidence": 0.7,
         }
         for i in range(n_det)
     ]
-    meta = {
+    meta: dict = {
         "schema_version": "harvest-1.0",
         "span_id": span_id,
-        "source_id": "cam_backyard",
-        "source_span_start_utc": f"{date}T17:29:38+00:00",
+        "source_id": source_id,
+        "source_span_start_utc": span_start_utc or f"{date}T17:29:38+00:00",
         "fps": 30.0,
         "frame_count": 12,
         "width": 160,
@@ -68,6 +76,16 @@ def _make_clip_dir(
         "track_id": track_id,
         "detections": detections,
     }
+    if camera_name is not None:
+        meta["camera_name"] = camera_name
+    if detect_conf is not None:
+        meta["detect_conf"] = detect_conf
+    if span_end_utc is not None:
+        meta["source_span_end_utc"] = span_end_utc
+    if source_start_utc is not None:
+        meta["source_start_utc"] = source_start_utc
+    if start_s is not None:
+        meta["start_s"] = start_s
     (clip_dir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
     return clip_dir
 
@@ -129,6 +147,131 @@ def test_clip_detail_groups_tracks(tmp_path: Path) -> None:
     assert [b["clip_frame_idx"] for b in boxes] == [0, 2, 4]
     assert boxes[0]["bbox"]["x1"] == 10.0
     assert detail["labels"]["ranges"] == []
+    # Own track is surfaced as a present (self) track.
+    assert detail["n_tracks"] == 1
+    self_track = detail["present_tracks"]["span_a:3"]
+    assert self_track["is_self"] is True
+    assert self_track["track_id"] == "3"
+
+
+def test_summarize_exposes_identity_and_timestamps(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    _make_clip_dir(
+        root,
+        "span_a",
+        source_id="6695ef21030c4603e400040d@20260606T094830Z",
+        camera_name="Backyard Grass",
+        detect_conf=0.25,
+        span_start_utc="2026-06-06T09:49:22+00:00",
+        span_end_utc="2026-06-06T09:49:25+00:00",
+    )
+    summary = labeling.summarize_clip(root / "span_a")
+    assert summary["camera_name"] == "Backyard Grass"
+    assert summary["camera_id"] == "6695ef21030c4603e400040d"
+    assert summary["detect_conf"] == 0.25
+    assert summary["span_start_utc"] == "2026-06-06T09:49:22+00:00"
+    assert summary["span_end_utc"] == "2026-06-06T09:49:25+00:00"
+
+
+def test_camera_name_falls_back_to_cameras_json(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    root.mkdir(parents=True)
+    (root / "cameras.json").write_text(
+        json.dumps({"6695ef21030c4603e400040d": "Backyard Grass"}), encoding="utf-8"
+    )
+    # No camera_name in metadata -> resolved via the sidecar by camera id.
+    _make_clip_dir(root, "span_a", source_id="6695ef21030c4603e400040d@20260606T0Z")
+    rows = labeling.list_clips(root)
+    assert rows[0]["camera_name"] == "Backyard Grass"
+
+
+def test_scene_grouping_clusters_overlapping_clips(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    cam = "camA@w"
+    # span_a and span_b overlap in time on camera A -> same scene.
+    _make_clip_dir(
+        root, "span_a", source_id=cam,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:26+00:00",
+    )
+    _make_clip_dir(
+        root, "span_b", source_id=cam, track_id="2",
+        span_start_utc="2026-06-06T09:49:24+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+    )
+    # span_c is a different, non-overlapping window -> its own scene (alone).
+    _make_clip_dir(
+        root, "span_c", source_id=cam,
+        span_start_utc="2026-06-06T11:00:00+00:00",
+        span_end_utc="2026-06-06T11:00:05+00:00",
+    )
+    by_id = {r["span_id"]: r for r in labeling.list_clips(root)}
+    assert by_id["span_a"]["scene_id"] is not None
+    assert by_id["span_a"]["scene_id"] == by_id["span_b"]["scene_id"]
+    assert by_id["span_a"]["scene_size"] == 2
+    assert by_id["span_c"]["scene_id"] is None
+    assert by_id["span_c"]["scene_size"] == 1
+
+
+def test_present_tracks_maps_sibling_into_clip_timeline(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    cam = "6695ef21030c4603e400040d@20260606T094800Z"
+    # Clip A: frame 0 at 09:49:20; source starts 09:49:00 (start_s=20).
+    a = _make_clip_dir(
+        root, "span_a", source_id=cam, track_id="1", n_det=2,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+        source_start_utc="2026-06-06T09:49:00+00:00",
+        start_s=20.0,
+        det_time_s=[20.0, 20.1],
+    )
+    # Clip B (dog 2), same source recording; a detection at source t=20.5s
+    # -> abs 09:49:20.5 -> clip-A frame round(0.5*30)=15. frame_count is 12, so
+    # that one is out of A's window; t=20.0 -> frame 0 (in window).
+    _make_clip_dir(
+        root, "span_b", source_id=cam, track_id="2", n_det=2,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+        source_start_utc="2026-06-06T09:49:00+00:00",
+        start_s=20.0,
+        det_time_s=[20.0, 20.5],
+    )
+    detail = labeling.clip_detail(a, root)
+    assert detail["n_tracks"] == 2
+    sib = detail["present_tracks"]["span_b:2"]
+    assert sib["is_self"] is False
+    assert sib["span_id"] == "span_b"
+    # Only the in-window sibling detection (source t=20.0 -> A frame 0) is kept.
+    assert [b["clip_frame_idx"] for b in sib["boxes"]] == [0]
+
+
+def test_present_tracks_groups_file_harvest_siblings_without_at(
+    tmp_path: Path,
+) -> None:
+    # File harvests use the sanitized filename as source_id (no ``@`` camera id),
+    # so sibling grouping must fall back to the full source_id. Two spans from the
+    # same recording should still see each other as present tracks.
+    root = tmp_path / "harvest"
+    src = "data_backyard_6_7_2026_clip.mp4"
+    a = _make_clip_dir(
+        root, "span_a", source_id=src, track_id="1", n_det=2,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+        source_start_utc="2026-06-06T09:49:00+00:00",
+        start_s=20.0,
+        det_time_s=[20.0, 20.1],
+    )
+    _make_clip_dir(
+        root, "span_b", source_id=src, track_id="2", n_det=2,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+        source_start_utc="2026-06-06T09:49:00+00:00",
+        start_s=20.0,
+        det_time_s=[20.0, 20.1],
+    )
+    detail = labeling.clip_detail(a, root)
+    assert detail["n_tracks"] == 2
+    assert detail["present_tracks"]["span_b:2"]["is_self"] is False
 
 
 def test_save_clip_labels_roundtrip_and_validation(tmp_path: Path) -> None:

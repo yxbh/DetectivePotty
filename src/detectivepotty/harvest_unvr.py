@@ -34,6 +34,7 @@ from typing import Any
 
 from detectivepotty.harvest import (
     DEFAULT_CENTER_DIST_GATE,
+    DEFAULT_DETECT_BATCH_SIZE,
     DEFAULT_IOU_THRESHOLD,
     DEFAULT_MAX_AGE_FRAMES,
     DEFAULT_MAX_LEN_S,
@@ -121,6 +122,7 @@ def harvest_camera_window(
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
     max_age_frames: int = DEFAULT_MAX_AGE_FRAMES,
     center_dist_gate: float = DEFAULT_CENTER_DIST_GATE,
+    detect_batch_size: int = DEFAULT_DETECT_BATCH_SIZE,
     keep_chunks: bool = False,
     capture_factory: Callable[[str], Any] = open_capture,
     clip_writer_factory: Callable[
@@ -186,6 +188,7 @@ def harvest_camera_window(
                 iou_threshold=iou_threshold,
                 max_age_frames=max_age_frames,
                 center_dist_gate=center_dist_gate,
+                detect_batch_size=detect_batch_size,
                 capture_factory=capture_factory,
                 clip_writer_factory=clip_writer_factory,
             )

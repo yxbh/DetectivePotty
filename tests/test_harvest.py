@@ -14,6 +14,7 @@ from detectivepotty.geometry import BBox
 from detectivepotty.harvest import (
     DogSpan,
     FrameSample,
+    _scan_for_dogs,
     compute_spans,
     harvest_clips,
     make_span_id,
@@ -218,7 +219,99 @@ class FakeClipWriter:
         FakeClipWriter.written[self.path.parent.name] = self.count
 
 
-def test_harvest_clips_writes_span_dir_and_metadata(tmp_path: Path) -> None:
+class FakeBatchDetector(FakeDetector):
+    """``FakeDetector`` that also exposes ``detect_batch`` (per-image-independent).
+
+    Delegates each batch entry to the per-frame :meth:`detect`, so a batched scan
+    must yield identical detections (and thus identical spans) to the single-frame
+    path. Records the batch sizes it was called with for boundary assertions.
+    """
+
+    def __init__(self, present_start: int, present_end: int) -> None:
+        super().__init__(present_start, present_end)
+        self.batch_sizes: list[int] = []
+
+    def detect_batch(self, frames, metas=None):
+        frames = list(frames)
+        if metas is None:
+            metas = [None] * len(frames)
+        self.batch_sizes.append(len(frames))
+        out = []
+        for frame, meta in zip(frames, metas):
+            idx = 0 if meta is None else meta.frame_idx
+            out.append(self.detect(frame, frame_idx=idx))
+        return out
+
+
+def _scan(detector, *, detect_batch_size, n_frames=60, sample_every=5, fps=10.0):
+    return _scan_for_dogs(
+        Path("fake.mp4"),
+        detector=detector,
+        sample_every=sample_every,
+        iou_threshold=0.3,
+        max_age_frames=15,
+        center_dist_gate=1.5,
+        detect_batch_size=detect_batch_size,
+        capture_factory=lambda _p: FakeCapture(n_frames, fps=fps),
+    )
+
+
+@pytest.mark.parametrize("batch_size", [2, 4, 5, 32])
+def test_scan_batched_matches_single_frame(batch_size: int) -> None:
+    # A detector without detect_batch always takes the single-frame path; the
+    # batched path must reproduce its (fps, total_frames, presence) exactly.
+    single = _scan(FakeDetector(10, 30), detect_batch_size=1)
+    batched = _scan(FakeBatchDetector(10, 30), detect_batch_size=batch_size)
+    assert batched == single
+
+
+def test_scan_batch_size_one_uses_single_frame_path() -> None:
+    # detect_batch_size=1 disables batching even when detect_batch exists.
+    det = FakeBatchDetector(10, 30)
+    single = _scan(FakeDetector(10, 30), detect_batch_size=1)
+    assert _scan(det, detect_batch_size=1) == single
+    assert det.batch_sizes == []  # detect_batch never called
+
+
+def test_scan_batch_flush_sizes() -> None:
+    # 60 frames @ sample_every=5 -> 12 sampled frames.
+    # Larger-than-count -> one partial flush; exact multiple -> even flushes;
+    # remainder -> a short tail flush. All paths still match single-frame.
+    single = _scan(FakeDetector(10, 30), detect_batch_size=1)
+
+    big = FakeBatchDetector(10, 30)
+    assert _scan(big, detect_batch_size=32) == single
+    assert big.batch_sizes == [12]
+
+    exact = FakeBatchDetector(10, 30)
+    assert _scan(exact, detect_batch_size=4) == single
+    assert exact.batch_sizes == [4, 4, 4]
+
+    remainder = FakeBatchDetector(10, 30)
+    assert _scan(remainder, detect_batch_size=5) == single
+    assert remainder.batch_sizes == [5, 5, 2]
+
+
+def test_harvest_clips_batched_matches_single_frame_spans(tmp_path: Path) -> None:
+    def run(detector, *, detect_batch_size) -> list[tuple[str, int, int]]:
+        results = harvest_clips(
+            tmp_path / "fake.mp4",
+            tmp_path / f"harvest_{detect_batch_size}",
+            detector=detector,
+            sample_every=5,
+            pad_s=0.0,
+            min_len_s=0.0,
+            detect_batch_size=detect_batch_size,
+            source_start_utc=datetime(2026, 6, 6, tzinfo=timezone.utc),
+            capture_factory=lambda _p: FakeCapture(60, fps=10.0),
+            clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+        )
+        return [(r.span_id, r.span.start_frame, r.span.end_frame) for r in results]
+
+    single = run(FakeDetector(10, 30), detect_batch_size=1)
+    batched = run(FakeBatchDetector(10, 30), detect_batch_size=32)
+    assert single == batched
+    assert len(single) == 1
     FakeClipWriter.written = {}
     out_dir = tmp_path / "harvest"
 

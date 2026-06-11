@@ -647,6 +647,15 @@ def harvest_command(
         int,
         typer.Option("--sample-every", min=1, help="Run detection every N frames."),
     ] = 5,
+    detect_batch_size: Annotated[
+        int,
+        typer.Option(
+            "--detect-batch-size",
+            min=1,
+            help="Detect this many sampled frames per batched forward (faster on "
+            "accelerated backends; CoreML/MPS true-batch here). 1 = single-frame.",
+        ),
+    ] = 32,
     max_age_frames: Annotated[
         int,
         typer.Option(
@@ -708,6 +717,7 @@ def harvest_command(
         max_len_s=max_len_s,
         max_age_frames=max_age_frames,
         center_dist_gate=center_dist_gate,
+        detect_batch_size=detect_batch_size,
         camera_name=camera_name,
         detect_conf=conf,
     )
@@ -790,6 +800,15 @@ def harvest_camera_command(
         int,
         typer.Option("--sample-every", min=1, help="Run detection every N frames."),
     ] = 5,
+    detect_batch_size: Annotated[
+        int,
+        typer.Option(
+            "--detect-batch-size",
+            min=1,
+            help="Detect this many sampled frames per batched forward (faster on "
+            "accelerated backends; CoreML/MPS true-batch here). 1 = single-frame.",
+        ),
+    ] = 32,
     merge_gap_s: Annotated[
         float,
         typer.Option("--merge-gap", min=0.0, help="Merge same-track gaps up to N seconds."),
@@ -847,6 +866,7 @@ def harvest_camera_command(
         chunk_s=chunk_s,
         overlap_s=overlap_s,
         sample_every=sample_every,
+        detect_batch_size=detect_batch_size,
         merge_gap_s=merge_gap_s,
         pad_s=pad_s,
         min_len_s=min_len_s,

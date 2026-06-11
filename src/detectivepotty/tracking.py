@@ -107,6 +107,16 @@ class Tracker:
     ``update`` expects detections from one sampled frame and returns tracks still
     considered active. Histories are retained after death via ``histories`` or
     ``get_track`` so recorder/state-machine code can recover full windows.
+
+    ``center_dist_gate`` (default ``0.0`` = disabled) adds an OR association gate:
+    a detection also matches a track when its box center is within
+    ``center_dist_gate`` reference-box diagonals of the track's last box, even if
+    IoU is below ``iou_threshold``. This re-associates a dog that moved far enough
+    between sparsely-sampled frames (or reappeared after a brief miss) for its box
+    to stop overlapping, which pure IoU would split into a new track. IoU matches
+    always win; the gate only adds candidates pure IoU would have dropped. Left at
+    ``0.0`` the tracker is byte-for-byte the original pure-IoU behavior (the live
+    pipeline relies on this).
     """
 
     def __init__(
@@ -114,6 +124,7 @@ class Tracker:
         iou_threshold: float = 0.3,
         max_age_frames: int = 5,
         min_confidence: float = 0.0,
+        center_dist_gate: float = 0.0,
     ) -> None:
         if not 0.0 <= iou_threshold <= 1.0:
             raise ValueError("iou_threshold must be between 0 and 1")
@@ -121,9 +132,12 @@ class Tracker:
             raise ValueError("max_age_frames must be non-negative")
         if min_confidence < 0.0:
             raise ValueError("min_confidence must be non-negative")
+        if center_dist_gate < 0.0:
+            raise ValueError("center_dist_gate must be non-negative")
         self.iou_threshold = iou_threshold
         self.max_age_frames = max_age_frames
         self.min_confidence = min_confidence
+        self.center_dist_gate = center_dist_gate
         self._next_id = 1
         self._states: dict[str, _TrackState] = {}
         self._histories: dict[str, Track] = {}
@@ -146,17 +160,30 @@ class Tracker:
             self._age_unmatched(current_frame_idx)
             return self.active_tracks
 
-        candidate_pairs: list[tuple[float, str, int]] = []
+        candidate_pairs: list[tuple[float, float, str, int]] = []
         for track_id, state in self._states.items():
+            ref = state.last_detection.bbox
+            ref_diag = math.hypot(ref.width, ref.height)
             for detection_idx, detection in enumerate(detections):
-                score = iou(state.last_detection.bbox, detection.bbox)
-                if score >= self.iou_threshold:
-                    candidate_pairs.append((score, track_id, detection_idx))
-        candidate_pairs.sort(key=lambda item: item[0], reverse=True)
+                score = iou(ref, detection.bbox)
+                matched = score >= self.iou_threshold
+                neg_dist = 0.0
+                if self.center_dist_gate > 0.0 and ref_diag > 0.0:
+                    rcx, rcy = ref.center
+                    dcx, dcy = detection.bbox.center
+                    dist_frac = math.hypot(dcx - rcx, dcy - rcy) / ref_diag
+                    neg_dist = -dist_frac
+                    matched = matched or dist_frac <= self.center_dist_gate
+                if matched:
+                    candidate_pairs.append((score, neg_dist, track_id, detection_idx))
+        # IoU wins first; among equal IoU (incl. zero-IoU distance matches) the
+        # nearest center wins. With center_dist_gate=0 neg_dist is always 0.0, so
+        # this reduces to the original score-only stable sort.
+        candidate_pairs.sort(key=lambda item: (item[0], item[1]), reverse=True)
 
         matched_tracks: set[str] = set()
         matched_detections: set[int] = set()
-        for _, track_id, detection_idx in candidate_pairs:
+        for _, _, track_id, detection_idx in candidate_pairs:
             if track_id in matched_tracks or detection_idx in matched_detections:
                 continue
             detection = detections[detection_idx]

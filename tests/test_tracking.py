@@ -144,3 +144,48 @@ def test_overlapping_dogs_have_no_reidentification_guarantee() -> None:
     assert original_ids <= final_ids
     assert len(crossed) >= 2
     assert all(track.detections for track in crossed)
+
+
+def test_center_dist_gate_reassociates_nonoverlapping_box() -> None:
+    # A dog that moved far enough between sparse samples for its box to stop
+    # overlapping (IoU == 0) would fragment into a new track under pure IoU. The
+    # center-distance gate keeps it as one track (this is the harvest fix).
+    moved = BBox(25, 0, 45, 20)
+    assert iou(BBox(0, 0, 20, 20), moved) == 0.0
+
+    tracker = Tracker(iou_threshold=0.3, center_dist_gate=1.5)
+    first = tracker.update([make_detection(0, BBox(0, 0, 20, 20))])
+    second = tracker.update([make_detection(1, moved)])
+
+    assert len(second) == 1
+    assert second[0].track_id == first[0].track_id
+    assert len(second[0].detections) == 2
+
+
+def test_center_dist_gate_disabled_by_default_keeps_pure_iou() -> None:
+    # Default gate (0.0) must not change pure-IoU behavior: the same
+    # non-overlapping jump births a new track, the live-pipeline contract.
+    tracker = Tracker(iou_threshold=0.3)
+    first = tracker.update([make_detection(0, BBox(0, 0, 20, 20))])
+    second = tracker.update([make_detection(1, BBox(25, 0, 45, 20))])
+
+    assert first[0].track_id == "1"
+    assert {track.track_id for track in second} == {"1", "2"}
+    moved_track = next(track for track in second if track.track_id == "2")
+    assert len(moved_track.detections) == 1
+
+
+def test_center_dist_gate_respects_threshold() -> None:
+    # A box beyond the gate (here ~0.88 box-diagonals away, gate 0.5) still
+    # fragments — the gate widens association, it does not merge anything nearby.
+    tracker = Tracker(iou_threshold=0.3, center_dist_gate=0.5)
+    tracker.update([make_detection(0, BBox(0, 0, 20, 20))])
+    second = tracker.update([make_detection(1, BBox(25, 0, 45, 20))])
+
+    assert {track.track_id for track in second} == {"1", "2"}
+
+
+def test_center_dist_gate_rejects_negative() -> None:
+    with pytest.raises(ValueError):
+        Tracker(center_dist_gate=-0.1)
+

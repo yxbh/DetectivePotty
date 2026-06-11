@@ -22,6 +22,15 @@ _FILENAME_TS_RE = re.compile(
     r"GMT([+-]\d{1,2})(?::?(\d{2}))?"
 )
 
+# UniFi Protect / NVR exports and our chunk downloader name files with an
+# ISO-8601 *basic* UTC stamp, e.g. ``<cameraId>_20260606T230000Z.mp4`` (8 date
+# digits, ``T``, 6 time digits, optional ``Z`` or numeric offset). The GMT
+# app-export regex above does not match this, which previously dropped the
+# anchor to the file's mtime (the download time, not the recording time).
+_FILENAME_ISO_TS_RE = re.compile(
+    r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z|[+-]\d{2}:?\d{2})?"
+)
+
 
 def _ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -29,13 +38,7 @@ def _ensure_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def parse_filename_start_ts(name: str) -> datetime | None:
-    """Parse the real recording-start UTC time from a UniFi export filename.
-
-    Returns ``None`` when the filename does not contain a recognizable,
-    in-range timestamp so the caller can fall back to a different anchor.
-    """
-
+def _parse_gmt_export_ts(name: str) -> datetime | None:
     match = _FILENAME_TS_RE.search(name)
     if match is None:
         return None
@@ -54,6 +57,44 @@ def parse_filename_start_ts(name: str) -> datetime | None:
     except ValueError:
         return None
     return local.astimezone(timezone.utc)
+
+
+def _parse_iso_basic_ts(name: str) -> datetime | None:
+    match = _FILENAME_ISO_TS_RE.search(name)
+    if match is None:
+        return None
+    year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    hour, minute, second = int(match.group(4)), int(match.group(5)), int(match.group(6))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return None
+    token = match.group(7)
+    if token and token not in ("Z", "z"):
+        body = token[1:].replace(":", "")
+        offset = timedelta(hours=int(body[:2]), minutes=int(body[2:4]))
+        tz = timezone(offset if token[0] == "+" else -offset)
+    else:
+        # No suffix or ``Z`` -> UTC. Protect's basic stamps are always UTC.
+        tz = timezone.utc
+    try:
+        local = datetime(year, month, day, hour, minute, second, tzinfo=tz)
+    except ValueError:
+        return None
+    return local.astimezone(timezone.utc)
+
+
+def parse_filename_start_ts(name: str) -> datetime | None:
+    """Parse the real recording-start UTC time from an export/recording filename.
+
+    Recognizes two namings: the UniFi app-export ``M-D-YYYY, H.MM.SS GMT±H``
+    form and the Protect/NVR ISO-8601 *basic* ``YYYYMMDDTHHMMSS[Z]`` form (used
+    by the chunk downloader and historical exports). Returns ``None`` when the
+    filename has no recognizable, in-range timestamp so the caller can fall back
+    to a different anchor.
+    """
+
+    return _parse_gmt_export_ts(name) or _parse_iso_basic_ts(name)
 
 
 def derive_base_wall_ts(

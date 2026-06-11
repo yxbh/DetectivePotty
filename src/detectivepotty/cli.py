@@ -647,6 +647,26 @@ def harvest_command(
         int,
         typer.Option("--sample-every", min=1, help="Run detection every N frames."),
     ] = 5,
+    max_age_frames: Annotated[
+        int,
+        typer.Option(
+            "--max-age-frames",
+            min=0,
+            help="Keep a track alive across this many missed source frames "
+            "(survives brief detector misses; ~3 missed samples at the default "
+            "stride). Higher = fewer fragmented spans.",
+        ),
+    ] = 15,
+    center_dist_gate: Annotated[
+        float,
+        typer.Option(
+            "--center-dist-gate",
+            min=0.0,
+            help="Re-associate a detection to a track when its box center is within "
+            "this many box-diagonals, even if IoU is low (0 disables; handles a dog "
+            "that moved between sparse samples). Higher = stickier tracks.",
+        ),
+    ] = 1.5,
     merge_gap_s: Annotated[
         float,
         typer.Option("--merge-gap", min=0.0, help="Merge same-track gaps up to N seconds."),
@@ -686,6 +706,8 @@ def harvest_command(
         pad_s=pad_s,
         min_len_s=min_len_s,
         max_len_s=max_len_s,
+        max_age_frames=max_age_frames,
+        center_dist_gate=center_dist_gate,
         camera_name=camera_name,
         detect_conf=conf,
     )

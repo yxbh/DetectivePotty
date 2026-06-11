@@ -47,6 +47,15 @@ DEFAULT_MERGE_GAP_S = 2.0
 DEFAULT_PAD_S = 1.0
 DEFAULT_MIN_LEN_S = 0.5
 DEFAULT_MAX_LEN_S = 60.0
+# Tracking defaults are deliberately looser than the live pipeline's: harvest
+# samples every Nth frame, so a dog drifts further between tracker updates and
+# the detector misses it more often. A larger max-age survives a few missed
+# samples (DEFAULT_MAX_AGE_FRAMES ≈ 3 misses at the default stride) and the
+# center-distance gate re-associates boxes that stopped overlapping, which keeps
+# one walking dog as one track instead of fragmenting it into many short spans.
+DEFAULT_IOU_THRESHOLD = 0.3
+DEFAULT_MAX_AGE_FRAMES = 15
+DEFAULT_CENTER_DIST_GATE = 1.5
 
 CLIP_NAME = "clip.mp4"
 METADATA_NAME = "metadata.json"
@@ -260,8 +269,9 @@ def harvest_clips(
     source_id: str | None = None,
     camera_name: str | None = None,
     detect_conf: float | None = None,
-    iou_threshold: float = 0.3,
-    max_age_frames: int = 5,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    max_age_frames: int = DEFAULT_MAX_AGE_FRAMES,
+    center_dist_gate: float = DEFAULT_CENTER_DIST_GATE,
     capture_factory: Callable[[str], Any] = open_capture,
     clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter] = (
         _default_clip_writer_factory
@@ -298,6 +308,7 @@ def harvest_clips(
         sample_every=sample_every,
         iou_threshold=iou_threshold,
         max_age_frames=max_age_frames,
+        center_dist_gate=center_dist_gate,
         capture_factory=capture_factory,
     )
     if total_frames == 0:
@@ -339,6 +350,7 @@ def _scan_for_dogs(
     sample_every: int,
     iou_threshold: float,
     max_age_frames: int,
+    center_dist_gate: float = 0.0,
     capture_factory: Callable[[str], Any],
 ) -> tuple[float, int, dict[str, list[FrameSample]]]:
     capture = capture_factory(str(input_path))
@@ -347,7 +359,11 @@ def _scan_for_dogs(
         raise RuntimeError(f"failed to open video file: {input_path}")
 
     fps = _capture_value(capture, cv2.CAP_PROP_FPS) or 30.0
-    tracker = Tracker(iou_threshold=iou_threshold, max_age_frames=max_age_frames)
+    tracker = Tracker(
+        iou_threshold=iou_threshold,
+        max_age_frames=max_age_frames,
+        center_dist_gate=center_dist_gate,
+    )
     presence: dict[str, list[FrameSample]] = {}
 
     def _decode_frames():

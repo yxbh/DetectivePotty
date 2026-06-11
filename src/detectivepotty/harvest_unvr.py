@@ -33,6 +33,9 @@ from pathlib import Path
 from typing import Any
 
 from detectivepotty.harvest import (
+    DEFAULT_CENTER_DIST_GATE,
+    DEFAULT_IOU_THRESHOLD,
+    DEFAULT_MAX_AGE_FRAMES,
     DEFAULT_MAX_LEN_S,
     DEFAULT_MERGE_GAP_S,
     DEFAULT_MIN_LEN_S,
@@ -115,8 +118,9 @@ def harvest_camera_window(
     pad_s: float = DEFAULT_PAD_S,
     min_len_s: float = DEFAULT_MIN_LEN_S,
     max_len_s: float = DEFAULT_MAX_LEN_S,
-    iou_threshold: float = 0.3,
-    max_age_frames: int = 5,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    max_age_frames: int = DEFAULT_MAX_AGE_FRAMES,
+    center_dist_gate: float = DEFAULT_CENTER_DIST_GATE,
     keep_chunks: bool = False,
     capture_factory: Callable[[str], Any] = open_capture,
     clip_writer_factory: Callable[
@@ -181,6 +185,7 @@ def harvest_camera_window(
                 detect_conf=detect_conf,
                 iou_threshold=iou_threshold,
                 max_age_frames=max_age_frames,
+                center_dist_gate=center_dist_gate,
                 capture_factory=capture_factory,
                 clip_writer_factory=clip_writer_factory,
             )

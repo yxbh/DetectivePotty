@@ -194,6 +194,43 @@ def test_parse_filename_start_ts_rejects_impossible_dates() -> None:
     assert parse_filename_start_ts("just-a-clip.mp4") is None
 
 
+def test_parse_filename_start_ts_iso_basic_utc() -> None:
+    # Protect/NVR + chunk-downloader naming: <cameraId>_YYYYMMDDTHHMMSSZ.mp4 (UTC).
+    name = "6695ef21030c4603e400040d_20260606T230000Z.mp4"
+    assert parse_filename_start_ts(name) == datetime(
+        2026, 6, 6, 23, 0, 0, tzinfo=timezone.utc
+    )
+    # No suffix is still treated as UTC.
+    assert parse_filename_start_ts("cam_20260606T230000.mp4") == datetime(
+        2026, 6, 6, 23, 0, 0, tzinfo=timezone.utc
+    )
+
+
+def test_parse_filename_start_ts_iso_basic_offset() -> None:
+    # Explicit numeric offset is honored: 09:00:00 at +10:00 == 23:00:00 UTC prior day.
+    assert parse_filename_start_ts("cam_20260606T090000+1000.mp4") == datetime(
+        2026, 6, 5, 23, 0, 0, tzinfo=timezone.utc
+    )
+
+
+def test_parse_filename_start_ts_iso_basic_rejects_impossible() -> None:
+    # 13th month -> not a valid ISO-basic stamp; hex camera id alone -> no match.
+    assert parse_filename_start_ts("cam_20261306T230000Z.mp4") is None
+    assert parse_filename_start_ts("6695ef21030c4603e400040d.mp4") is None
+
+
+def test_derive_base_wall_ts_prefers_iso_basic_filename(tmp_path: Path) -> None:
+    # Regression: a downloaded chunk named with the ISO-basic UTC stamp must
+    # anchor to the recording time, not the file's (download) mtime.
+    path = tmp_path / "6695ef21030c4603e400040d_20260606T230000Z.mp4"
+    path.write_bytes(b"x")
+    far = datetime(2026, 6, 10, 22, 0, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(path, (far, far))
+    base, basis = derive_base_wall_ts(path)
+    assert basis == "filename"
+    assert base == datetime(2026, 6, 6, 23, 0, 0, tzinfo=timezone.utc)
+
+
 def test_derive_base_wall_ts_prefers_filename(tmp_path: Path) -> None:
     path = tmp_path / UNIFI_NAME
     path.write_bytes(b"x")

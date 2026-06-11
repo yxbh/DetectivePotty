@@ -29,6 +29,9 @@ dependencies = [
 pose = [
     "deeplabcut>=3.0",
 ]
+coreml = [
+    "coremltools>=8,<9",
+]
 
 [project.scripts]
 detectivepotty = "detectivepotty.cli:app"

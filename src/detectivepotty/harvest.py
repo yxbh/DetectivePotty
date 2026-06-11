@@ -511,6 +511,41 @@ def _write_spans(
     return results
 
 
+def _merge_frame_ranges(
+    ranges: Sequence[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Merge ``(start, end)`` frame ranges into disjoint, sorted segments.
+
+    Overlapping *or adjacent* ranges fuse (``end + 1 >= next start``) so one
+    seek+decode covers every span that shares those frames.
+    """
+
+    segments: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if segments and start <= segments[-1][1] + 1:
+            segments[-1][1] = max(segments[-1][1], end)
+        else:
+            segments.append([start, end])
+    return [(s, e) for s, e in segments]
+
+
+def _seek_capture(capture: Any, frame_idx: int) -> bool:
+    """Position ``capture`` so the next ``read()`` returns ``frame_idx``.
+
+    Uses the ``cv2.CAP_PROP_POS_FRAMES`` setter (native on OpenCV, frame-accurate
+    forward seek on :class:`PyAvCapture`). Returns ``False`` when the capture has
+    no usable setter so callers can fall back to a sequential pass.
+    """
+
+    setter = getattr(capture, "set", None)
+    if not callable(setter):
+        return False
+    try:
+        return bool(setter(cv2.CAP_PROP_POS_FRAMES, frame_idx))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _extract_span_clips(
     input_path: Path,
     plans: Sequence[tuple[DogSpan, str, Path]],
@@ -519,11 +554,19 @@ def _extract_span_clips(
     capture_factory: Callable[[str], Any],
     clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter],
 ) -> dict[str, tuple[int, int]]:
-    """Single sequential pass writing each source frame into every span it hits.
+    """Cut each span's clip by decoding **only** the dog-present windows.
 
-    Overlapping spans (different tracks) share frames, so one decode pass feeds
-    all writers. Writers are created lazily on the first frame so we know the
-    real frame size. Returns ``span_id -> (width, height)``.
+    Spans cover a small fraction of a long recording, so instead of decoding the
+    whole file we merge the span frame-ranges into disjoint decode-segments and
+    seek to each one, decoding only ``[start, end]``. Overlapping spans (different
+    tracks sharing frames) live in the same segment, so one decode still feeds all
+    their writers. Writers are created lazily on the first frame so we know the
+    real size, and each span's first written frame is exactly ``start_frame`` so
+    the clip-frame / source-frame metadata mapping stays correct. Returns
+    ``span_id -> (width, height)``.
+
+    When the capture cannot seek (no ``CAP_PROP_POS_FRAMES`` support), falls back
+    to a single sequential pass over the whole file.
     """
 
     capture = capture_factory(str(input_path))
@@ -531,26 +574,50 @@ def _extract_span_clips(
         _release(capture)
         raise RuntimeError(f"failed to open video file: {input_path}")
 
+    segments = _merge_frame_ranges(
+        [(span.start_frame, span.end_frame) for span, _, _ in plans]
+    )
     writers: dict[str, ClipWriter] = {}
     sizes: dict[str, tuple[int, int]] = {}
-    decoded_idx = 0
+
+    def _emit(frame: np.ndarray, decoded_idx: int) -> None:
+        height, width = frame.shape[:2]
+        for span, span_id, clip_dir in plans:
+            if span.start_frame <= decoded_idx <= span.end_frame:
+                writer = writers.get(span_id)
+                if writer is None:
+                    writer = clip_writer_factory(
+                        clip_dir / CLIP_NAME, fps, (width, height)
+                    )
+                    writers[span_id] = writer
+                    sizes[span_id] = (width, height)
+                writer.write(frame)
+
     try:
-        while True:
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                break
-            height, width = frame.shape[:2]
-            for span, span_id, clip_dir in plans:
-                if span.start_frame <= decoded_idx <= span.end_frame:
-                    writer = writers.get(span_id)
-                    if writer is None:
-                        writer = clip_writer_factory(
-                            clip_dir / CLIP_NAME, fps, (width, height)
-                        )
-                        writers[span_id] = writer
-                        sizes[span_id] = (width, height)
-                    writer.write(frame)
-            decoded_idx += 1
+        seekable = bool(segments) and _seek_capture(capture, segments[0][0])
+        if seekable:
+            for seg_index, (seg_start, seg_end) in enumerate(segments):
+                if seg_index > 0 and not _seek_capture(capture, seg_start):
+                    raise RuntimeError(
+                        f"seek to frame {seg_start} failed mid-extraction"
+                    )
+                decoded_idx = seg_start
+                while decoded_idx <= seg_end:
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        break
+                    _emit(frame, decoded_idx)
+                    decoded_idx += 1
+        else:
+            # No seek support: one sequential pass writes each frame into every
+            # span it falls inside (legacy behavior).
+            decoded_idx = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
+                _emit(frame, decoded_idx)
+                decoded_idx += 1
     finally:
         for writer in writers.values():
             writer.release()

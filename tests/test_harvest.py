@@ -14,6 +14,8 @@ from detectivepotty.geometry import BBox
 from detectivepotty.harvest import (
     DogSpan,
     FrameSample,
+    _extract_span_clips,
+    _merge_frame_ranges,
     _scan_for_dogs,
     compute_spans,
     harvest_clips,
@@ -312,6 +314,159 @@ def test_harvest_clips_batched_matches_single_frame_spans(tmp_path: Path) -> Non
     batched = run(FakeBatchDetector(10, 30), detect_batch_size=32)
     assert single == batched
     assert len(single) == 1
+
+
+class _CountingCapture(FakeCapture):
+    """``FakeCapture`` that counts ``read()`` calls that returned a frame."""
+
+    def __init__(self, n_frames: int, *, fps: float = 10.0, size=(64, 48)) -> None:
+        super().__init__(n_frames, fps=fps, size=size)
+        self._n = n_frames
+        self.read_count = 0
+
+    def read(self):
+        ok, frame = super().read()
+        if ok:
+            self.read_count += 1
+        return ok, frame
+
+
+class FakeSeekCapture(_CountingCapture):
+    """Seekable fake: ``set(CAP_PROP_POS_FRAMES, n)`` repositions the reader."""
+
+    def __init__(self, n_frames: int, *, fps: float = 10.0, size=(64, 48)) -> None:
+        super().__init__(n_frames, fps=fps, size=size)
+        self.seeks: list[int] = []
+
+    def set(self, prop: int, value: float) -> bool:  # noqa: N802 - mirror cv2
+        import cv2
+
+        if prop != cv2.CAP_PROP_POS_FRAMES:
+            return False
+        n = int(value)
+        if not (0 <= n <= self._n):
+            return False
+        self.seeks.append(n)
+        self._remaining = deque(range(n, self._n))
+        return True
+
+
+def _span(track_id: str, start: int, end: int, fps: float = 10.0) -> DogSpan:
+    return DogSpan(
+        track_id=track_id,
+        start_frame=start,
+        end_frame=end,
+        start_s=start / fps,
+        end_s=end / fps,
+    )
+
+
+def _plans(tmp_path: Path, spans):
+    out: list[tuple[DogSpan, str, Path]] = []
+    for i, span in enumerate(spans):
+        span_id = f"s{i}"
+        clip_dir = tmp_path / span_id
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        out.append((span, span_id, clip_dir))
+    return out
+
+
+def test_merge_frame_ranges() -> None:
+    # disjoint stays separate; overlapping and adjacent (end+1 == next start) fuse.
+    assert _merge_frame_ranges([(0, 5), (20, 25)]) == [(0, 5), (20, 25)]
+    assert _merge_frame_ranges([(0, 10), (5, 15)]) == [(0, 15)]
+    assert _merge_frame_ranges([(0, 5), (6, 10)]) == [(0, 10)]
+    # unsorted input + a contained range.
+    assert _merge_frame_ranges([(20, 25), (0, 5), (2, 3)]) == [(0, 5), (20, 25)]
+
+
+def test_extract_decodes_only_union(tmp_path: Path) -> None:
+    FakeClipWriter.written = {}
+    spans = [_span("1", 10, 20), _span("2", 50, 60)]  # two disjoint segments
+    plans = _plans(tmp_path, spans)
+    cap = FakeSeekCapture(100)
+
+    _extract_span_clips(
+        tmp_path / "fake.mp4",
+        plans,
+        fps=10.0,
+        capture_factory=lambda _p: cap,
+        clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+    )
+
+    # Only the union of the two ranges is decoded (11 + 11), not all 100 frames.
+    assert cap.read_count == 22
+    assert cap.seeks == [10, 50]
+    assert FakeClipWriter.written["s0"] == 11  # frames 10..20 inclusive
+    assert FakeClipWriter.written["s1"] == 11  # frames 50..60 inclusive
+
+
+def test_extract_overlapping_spans_share_one_segment(tmp_path: Path) -> None:
+    FakeClipWriter.written = {}
+    spans = [_span("1", 10, 30), _span("2", 20, 40)]  # overlap -> one segment
+    plans = _plans(tmp_path, spans)
+    cap = FakeSeekCapture(100)
+
+    _extract_span_clips(
+        tmp_path / "fake.mp4",
+        plans,
+        fps=10.0,
+        capture_factory=lambda _p: cap,
+        clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+    )
+
+    # Union [10..40] decoded once; each writer still gets only its own frames.
+    assert cap.read_count == 31
+    assert cap.seeks == [10]
+    assert FakeClipWriter.written["s0"] == 21  # 10..30
+    assert FakeClipWriter.written["s1"] == 21  # 20..40
+
+
+def test_extract_sequential_fallback_without_seek(tmp_path: Path) -> None:
+    # A capture without ``set`` decodes the whole file (legacy path) but still
+    # writes exactly each span's frames.
+    FakeClipWriter.written = {}
+    spans = [_span("1", 10, 20)]
+    plans = _plans(tmp_path, spans)
+    cap = _CountingCapture(100)
+    assert not hasattr(cap, "set")
+
+    _extract_span_clips(
+        tmp_path / "fake.mp4",
+        plans,
+        fps=10.0,
+        capture_factory=lambda _p: cap,
+        clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+    )
+
+    assert cap.read_count == 100  # full sequential pass
+    assert FakeClipWriter.written["s0"] == 11
+
+
+def test_harvest_clips_seek_matches_sequential(tmp_path: Path) -> None:
+    def run(capture_cls, sub: str):
+        FakeClipWriter.written = {}
+        results = harvest_clips(
+            tmp_path / "fake.mp4",
+            tmp_path / sub,
+            detector=FakeDetector(present_start=10, present_end=30),
+            sample_every=5,
+            pad_s=0.0,
+            min_len_s=0.0,
+            source_start_utc=datetime(2026, 6, 6, tzinfo=timezone.utc),
+            capture_factory=lambda _p: capture_cls(60, fps=10.0),
+            clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+        )
+        ids = [(r.span_id, r.span.start_frame, r.span.end_frame) for r in results]
+        return ids, dict(FakeClipWriter.written)
+
+    seek_ids, seek_counts = run(FakeSeekCapture, "seek")
+    seq_ids, seq_counts = run(FakeCapture, "seq")
+    assert seek_ids == seq_ids
+    assert seek_counts == seq_counts
+
+
+def test_harvest_clips_writes_span_dir_and_metadata(tmp_path: Path) -> None:
     FakeClipWriter.written = {}
     out_dir = tmp_path / "harvest"
 

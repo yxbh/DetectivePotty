@@ -16,6 +16,7 @@ import cv2
 from fastapi.testclient import TestClient
 import numpy as np
 import pytest
+import yaml
 
 from detectivepotty.config import (
     CameraConfig,
@@ -862,6 +863,114 @@ def test_track_range_ultralytics_unavailable_returns_400(
     )
     assert resp.status_code == 400
     assert "lap" in resp.json()["detail"]
+
+
+def test_track_range_ultralytics_params_drive_track_call_and_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import detectivepotty.web.app as app_mod
+    import ultralytics
+    import ultralytics.utils
+
+    trackers_dir = tmp_path / "ultra" / "cfg" / "trackers"
+    trackers_dir.mkdir(parents=True)
+    base = {
+        "tracker_type": "botsort",
+        "track_high_thresh": 0.25,
+        "track_low_thresh": 0.1,
+        "new_track_thresh": 0.25,
+        "track_buffer": 30,
+        "match_thresh": 0.8,
+        "proximity_thresh": 0.5,
+        "appearance_thresh": 0.25,
+        "with_reid": False,
+    }
+    (trackers_dir / "botsort.yaml").write_text(yaml.safe_dump(base))
+    (trackers_dir / "bytetrack.yaml").write_text(
+        yaml.safe_dump({**base, "tracker_type": "bytetrack"})
+    )
+    captured: dict = {}
+
+    class _Boxes:
+        xyxy = np.array([[10.0, 10.0, 80.0, 90.0]])
+        conf = np.array([0.7])
+        id = np.array([3])
+
+    class _Result:
+        boxes = _Boxes()
+
+    class _FakeYOLO:
+        names = {16: "dog"}
+
+        def __init__(self, model_name: str) -> None:
+            captured["model_name"] = model_name
+
+        def track(self, frame, **kwargs):  # noqa: ANN001
+            del frame
+            captured["conf"] = kwargs["conf"]
+            captured["classes"] = kwargs["classes"]
+            captured["tracker_yaml"] = yaml.safe_load(Path(kwargs["tracker"]).read_text())
+            return [_Result()]
+
+    monkeypatch.setattr(app_mod, "_ultralytics_tracking_available", lambda: True)
+    monkeypatch.setattr(ultralytics, "YOLO", _FakeYOLO)
+    monkeypatch.setattr(ultralytics.utils, "ROOT", tmp_path / "ultra")
+
+    clip = write_clip(tmp_path / "c.mp4", frames=3)
+    client = make_client(tmp_path, clip)
+    params = {
+        "path": str(clip),
+        "count": 3,
+        "tracker": "botsort_reid",
+        "sample_every": 1,
+        "ultra_conf": 0.12,
+        "track_high_thresh": 0.34,
+        "track_low_thresh": 0.05,
+        "new_track_thresh": 0.29,
+        "track_buffer": 12,
+        "match_thresh": 0.67,
+        "proximity_thresh": 0.44,
+        "appearance_thresh": 0.22,
+    }
+    resp = client.get("/api/tune/track_range", params=params)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert captured["model_name"] == "models/yolo11m.pt"
+    assert captured["conf"] == pytest.approx(0.12)
+    assert captured["classes"] == [16]
+    written = captured["tracker_yaml"]
+    assert written["track_high_thresh"] == pytest.approx(0.34)
+    assert written["track_low_thresh"] == pytest.approx(0.05)
+    assert written["new_track_thresh"] == pytest.approx(0.29)
+    assert written["track_buffer"] == 12
+    assert written["match_thresh"] == pytest.approx(0.67)
+    assert written["proximity_thresh"] == pytest.approx(0.44)
+    assert written["appearance_thresh"] == pytest.approx(0.22)
+    assert written["with_reid"] is True
+    assert body["detection_floor"] == pytest.approx(0.12)
+    assert body["stats"]["ultralytics"]["conf"] == pytest.approx(0.12)
+    assert body["stats"]["ultralytics"]["with_reid"] is True
+
+    stream = client.get("/api/tune/track_range_stream", params=params)
+    assert stream.status_code == 200, stream.text
+    done = _read_ndjson(stream)[-1]
+    assert done["type"] == "done"
+    assert done["detection_floor"] == pytest.approx(body["detection_floor"])
+    assert done["stats"]["ultralytics"] == body["stats"]["ultralytics"]
+
+
+def test_track_range_ultralytics_param_validation(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    params = {
+        "path": str(clip),
+        "count": 4,
+        "tracker": "bytetrack",
+        "ultra_conf": 1.5,
+    }
+    assert client.get("/api/tune/track_range", params=params).status_code == 422
+    assert client.get("/api/tune/track_range_stream", params=params).status_code == 422
 
 
 # --- track_range_stream (NDJSON forward-fill) -----------------------------

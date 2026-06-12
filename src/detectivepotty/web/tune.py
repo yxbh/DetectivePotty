@@ -678,6 +678,7 @@ def summarize_tracked_frames(
         "iou_threshold": iou_threshold,
         "max_age_frames": max_age_frames,
         "center_dist_gate": center_dist_gate,
+        "ultralytics": None,
     }
 
 

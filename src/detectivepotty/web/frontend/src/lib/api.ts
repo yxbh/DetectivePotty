@@ -17,6 +17,7 @@ import type {
   TunePoseRangeResult,
   TuneSceneResult,
   TuneTracker,
+  TuneTrackRequestParams,
   TuneTrackRangeResult,
   TuneTrackStreamDone,
   TuneTrackedFrame,
@@ -224,24 +225,30 @@ export async function fetchTuneDetectRange(
   return jsonOrThrow<TuneDetectRangeResult>(response);
 }
 
+function addTrackParams(query: URLSearchParams, params: TuneTrackRequestParams): void {
+  query.set("sample_every", String(params.sampleEvery));
+  query.set("iou_threshold", String(params.iouThreshold));
+  query.set("max_age_frames", String(params.maxAgeFrames));
+  query.set("center_dist_gate", String(params.centerDistGate));
+  query.set("ultra_conf", String(params.ultralytics.conf));
+  for (const [key, value] of Object.entries(params.ultralytics)) {
+    if (key === "conf" || key === "with_reid" || value === null) continue;
+    query.set(key, String(value));
+  }
+}
+
 /** Track a `[start, start+count)` range with the chosen tracker (the "Track range"
- *  action). Decodes in frame order, detects the sampled frames, and replays through
- *  the harvest IoU `Tracker` with the supplied knobs — returning persistent
- *  per-frame track-ID boxes + de-fragmentation stats (distinct tracks,
- *  spans-per-presence-window). Works with every model including CoreML. The backend
- *  caps `count` at `TUNE_TRACK_MAX_FRAMES`. */
+ *  action). The request always decodes in frame order; `ours` replays YOLO boxes
+ *  through the harvest IoU tracker, while Ultralytics backends call `YOLO.track`
+ *  with per-run detector/tracker knobs. The backend caps `count` at
+ *  `TUNE_TRACK_MAX_FRAMES`. */
 export async function fetchTuneTrackRange(
   path: string,
   start: number,
   count: number,
   model: string,
   tracker: TuneTracker,
-  params: {
-    sampleEvery: number;
-    iouThreshold: number;
-    maxAgeFrames: number;
-    centerDistGate: number;
-  },
+  params: TuneTrackRequestParams,
   signal?: AbortSignal,
 ): Promise<TuneTrackRangeResult> {
   const query = new URLSearchParams({
@@ -250,11 +257,8 @@ export async function fetchTuneTrackRange(
     count: String(count),
     model,
     tracker,
-    sample_every: String(params.sampleEvery),
-    iou_threshold: String(params.iouThreshold),
-    max_age_frames: String(params.maxAgeFrames),
-    center_dist_gate: String(params.centerDistGate),
   });
+  addTrackParams(query, params);
   const response = await fetch(`/api/tune/track_range?${query.toString()}`, { signal });
   return jsonOrThrow<TuneTrackRangeResult>(response);
 }
@@ -270,12 +274,7 @@ export async function streamTuneTrackRange(
   count: number,
   model: string,
   tracker: TuneTracker,
-  params: {
-    sampleEvery: number;
-    iouThreshold: number;
-    maxAgeFrames: number;
-    centerDistGate: number;
-  },
+  params: TuneTrackRequestParams,
   handlers: {
     onFrames: (frames: TuneTrackedFrame[]) => void;
     onDone: (done: TuneTrackStreamDone) => void;
@@ -289,11 +288,8 @@ export async function streamTuneTrackRange(
     count: String(count),
     model,
     tracker,
-    sample_every: String(params.sampleEvery),
-    iou_threshold: String(params.iouThreshold),
-    max_age_frames: String(params.maxAgeFrames),
-    center_dist_gate: String(params.centerDistGate),
   });
+  addTrackParams(query, params);
   const response = await fetch(`/api/tune/track_range_stream?${query.toString()}`, {
     signal,
   });

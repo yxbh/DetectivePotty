@@ -22,6 +22,7 @@
     TuneTracker,
     TuneTrackStats,
     TuneTrackedDetection,
+    TuneUltralyticsTrackerParams,
   } from "./types";
   import Transport from "./Transport.svelte";
   import {
@@ -64,6 +65,13 @@
   const URGENT_WINDOW = 30;
   // The floor the slider can't go below (overwritten by the first detect result).
   const DEFAULT_FLOOR = 0.05;
+  const ULTRA_TRACK_HIGH_DEFAULT = 0.25;
+  const ULTRA_TRACK_LOW_DEFAULT = 0.1;
+  const ULTRA_NEW_TRACK_DEFAULT = 0.25;
+  const ULTRA_TRACK_BUFFER_DEFAULT = 30;
+  const ULTRA_MATCH_DEFAULT = 0.8;
+  const ULTRA_PROXIMITY_DEFAULT = 0.5;
+  const ULTRA_APPEARANCE_DEFAULT = 0.25;
 
   // Skeleton edges by raw DeepLabCut keypoint name. Drawn only when both
   // endpoints are present, so the mock (a torso+paws subset) and the full
@@ -189,6 +197,14 @@
   let trackIou = $state(0.3);
   let trackMaxAge = $state(15);
   let trackCenterGate = $state(1.5);
+  let ultraConf = $state(DEFAULT_FLOOR);
+  let ultraTrackHigh = $state(ULTRA_TRACK_HIGH_DEFAULT);
+  let ultraTrackLow = $state(ULTRA_TRACK_LOW_DEFAULT);
+  let ultraNewTrack = $state(ULTRA_NEW_TRACK_DEFAULT);
+  let ultraTrackBuffer = $state(ULTRA_TRACK_BUFFER_DEFAULT);
+  let ultraMatch = $state(ULTRA_MATCH_DEFAULT);
+  let ultraProximity = $state(ULTRA_PROXIMITY_DEFAULT);
+  let ultraAppearance = $state(ULTRA_APPEARANCE_DEFAULT);
   let tracking = $state(false);
   let trackError = $state<string | null>(null);
   let trackStats = $state<TuneTrackStats | null>(null);
@@ -228,8 +244,7 @@
   const SCENE_TOP_N = 8;
 
   const trackingActive = $derived(tracker !== "off" && tracked);
-  // Ultralytics backends are .pt-only and not yet wired (tune-track-ultra);
-  // offer them disabled so the picker shows the roadmap.
+  // Ultralytics native trackers are .pt-only; CoreML packages use `ours`.
   const isMlpackage = $derived(selectedModel.endsWith(".mlpackage"));
 
   // Async overlay buffer: detections (+pose) per frame index, each tagged with the
@@ -879,9 +894,55 @@
   function setTracker(value: TuneTracker): void {
     if (value === tracker) return;
     tracker = value;
-    // Switching to "off" just stops drawing tracked boxes; switching to a real
-    // tracker shows the last pass if one exists, else waits for "Track range".
+    // Track IDs are backend-specific; switching tracker invalidates the cache.
+    clearTracks();
     syncTracks();
+  }
+
+  function isUltralyticsTracker(value: TuneTracker = tracker): boolean {
+    return value === "bytetrack" || value === "botsort" || value === "botsort_reid";
+  }
+
+  function isBotsortTracker(value: TuneTracker = tracker): boolean {
+    return value === "botsort" || value === "botsort_reid";
+  }
+
+  function ultralyticsParams(): TuneUltralyticsTrackerParams {
+    return {
+      conf: clamp(ultraConf, 0, 1),
+      track_high_thresh: clamp(ultraTrackHigh, 0, 1),
+      track_low_thresh: clamp(ultraTrackLow, 0, 1),
+      new_track_thresh: clamp(ultraNewTrack, 0, 1),
+      track_buffer: Math.max(0, Math.round(ultraTrackBuffer)),
+      match_thresh: clamp(ultraMatch, 0, 1),
+      proximity_thresh: isBotsortTracker() ? clamp(ultraProximity, 0, 1) : null,
+      appearance_thresh: isBotsortTracker() ? clamp(ultraAppearance, 0, 1) : null,
+      with_reid: tracker === "botsort_reid",
+    };
+  }
+
+  function invalidateButtonDrivenTrack(): void {
+    if (!isUltralyticsTracker()) return;
+    clearTracks();
+    syncTracks();
+  }
+
+  function trackStatsTitle(stats: TuneTrackStats): string {
+    const base =
+      "Distinct track IDs · harvest spans · merged presence windows · spans-per-window (the de-fragmentation metric)";
+    if (!stats.ultralytics) return base;
+    const u = stats.ultralytics;
+    const parts = [
+      `det-conf ${u.conf.toFixed(2)}`,
+      u.track_high_thresh === null ? null : `high ${u.track_high_thresh.toFixed(2)}`,
+      u.track_low_thresh === null ? null : `low ${u.track_low_thresh.toFixed(2)}`,
+      u.new_track_thresh === null ? null : `new ${u.new_track_thresh.toFixed(2)}`,
+      u.track_buffer === null ? null : `buffer ${u.track_buffer}`,
+      u.match_thresh === null ? null : `match ${u.match_thresh.toFixed(2)}`,
+      u.proximity_thresh === null ? null : `prox ${u.proximity_thresh.toFixed(2)}`,
+      u.appearance_thresh === null ? null : `appear ${u.appearance_thresh.toFixed(2)}`,
+    ].filter(Boolean);
+    return `${base} · ${parts.join(" · ")}`;
   }
 
   // Run a stateful track pass over the whole clip (server caps the range) and
@@ -923,6 +984,7 @@
           iouThreshold: trackIou,
           maxAgeFrames: trackMaxAge,
           centerDistGate: trackCenterGate,
+          ultralytics: ultralyticsParams(),
         },
         {
           onFrames: (frames) => {
@@ -2070,27 +2132,131 @@
             </select>
           </label>
 
-          {#if tracker === "ours"}
+          {#if tracker !== "off"}
             <div class="track-knobs mono small">
-              <label title="Sample every N frames (matches the harvest scan stride)">
+              <label title="Sample every N source frames before tracking. Affects both Ours and Ultralytics; changing it requires a new track pass.">
                 stride
-                <input type="number" min="1" max="60" step="1" bind:value={trackSampleEvery} />
+                <input
+                  type="number"
+                  min="1"
+                  max="60"
+                  step="1"
+                  bind:value={trackSampleEvery}
+                  oninput={invalidateButtonDrivenTrack}
+                />
               </label>
-              <label title="IoU association threshold">
-                iou
-                <input type="number" min="0" max="1" step="0.05" bind:value={trackIou} />
-              </label>
-              <label title="Frames an unmatched track survives before it dies">
-                max-age
-                <input type="number" min="0" max="300" step="1" bind:value={trackMaxAge} />
-              </label>
-              <label title="Center-distance OR-gate, in box diagonals (0 = IoU only)">
-                gate
-                <input type="number" min="0" max="20" step="0.1" bind:value={trackCenterGate} />
-              </label>
+              {#if tracker === "ours"}
+                <label title="Minimum box overlap to associate a detection with an existing Ours track. Lower joins more jumps; higher splits more tracks.">
+                  iou
+                  <input type="number" min="0" max="1" step="0.05" bind:value={trackIou} />
+                </label>
+                <label title="Sampled frames an unmatched Ours track survives before it dies. Higher bridges longer gaps.">
+                  max-age
+                  <input type="number" min="0" max="300" step="1" bind:value={trackMaxAge} />
+                </label>
+                <label title="Center-distance OR-gate in box diagonals for Ours. 0 means IoU-only; higher reconnects larger jumps.">
+                  gate
+                  <input type="number" min="0" max="20" step="0.1" bind:value={trackCenterGate} />
+                </label>
+              {:else if isUltralyticsTracker() && !isMlpackage}
+                <label title="YOLO confidence floor passed to Ultralytics model.track(). Lower can expose more detections to the tracker; requires Re-track range.">
+                  det-conf
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    bind:value={ultraConf}
+                    oninput={invalidateButtonDrivenTrack}
+                  />
+                </label>
+                <label title="Ultralytics track_high_thresh: high-confidence detections used for the primary association pass.">
+                  track-high
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    bind:value={ultraTrackHigh}
+                    oninput={invalidateButtonDrivenTrack}
+                  />
+                </label>
+                <label title="Ultralytics track_low_thresh: lower-confidence detections still eligible for secondary association.">
+                  track-low
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    bind:value={ultraTrackLow}
+                    oninput={invalidateButtonDrivenTrack}
+                  />
+                </label>
+                <label title="Ultralytics new_track_thresh: minimum confidence required to start a new track ID.">
+                  new-track
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    bind:value={ultraNewTrack}
+                    oninput={invalidateButtonDrivenTrack}
+                  />
+                </label>
+                <label title="Ultralytics track_buffer: sampled frames an unmatched track stays alive before removal.">
+                  buffer
+                  <input
+                    type="number"
+                    min="0"
+                    max="10000"
+                    step="1"
+                    bind:value={ultraTrackBuffer}
+                    oninput={invalidateButtonDrivenTrack}
+                  />
+                </label>
+                <label title="Ultralytics match_thresh: association matching threshold. Higher is stricter; lower can bridge more uncertain matches.">
+                  match
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    bind:value={ultraMatch}
+                    oninput={invalidateButtonDrivenTrack}
+                  />
+                </label>
+                {#if isBotsortTracker()}
+                  <label title="BoT-SORT proximity_thresh: spatial proximity gate before appearance matching. Lower is more permissive.">
+                    prox
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      bind:value={ultraProximity}
+                      oninput={invalidateButtonDrivenTrack}
+                    />
+                  </label>
+                  <label title="BoT-SORT appearance_thresh: appearance/ReID similarity threshold. Higher requires stronger visual match.">
+                    appear
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      bind:value={ultraAppearance}
+                      oninput={invalidateButtonDrivenTrack}
+                    />
+                  </label>
+                {/if}
+              {/if}
             </div>
-          {:else if tracker !== "off" && !isMlpackage}
-            <span class="track-note mono small muted">Ultralytics defaults</span>
+          {/if}
+
+          {#if isUltralyticsTracker() && !isMlpackage}
+            <span class="track-note mono small muted">
+              Overrides Ultralytics YAML for this run · press Track range
+            </span>
           {/if}
 
           {#if tracker !== "off"}
@@ -2131,9 +2297,12 @@
           {#if trackStats}
             <div
               class="track-stats mono small"
-              title="Distinct track IDs · harvest spans · merged presence windows · spans-per-window (the de-fragmentation metric)"
+              title={trackStatsTitle(trackStats)}
             >
               <span class="hud-yolo">{trackStats.tracker}</span>
+              {#if trackStats.ultralytics}
+                <span>conf {trackStats.ultralytics.conf.toFixed(2)}</span>
+              {/if}
               <span>tracks {trackStats.n_tracks}</span>
               <span>spans {trackStats.n_spans}</span>
               <span>windows {trackStats.n_presence_windows}</span>
@@ -2662,6 +2831,7 @@
 
   .track-knobs {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.55rem;
   }
@@ -2715,7 +2885,7 @@
   }
 
   .track-note {
-    max-width: 28ch;
+    max-width: 34ch;
   }
 
   .track-stats {

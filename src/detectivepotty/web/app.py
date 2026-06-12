@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -19,6 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
+import yaml
 
 from detectivepotty.config import Config, load_config
 from detectivepotty.events import Label, LabelStatus
@@ -111,6 +113,62 @@ TUNE_TRACKERS = ("off", "ours", "bytetrack", "botsort", "botsort_reid")
 _ULTRALYTICS_TRACKERS = ("bytetrack", "botsort", "botsort_reid")
 
 
+@dataclass(frozen=True, slots=True)
+class TuneUltralyticsTrackerParams:
+    """Per-run Ultralytics tracking knobs exposed by the Tune UI.
+
+    ``conf`` is passed to ``YOLO.track``. The other fields are optional overrides
+    for the bundled ByteTrack/BoT-SORT YAML; ``None`` means keep the YAML default.
+    """
+
+    conf: float = TUNE_DETECTION_FLOOR
+    track_high_thresh: float | None = None
+    track_low_thresh: float | None = None
+    new_track_thresh: float | None = None
+    track_buffer: int | None = None
+    match_thresh: float | None = None
+    proximity_thresh: float | None = None
+    appearance_thresh: float | None = None
+
+    def yaml_overrides(self, tracker: str) -> dict[str, float | int | bool]:
+        overrides: dict[str, float | int | bool] = {}
+        for key in (
+            "track_high_thresh",
+            "track_low_thresh",
+            "new_track_thresh",
+            "track_buffer",
+            "match_thresh",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                overrides[key] = value
+        if tracker in ("botsort", "botsort_reid"):
+            for key in ("proximity_thresh", "appearance_thresh"):
+                value = getattr(self, key)
+                if value is not None:
+                    overrides[key] = value
+        if tracker == "botsort_reid":
+            overrides["with_reid"] = True
+        return overrides
+
+    def payload(self, tracker: str) -> dict[str, float | int | bool | None]:
+        return {
+            "conf": self.conf,
+            "track_high_thresh": self.track_high_thresh,
+            "track_low_thresh": self.track_low_thresh,
+            "new_track_thresh": self.new_track_thresh,
+            "track_buffer": self.track_buffer,
+            "match_thresh": self.match_thresh,
+            "proximity_thresh": (
+                self.proximity_thresh if tracker in ("botsort", "botsort_reid") else None
+            ),
+            "appearance_thresh": (
+                self.appearance_thresh if tracker in ("botsort", "botsort_reid") else None
+            ),
+            "with_reid": tracker == "botsort_reid",
+        }
+
+
 def _ultralytics_tracking_available() -> bool:
     """True when Ultralytics native tracking can run (its ``lap`` dep imports).
 
@@ -141,6 +199,38 @@ def _ultralytics_dog_class_indices(
     else:  # pragma: no cover - list-style names are rare
         idxs = [i for i, n in enumerate(names) if str(n).lower() in accepted]
     return idxs or [16]
+
+
+def _ultralytics_tracker_yaml(
+    trackers_dir: Path,
+    tracker: str,
+    params: TuneUltralyticsTrackerParams,
+) -> tuple[str, Path | None]:
+    """Return ``(tracker_yaml, temp_dir)`` for one Ultralytics tracking request."""
+
+    if tracker == "bytetrack":
+        base_yaml = trackers_dir / "bytetrack.yaml"
+    elif tracker in ("botsort", "botsort_reid"):
+        base_yaml = trackers_dir / "botsort.yaml"
+    else:  # pragma: no cover - guarded by endpoints
+        raise ValueError(f"unknown ultralytics tracker: {tracker}")
+
+    overrides = params.yaml_overrides(tracker)
+    if not overrides:
+        return str(base_yaml), None
+
+    with base_yaml.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"invalid tracker yaml: {base_yaml}")
+    data.update(overrides)
+
+    import tempfile
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="dp_tracker_"))
+    out = tmp_dir / f"{tracker}.yaml"
+    out.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return str(out), tmp_dir
 
 
 def _ultralytics_boxes(result: object) -> list[dict]:
@@ -880,6 +970,7 @@ def create_app(
         *,
         tracker: str,
         sample_every: int,
+        ultra_params: TuneUltralyticsTrackerParams,
     ):
         """Streaming generator core of the ``.pt``-only Ultralytics tracker backend.
 
@@ -895,8 +986,6 @@ def create_app(
         reproduces ``_track_range_ultralytics_payload``. ``count`` is pre-clamped by the
         caller.
         """
-
-        import tempfile
 
         from detectivepotty.device import resolve_device
         from detectivepotty.web import tune as tune_mod
@@ -917,25 +1006,15 @@ def create_app(
         decode_cap = max(1, app.state.config.global_settings.tune_detection_batch_size)
         stride = max(1, sample_every)
 
-        # Resolve the tracker yaml. bytetrack/botsort ship with Ultralytics; the ReID
-        # variant is botsort.yaml with `with_reid: True` written to a temp file.
+        # Resolve the tracker yaml. bytetrack/botsort ship with Ultralytics; when
+        # the UI overrides any thresholds (or asks for ReID) we copy the bundled
+        # yaml to a temp file and patch only those keys for this request.
         from ultralytics.utils import ROOT as _ULTRA_ROOT
 
         trackers_dir = Path(_ULTRA_ROOT) / "cfg" / "trackers"
-        tmp_yaml: Path | None = None
-        if tracker == "bytetrack":
-            tracker_yaml = str(trackers_dir / "bytetrack.yaml")
-        elif tracker == "botsort":
-            tracker_yaml = str(trackers_dir / "botsort.yaml")
-        elif tracker == "botsort_reid":
-            base = (trackers_dir / "botsort.yaml").read_text()
-            base = base.replace("with_reid: False", "with_reid: True")
-            tmp = Path(tempfile.mkdtemp(prefix="dp_reid_")) / "botsort_reid.yaml"
-            tmp.write_text(base)
-            tmp_yaml = tmp
-            tracker_yaml = str(tmp)
-        else:  # pragma: no cover - guarded by the endpoint
-            raise ValueError(f"unknown ultralytics tracker: {tracker}")
+        tracker_yaml, tmp_dir = _ultralytics_tracker_yaml(
+            trackers_dir, tracker, ultra_params
+        )
 
         out_frames: list[dict] = []
         fps = 0.0
@@ -967,7 +1046,7 @@ def create_app(
                             classes=dog_idxs,
                             imgsz=long_edge,
                             device=device,
-                            conf=TUNE_DETECTION_FLOOR,
+                            conf=ultra_params.conf,
                             verbose=False,
                         )[0]
                         record = {
@@ -983,10 +1062,10 @@ def create_app(
                         break
                     cursor = last_decoded + 1
         finally:
-            if tmp_yaml is not None:
+            if tmp_dir is not None:
                 import shutil
 
-                shutil.rmtree(tmp_yaml.parent, ignore_errors=True)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         stats = tune_mod.summarize_tracked_frames(
             out_frames,
@@ -995,6 +1074,7 @@ def create_app(
             sample_every=stride,
             tracker=tracker,
         )
+        stats["ultralytics"] = ultra_params.payload(tracker)
         yield {
             "type": "done",
             "model": model_name,
@@ -1002,7 +1082,7 @@ def create_app(
             "count": count,
             "fps": fps,
             "total_frames": total or None,
-            "detection_floor": TUNE_DETECTION_FLOOR,
+            "detection_floor": ultra_params.conf,
             "stats": stats,
         }
 
@@ -1014,6 +1094,7 @@ def create_app(
         *,
         tracker: str,
         sample_every: int,
+        ultra_params: TuneUltralyticsTrackerParams,
     ) -> dict:
         """Non-streaming Ultralytics Track-range payload (drains the generator)."""
 
@@ -1026,6 +1107,7 @@ def create_app(
             model_name,
             tracker=tracker,
             sample_every=sample_every,
+            ultra_params=ultra_params,
         ):
             if rec["type"] == "frames":
                 frames.extend(rec["frames"])
@@ -1037,7 +1119,7 @@ def create_app(
             "count": count,
             "fps": done.get("fps", 0.0),
             "total_frames": done.get("total_frames"),
-            "detection_floor": TUNE_DETECTION_FLOOR,
+            "detection_floor": done.get("detection_floor", TUNE_DETECTION_FLOOR),
             "frames": frames,
             "stats": done.get("stats", {}),
         }
@@ -1355,6 +1437,14 @@ def create_app(
         iou_threshold: Annotated[float, Query(ge=0.0, le=1.0)] = 0.3,
         max_age_frames: Annotated[int, Query(ge=0, le=300)] = 15,
         center_dist_gate: Annotated[float, Query(ge=0.0, le=20.0)] = 1.5,
+        ultra_conf: Annotated[float, Query(ge=0.0, le=1.0)] = TUNE_DETECTION_FLOOR,
+        track_high_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        track_low_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        new_track_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        track_buffer: Annotated[int | None, Query(ge=0, le=10000)] = None,
+        match_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        proximity_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        appearance_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
     ) -> dict:
         """Track a ``[start, start+count)`` range with the chosen tracker backend.
 
@@ -1378,6 +1468,16 @@ def create_app(
             raise HTTPException(status_code=400, detail="invalid path") from exc
         model_name = _resolve_tune_model(model)
         bounded = min(count, TUNE_TRACK_MAX_FRAMES)
+        ultra_params = TuneUltralyticsTrackerParams(
+            conf=ultra_conf,
+            track_high_thresh=track_high_thresh,
+            track_low_thresh=track_low_thresh,
+            new_track_thresh=new_track_thresh,
+            track_buffer=track_buffer,
+            match_thresh=match_thresh,
+            proximity_thresh=proximity_thresh,
+            appearance_thresh=appearance_thresh,
+        )
 
         if tracker in _ULTRALYTICS_TRACKERS:
             if not model_name.endswith(".pt"):
@@ -1399,6 +1499,7 @@ def create_app(
                     model_name,
                     tracker=tracker,
                     sample_every=sample_every,
+                    ultra_params=ultra_params,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1433,6 +1534,14 @@ def create_app(
         iou_threshold: Annotated[float, Query(ge=0.0, le=1.0)] = 0.3,
         max_age_frames: Annotated[int, Query(ge=0, le=300)] = 15,
         center_dist_gate: Annotated[float, Query(ge=0.0, le=20.0)] = 1.5,
+        ultra_conf: Annotated[float, Query(ge=0.0, le=1.0)] = TUNE_DETECTION_FLOOR,
+        track_high_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        track_low_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        new_track_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        track_buffer: Annotated[int | None, Query(ge=0, le=10000)] = None,
+        match_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        proximity_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+        appearance_thresh: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
     ) -> StreamingResponse:
         """Stream a Track-range pass as newline-delimited JSON (forward-fill + progress).
 
@@ -1458,6 +1567,16 @@ def create_app(
             raise HTTPException(status_code=400, detail="invalid path") from exc
         model_name = _resolve_tune_model(model)
         bounded = min(count, TUNE_TRACK_MAX_FRAMES)
+        ultra_params = TuneUltralyticsTrackerParams(
+            conf=ultra_conf,
+            track_high_thresh=track_high_thresh,
+            track_low_thresh=track_low_thresh,
+            new_track_thresh=new_track_thresh,
+            track_buffer=track_buffer,
+            match_thresh=match_thresh,
+            proximity_thresh=proximity_thresh,
+            appearance_thresh=appearance_thresh,
+        )
 
         if tracker in _ULTRALYTICS_TRACKERS:
             if not model_name.endswith(".pt"):
@@ -1477,6 +1596,7 @@ def create_app(
                 model_name,
                 tracker=tracker,
                 sample_every=sample_every,
+                ultra_params=ultra_params,
             )
         else:
             gen = _iter_track_range(

@@ -243,6 +243,8 @@ export interface TuneTrackStats {
   iou_threshold: number | null;
   max_age_frames: number | null;
   center_dist_gate: number | null;
+  /** Ultralytics tracker knobs used for this run; `null` for the `ours` backend. */
+  ultralytics: TuneUltralyticsTrackerParams | null;
 }
 
 /** Result of tracking a `[start, start+count)` range with a chosen tracker. */
@@ -280,6 +282,28 @@ export interface TuneTrackerParams {
   iou_threshold: number;
   max_age_frames: number;
   center_dist_gate: number;
+}
+
+/** Per-run Ultralytics tracking knobs. `null` threshold fields keep YAML defaults. */
+export interface TuneUltralyticsTrackerParams {
+  conf: number;
+  track_high_thresh: number | null;
+  track_low_thresh: number | null;
+  new_track_thresh: number | null;
+  track_buffer: number | null;
+  match_thresh: number | null;
+  proximity_thresh: number | null;
+  appearance_thresh: number | null;
+  with_reid: boolean;
+}
+
+/** Client-side Track range request params, shared by streaming and non-streaming APIs. */
+export interface TuneTrackRequestParams {
+  sampleEvery: number;
+  iouThreshold: number;
+  maxAgeFrames: number;
+  centerDistGate: number;
+  ultralytics: TuneUltralyticsTrackerParams;
 }
 
 // --- Range labeling (/label) ---------------------------------------------

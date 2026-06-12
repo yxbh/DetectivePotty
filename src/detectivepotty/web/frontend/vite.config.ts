@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createConnection } from "node:net";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
@@ -11,6 +12,10 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 const API_HOST = "127.0.0.1";
 const API_PORT = 8000;
 const API_TARGET = `http://${API_HOST}:${API_PORT}`;
+const STREAM_PROBE_TIMEOUT_MS = 2000;
+const BACKEND_SHUTDOWN_GRACE_MS = 10_000;
+const FRONTEND_CONNECTION_DRAIN_MS = 100;
+const execFileAsync = promisify(execFile);
 
 // vite.config.ts lives at src/detectivepotty/web/frontend/, so the repo root
 // (where config.yaml and `uv` live) is four levels up.
@@ -44,15 +49,108 @@ async function waitForApi(timeoutMs: number, child: ChildProcess): Promise<boole
   return false;
 }
 
-// Defense-in-depth against silently reusing a backend started before a route
-// existed: a stale `serve` (no --reload) keeps whatever app.py looked like when
-// it launched, so it can be missing /api/stream and leave the Live feed stuck on
-// "reconnecting". We can't safely kill a process we didn't start, so we just warn
-// loudly. Returns "ok" when /api/stream serves SSE, "stale" when it's missing/wrong,
-// "unknown" when the probe itself failed.
-async function probeStreamContract(): Promise<"ok" | "stale" | "unknown"> {
+async function waitForPortFree(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await probePort(API_HOST, API_PORT))) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return false;
+}
+
+async function listenerPids(): Promise<number[]> {
   try {
-    const controller = new AbortController();
+    const { stdout } = await execFileAsync("lsof", [
+      "-nP",
+      `-iTCP:${API_PORT}`,
+      "-sTCP:LISTEN",
+      "-t",
+    ]);
+    return [...new Set(stdout.split(/\s+/).map(Number).filter(Number.isFinite))];
+  } catch {
+    return [];
+  }
+}
+
+async function psField(pid: number, field: "command" | "pgid"): Promise<string> {
+  const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", `${field}=`]);
+  return stdout.trim();
+}
+
+function isDevServeCommand(command: string): boolean {
+  return (
+    command.includes("detectivepotty serve") &&
+    command.includes("--reload") &&
+    command.includes("--config") &&
+    command.includes(CONFIG)
+  );
+}
+
+async function stopUnhealthyDevBackend(log: { warn: (message: string) => void }): Promise<boolean> {
+  for (const pid of await listenerPids()) {
+    let command = "";
+    let pgid = pid;
+    try {
+      command = await psField(pid, "command");
+      pgid = Number.parseInt(await psField(pid, "pgid"), 10) || pid;
+    } catch {
+      continue;
+    }
+    if (!isDevServeCommand(command)) {
+      continue;
+    }
+    log.warn(
+      `[backend] stopping unhealthy auto-started backend on ${API_TARGET} ` +
+        `(pid ${pid}) before launching a fresh one`,
+    );
+    if (!signalProcessGroup(pgid, "SIGTERM")) {
+      return false;
+    }
+    if (await waitForPortFree(5_000)) {
+      return true;
+    }
+    log.warn(
+      `[backend] auto-started backend on ${API_TARGET} ignored SIGTERM; ` +
+        "forcing it to stop before restart",
+    );
+    if (!signalProcessGroup(pgid, "SIGKILL")) {
+      return false;
+    }
+    return await waitForPortFree(5_000);
+  }
+  return false;
+}
+
+function unhealthyBackendMessage(): string {
+  return (
+    `[backend] ${API_TARGET} is occupied by an unhealthy process that could not ` +
+    "be restarted automatically. Stop it manually, then re-run `npm run dev`."
+  );
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    try {
+      process.kill(pid, signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// Defense-in-depth against silently reusing an unhealthy backend. Returns "ok"
+// when /api/stream serves SSE, "stale" when it's missing/wrong, and "unknown"
+// when the probe itself failed.
+async function probeStreamContract(): Promise<"ok" | "stale" | "unknown"> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), STREAM_PROBE_TIMEOUT_MS);
+  try {
     const res = await fetch(`${API_TARGET}/api/stream`, { signal: controller.signal });
     const ctype = res.headers.get("content-type") ?? "";
     controller.abort();
@@ -60,6 +158,8 @@ async function probeStreamContract(): Promise<"ok" | "stale" | "unknown"> {
     return ctype.includes("text/event-stream") ? "ok" : "stale";
   } catch {
     return "unknown";
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -82,15 +182,22 @@ function backendAutostart(): Plugin {
         const contract = await probeStreamContract();
         if (contract === "stale") {
           log.warn(
-            `[backend] reusing API at ${API_TARGET}, but it is missing /api/stream — ` +
+            `[backend] API at ${API_TARGET} is missing /api/stream — ` +
               "this is likely a stale backend started before the live-stream route existed. " +
-              "Stop it and re-run `npm run dev` (it now starts the backend with --reload) so " +
-              "the Live feed can connect.",
+              "Trying to restart the auto-started dev backend.",
+          );
+        } else if (contract === "unknown") {
+          log.warn(
+            `[backend] API at ${API_TARGET} did not answer the startup probe quickly. ` +
+              "Trying to restart the auto-started dev backend.",
           );
         } else {
           log.info(`[backend] reusing API already running at ${API_TARGET}`);
+          return;
         }
-        return;
+        if (!(await stopUnhealthyDevBackend(log))) {
+          throw new Error(unhealthyBackendMessage());
+        }
       }
 
       log.info(`[backend] starting API: uv run detectivepotty serve --config ${CONFIG} --reload`);
@@ -116,14 +223,26 @@ function backendAutostart(): Plugin {
         }
       });
 
+      let shutdownStarted = false;
       const shutdown = () => {
-        if (child?.pid && child.exitCode === null) {
-          try {
-            process.kill(-child.pid, "SIGTERM");
-          } catch {
-            child.kill("SIGTERM");
-          }
+        if (shutdownStarted || !child?.pid || child.exitCode !== null) {
+          return;
         }
+        shutdownStarted = true;
+        const pid = child.pid;
+        server.httpServer?.closeAllConnections();
+        setTimeout(() => {
+          signalProcessGroup(pid, "SIGTERM");
+        }, FRONTEND_CONNECTION_DRAIN_MS);
+        setTimeout(() => {
+          if (child?.exitCode === null) {
+            log.warn(
+              `[backend] still shutting down after ${BACKEND_SHUTDOWN_GRACE_MS}ms; ` +
+                "forcing dev backend to exit",
+            );
+            signalProcessGroup(pid, "SIGKILL");
+          }
+        }, BACKEND_SHUTDOWN_GRACE_MS);
       };
       server.httpServer?.once("close", shutdown);
       process.once("SIGINT", shutdown);

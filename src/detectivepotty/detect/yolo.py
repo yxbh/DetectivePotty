@@ -17,6 +17,12 @@ from detectivepotty.geometry import BBox
 
 DOG_CLASS_NAME = "dog"
 
+# A dog box gets this small confidence boost when deciding NMS priority, so a
+# near-equal-confidence "dog" read wins over an alias read covering the same animal
+# (we'd rather keep the box labelled "dog"). It only affects which of two
+# overlapping boxes survives, never the final confidence-sorted output order.
+_DOG_NMS_PRIORITY_EPS = 0.05
+
 logger = logging.getLogger(__name__)
 
 # Process-wide cache of loaded ultralytics models, keyed by (requested model name,
@@ -32,6 +38,66 @@ def clear_model_cache() -> None:
 
     with _MODEL_CACHE_LOCK:
         _MODEL_CACHE.clear()
+
+
+def normalize_alias_classes(classes: Iterable[str]) -> tuple[str, ...]:
+    """Lower-case, de-dupe, and drop blanks/``dog`` from an alias-class list.
+
+    ``dog`` is always accepted, so it is never carried as an "alias"; the returned
+    tuple is the set of *extra* classes to treat as dog candidates, order-stable.
+    """
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in classes:
+        name = raw.strip().lower()
+        if not name or name == DOG_CLASS_NAME or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
+def nms_dog_aliases(
+    detections: Sequence[Detection], iou_threshold: float
+) -> list[Detection]:
+    """Class-agnostic NMS over a ``{dog} ∪ {alias}`` detection list.
+
+    Greedy by confidence descending: keep a box, suppress any later box overlapping
+    it with IoU > ``iou_threshold``. A small priority boost (``_DOG_NMS_PRIORITY_EPS``)
+    is given to ``dog``-class boxes so a near-equal-confidence dog read wins over an
+    alias read of the *same* animal — we'd rather keep it labelled ``dog``. Distinct
+    animals (IoU ≈ 0) are never suppressed, so multiple dogs survive. The returned
+    list is sorted by real confidence descending (the priority boost only governs
+    suppression, not output order). Pure/offline — no model or numpy needed.
+    """
+
+    n = len(detections)
+    if n <= 1:
+        return list(detections)
+
+    def priority(det: Detection) -> float:
+        boost = (
+            _DOG_NMS_PRIORITY_EPS
+            if det.class_name.lower() == DOG_CLASS_NAME
+            else 0.0
+        )
+        return det.confidence + boost
+
+    order = sorted(range(n), key=lambda i: priority(detections[i]), reverse=True)
+    suppressed = [False] * n
+    kept: list[Detection] = []
+    for i in order:
+        if suppressed[i]:
+            continue
+        kept.append(detections[i])
+        for j in order:
+            if j == i or suppressed[j]:
+                continue
+            if detections[i].bbox.iou(detections[j].bbox) > iou_threshold:
+                suppressed[j] = True
+    kept.sort(key=lambda det: det.confidence, reverse=True)
+    return kept
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +158,8 @@ class DogDetector:
         conf_threshold: float = 0.25,
         device: str = "auto",
         use_shared_model: bool = True,
+        alias_classes: Iterable[str] = (),
+        alias_nms_iou: float = 0.65,
     ) -> None:
         if long_edge <= 0:
             raise ValueError("long_edge must be positive")
@@ -100,6 +168,13 @@ class DogDetector:
         self.device = resolve_device(device)
         self.model_name = model_name
         self._use_shared_model = use_shared_model
+        # Extra classes to accept as dog candidates (e.g. "sheep"), normalized to a
+        # de-duped lower-case tuple with "dog" stripped. The accepted set used by the
+        # detector is {dog} ∪ aliases; when there are no aliases the detector behaves
+        # exactly as the legacy dog-only filter (no extra cross-class NMS is applied).
+        self.alias_classes = normalize_alias_classes(alias_classes)
+        self.alias_nms_iou = alias_nms_iou
+        self._accepted_classes = frozenset({DOG_CLASS_NAME, *self.alias_classes})
         self._candidates: tuple[str, ...] = (model_name, "yolov8n.pt")
         self.model = self._acquire_model(self.device)
         self.last_inference: InferenceInfo | None = None
@@ -206,27 +281,29 @@ class DogDetector:
         self,
         frame_bgr_original: np.ndarray,
         top_n: int = 8,
-    ) -> list[tuple[str, float]]:
+    ) -> list[tuple[str, float, BBox]]:
         """Top-``top_n`` detections of **any** class in the frame (diagnostic only).
 
         Unlike :meth:`detect` this does *not* filter to the dog class — it surfaces
         whatever the detector sees (cat, person, etc.) so a reviewer can tell whether
         a "no dog box" frame is an empty scene, a sub-threshold dog, or the animal
         being classified as something else. Runs at the configured confidence floor.
-        Returns ``(class_name, confidence)`` pairs sorted by confidence descending.
-        This is read-only and never touches the detection/harvest pipeline.
+        Returns ``(class_name, confidence, bbox)`` triples sorted by confidence
+        descending, with each box clipped to the original frame so the reviewer can
+        overlay it. This is read-only and never touches the detection/harvest pipeline.
         """
 
         if frame_bgr_original.ndim < 2:
             raise ValueError("frame_bgr_original must be an image array")
 
+        original_h, original_w = frame_bgr_original.shape[:2]
         results = self._predict(frame_bgr_original)
         result = results[0] if len(results) else None
         if result is None:
             return []
         objects = [
-            (class_name, confidence)
-            for _xyxy, confidence, class_name in self._iter_boxes([result])
+            (class_name, confidence, BBox(*xyxy).clip_to(original_w, original_h))
+            for xyxy, confidence, class_name in self._iter_boxes([result])
             if confidence >= self.conf_threshold
         ]
         objects.sort(key=lambda item: item[1], reverse=True)
@@ -269,8 +346,9 @@ class DogDetector:
         detections: list[Detection] = []
         if result is None:
             return detections
+        accepted = self._accepted_classes
         for xyxy, confidence, class_name in self._iter_boxes([result]):
-            if class_name.lower() != DOG_CLASS_NAME:
+            if class_name.lower() not in accepted:
                 continue
             if confidence < self.conf_threshold:
                 continue
@@ -285,7 +363,15 @@ class DogDetector:
                     wall_ts=wall_ts,
                 )
             )
-        return sorted(detections, key=lambda item: item.confidence, reverse=True)
+        # With no aliases the accepted set is dog-only and Ultralytics' per-class NMS
+        # already deduped — keep the legacy "sorted by confidence" behavior untouched.
+        # When aliases are in play, run our own class-agnostic NMS over the
+        # {dog} ∪ {alias} union so duplicate reads of the *same* animal collapse while
+        # distinct dogs survive. The union was filtered first, so background clutter
+        # can never suppress a real dog box.
+        if not self.alias_classes:
+            return sorted(detections, key=lambda item: item.confidence, reverse=True)
+        return nms_dog_aliases(detections, self.alias_nms_iou)
 
     def _record_batch_stats(
         self, n_frames: int, latency_ms: float, batched: bool

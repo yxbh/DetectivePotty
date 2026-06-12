@@ -184,15 +184,20 @@ export interface TuneDetectRangeResult {
   frames: TuneDetectResult[];
 }
 
-/** One top-N "object in scene" row (any class, no dog filter). */
+/** One top-N "object in scene" row (any class, no dog filter) with its box. */
 export interface TuneSceneObject {
   class_name: string;
   confidence: number;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
 }
 
 /** Top-N all-class detections for one frame (`GET /api/tune/scene`) — the
- *  diagnostic "objects in scene" list. No boxes are drawn; this just tells the
- *  reviewer what the detector sees on a frame, including non-dog classes. */
+ *  diagnostic "objects in scene" list. Each object carries its original-frame box
+ *  so the client can optionally overlay it; this tells the reviewer what the
+ *  detector sees on a frame, including non-dog classes, and where. */
 export interface TuneSceneResult {
   path: string;
   index: number;

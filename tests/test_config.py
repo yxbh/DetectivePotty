@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from detectivepotty.config import CameraInputConfig
+from detectivepotty.config import (
+    DEFAULT_DOG_ALIAS_CLASSES,
+    CameraInputConfig,
+    GlobalSettings,
+)
 
 
 def test_rtsp_input_requires_url_env() -> None:
@@ -47,3 +51,19 @@ def test_resolve_url_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = CameraInputConfig(kind="rtsp", url_env="POOL_RTSP_URL")
     assert cfg.resolve_url() is None
     assert CameraInputConfig(kind="file").resolve_url() is None
+
+
+def test_global_settings_dog_alias_defaults() -> None:
+    g = GlobalSettings()
+    assert g.dog_alias_classes == list(DEFAULT_DOG_ALIAS_CLASSES)
+    assert g.dog_alias_nms_iou == 0.65
+
+
+def test_global_settings_dog_alias_validator_normalizes() -> None:
+    g = GlobalSettings(dog_alias_classes=["Sheep", "sheep", " COW ", "dog", ""])
+    assert g.dog_alias_classes == ["sheep", "cow"]
+
+
+def test_global_settings_dog_alias_empty_disables() -> None:
+    g = GlobalSettings(dog_alias_classes=[])
+    assert g.dog_alias_classes == []

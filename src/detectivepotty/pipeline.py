@@ -798,6 +798,8 @@ class PottyPipeline:
             long_edge=config.global_settings.inference_long_edge_px,
             conf_threshold=camera_config.detection_conf_threshold,
             device=config.global_settings.device,
+            alias_classes=config.global_settings.dog_alias_classes,
+            alias_nms_iou=config.global_settings.dog_alias_nms_iou,
         )
 
     def _default_classifier_factory(

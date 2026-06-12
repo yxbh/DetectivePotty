@@ -241,7 +241,7 @@
       {#if media.clip}
         {#key detail.summary.event_id + mediaVersion}
           <!-- svelte-ignore a11y_media_has_caption -->
-          <video controls preload="metadata" playsinline src={versioned(media.clip, mediaVersion)}
+          <video controls preload="metadata" playsinline loop src={versioned(media.clip, mediaVersion)}
           ></video>
         {/key}
       {:else}

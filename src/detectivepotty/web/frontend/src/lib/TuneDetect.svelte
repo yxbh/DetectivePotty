@@ -205,6 +205,7 @@
   // sub-threshold dog, or the dog classed as a cat?". Fetched on the presented
   // frame (debounced, stale-aborted) only while the panel is open.
   let sceneOpen = $state(false);
+  let sceneBoxes = $state(false);
   let sceneObjects = $state<TuneSceneObject[]>([]);
   let sceneLoading = $state(false);
   let sceneError = $state<string | null>(null);
@@ -1306,6 +1307,10 @@
     void overlayMode;
     void frameTracks;
     void trackingActive;
+    void sceneBoxes;
+    void sceneObjects;
+    void sceneIndex;
+    void sceneOpen;
     drawOverlay();
   });
 
@@ -1423,7 +1428,11 @@
       } else {
         for (const det of frameDetections) {
           const keep = det.confidence >= threshold;
-          const color = keep ? "#28d17c" : "#e0556b";
+          // Alias-sourced boxes (a dog read as sheep/zebra/cow/... and accepted as a
+          // dog) keep their real class name; draw kept ones in a distinct cyan so the
+          // reviewer can see the box came from an alias read, not a true "dog" box.
+          const isAlias = det.class_name.toLowerCase() !== "dog";
+          const color = keep ? (isAlias ? "#3fb6ff" : "#28d17c") : "#e0556b";
           ctx.strokeStyle = color;
           ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
           const label = `${det.class_name} ${det.confidence.toFixed(2)}`;
@@ -1436,6 +1445,33 @@
 
     if (overlayMode === "pose" || overlayMode === "both") {
       drawPose(ctx, w, framePose);
+    }
+
+    // Independent diagnostic layer: the "objects in scene" boxes (any class, no
+    // dog filter). Drawn dashed amber so they never read as a real dog-detection
+    // box. Only painted when the scene list matches the presented frame, since the
+    // scene list is fetched per-settled-frame and not buffered across playback.
+    if (
+      sceneOpen &&
+      sceneBoxes &&
+      sceneObjects.length > 0 &&
+      sceneIndex === presentedIndex
+    ) {
+      ctx.lineWidth = lineW;
+      ctx.font = `${fontPx}px ui-monospace, monospace`;
+      ctx.textBaseline = "bottom";
+      ctx.setLineDash([Math.max(4, lineW * 2), lineW * 2]);
+      for (const obj of sceneObjects) {
+        const isDog = obj.class_name.toLowerCase() === "dog";
+        const color = isDog ? "#28d17c" : "#f5a623";
+        ctx.strokeStyle = color;
+        ctx.strokeRect(obj.x1, obj.y1, obj.x2 - obj.x1, obj.y2 - obj.y1);
+        const label = `${obj.class_name} ${obj.confidence.toFixed(2)}`;
+        ctx.fillStyle = color;
+        const ty = obj.y1 > fontPx + 4 ? obj.y1 - 2 : obj.y1 + fontPx + 2;
+        ctx.fillText(label, obj.x1, ty);
+      }
+      ctx.setLineDash([]);
     }
   }
 
@@ -1852,6 +1888,7 @@
             preload="auto"
             playsinline
             muted
+            loop
             onloadedmetadata={onLoadedMetadata}
             onplay={onPlay}
             onpause={onPause}
@@ -2091,9 +2128,20 @@
           <div class="scene-panel">
             <div class="scene-head">
               <span class="eyebrow">OBJECTS IN SCENE</span>
-              <span class="mono muted small">
-                {#if sceneLoading}…{:else}frame {sceneIndex ?? presentedIndex}{/if}
-              </span>
+              <div class="scene-head-right">
+                <span class="mono muted small">
+                  {#if sceneLoading}…{:else}frame {sceneIndex ?? presentedIndex}{/if}
+                </span>
+                <button
+                  type="button"
+                  class="zoom-toggle"
+                  class:active={sceneBoxes}
+                  onclick={() => (sceneBoxes = !sceneBoxes)}
+                  title="Overlay these objects' boxes on the frame (dashed amber) so you can see where each class — e.g. a 'sheep' read — actually sits. Best paused or stepping; boxes draw on the frame the list was fetched on."
+                >
+                  ▢ boxes
+                </button>
+              </div>
             </div>
             {#if sceneError}
               <span class="export-error mono small" role="alert">{sceneError}</span>
@@ -2675,6 +2723,12 @@
     justify-content: space-between;
     gap: 0.6rem;
     margin-bottom: 0.4rem;
+  }
+
+  .scene-head-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
   }
 
   .scene-list {

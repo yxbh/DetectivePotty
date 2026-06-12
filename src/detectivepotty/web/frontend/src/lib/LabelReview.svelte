@@ -636,6 +636,7 @@
             bind:this={videoEl}
             src={labelClipVideoUrl(detail.span_id)}
             preload="auto"
+            loop
             onloadedmetadata={onLoadedMeta}
             onseeked={syncFrame}
             ontimeupdate={syncFrame}

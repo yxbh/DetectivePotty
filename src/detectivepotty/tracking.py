@@ -20,17 +20,7 @@ from detectivepotty.geometry import BBox
 def iou(left: BBox, right: BBox) -> float:
     """Return intersection-over-union for two pixel-space boxes."""
 
-    x1 = max(left.x1, right.x1)
-    y1 = max(left.y1, right.y1)
-    x2 = min(left.x2, right.x2)
-    y2 = min(left.y2, right.y2)
-    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    if intersection <= 0.0:
-        return 0.0
-    union = left.area + right.area - intersection
-    if union <= 0.0:
-        return 0.0
-    return intersection / union
+    return left.iou(right)
 
 
 # Window boxes whose center has drifted more than this many reference-diagonals

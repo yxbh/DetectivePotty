@@ -12,11 +12,45 @@ import cv2
 import numpy as np
 import typer
 
-from detectivepotty.config import Config, load_config
+from detectivepotty.config import Config, DEFAULT_DOG_ALIAS_CLASSES, load_config
 from detectivepotty.detect.yolo import DogDetector
 from detectivepotty.geometry import crop_from_frame
 
 app = typer.Typer(help="DetectivePotty offline and live utilities.")
+
+
+def _resolve_dog_aliases(
+    override: str | None, config: Config | None = None
+) -> tuple[list[str], float]:
+    """Resolve the accepted dog-alias classes + NMS IoU for a CLI detector.
+
+    Precedence: an explicit ``--dog-alias-classes`` override (comma list; empty
+    string disables) wins; otherwise the loaded config's values; otherwise the
+    built-in safe-set default. Keeps aliases default-ON for every detection command.
+    """
+
+    iou = config.global_settings.dog_alias_nms_iou if config is not None else 0.65
+    if override is not None:
+        classes = [c.strip().lower() for c in override.split(",") if c.strip()]
+        return classes, iou
+    if config is not None:
+        return list(config.global_settings.dog_alias_classes), iou
+    return list(DEFAULT_DOG_ALIAS_CLASSES), iou
+
+
+# Shared CLI option for overriding the accepted dog-alias classes on detection
+# commands. ``None`` (the default) means "use config / the built-in safe set".
+DogAliasOption = Annotated[
+    Optional[str],
+    typer.Option(
+        "--dog-alias-classes",
+        help=(
+            "Comma-separated YOLO classes to also accept as dogs (e.g. "
+            "'sheep,cow'). Empty string disables. Defaults to config / the "
+            "built-in safe set."
+        ),
+    ),
+]
 
 
 @app.callback()
@@ -339,6 +373,7 @@ def detect_file(
         str,
         typer.Option("--model", help="YOLO model name/path."),
     ] = "models/yolo11m.pt",
+    dog_alias_classes: DogAliasOption = None,
 ) -> None:
     from detectivepotty.sources.pyav_capture import open_capture
 
@@ -367,7 +402,14 @@ def detect_file(
     if save_crops is not None:
         save_crops.mkdir(parents=True, exist_ok=True)
 
-    detector = DogDetector(model_name=model, long_edge=long_edge, device="auto")
+    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
+    detector = DogDetector(
+        model_name=model,
+        long_edge=long_edge,
+        device="auto",
+        alias_classes=alias_classes,
+        alias_nms_iou=alias_nms_iou,
+    )
     frame_idx = 0
     detection_frames = 0
     dogs_detected = 0
@@ -490,6 +532,7 @@ def tune_detect(
             help="Run detection every N played frames (reuse boxes in between for smoother playback).",
         ),
     ] = 1,
+    dog_alias_classes: DogAliasOption = None,
 ) -> None:
     """Interactively tune ``detection_conf_threshold`` with live bounding boxes.
 
@@ -509,6 +552,7 @@ def tune_detect(
     )
 
     provider: FrameProvider
+    config: Config | None = None
     if input_path is not None:
         if config_path is not None or camera_id is not None:
             raise typer.BadParameter("Use either --input or --config/--camera, not both.")
@@ -528,11 +572,14 @@ def tune_detect(
         initial_conf = conf if conf is not None else camera.detection_conf_threshold
         provider = _build_camera_provider(config, camera, FileFrameProvider, LiveFrameProvider)
 
+    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes, config)
     detector = DogDetector(
         model_name=model_name,
         long_edge=long_edge,
         conf_threshold=floor,
         device="auto",
+        alias_classes=alias_classes,
+        alias_nms_iou=alias_nms_iou,
     )
     source_desc = "live stream" if provider.is_live else "file"
     typer.echo(
@@ -692,6 +739,7 @@ def harvest_command(
         float,
         typer.Option("--max-len", min=0.0, help="Split spans longer than N seconds."),
     ] = 60.0,
+    dog_alias_classes: DogAliasOption = None,
 ) -> None:
     """Cut dog-present spans out of a long recording into reviewable clip dirs.
 
@@ -703,8 +751,14 @@ def harvest_command(
 
     from detectivepotty.harvest import harvest_clips
 
+    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
     detector = DogDetector(
-        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+        model_name=model,
+        long_edge=long_edge,
+        conf_threshold=conf,
+        device="auto",
+        alias_classes=alias_classes,
+        alias_nms_iou=alias_nms_iou,
     )
     results = harvest_clips(
         input_path,
@@ -841,6 +895,7 @@ def harvest_camera_command(
             ),
         ),
     ] = "auto",
+    dog_alias_classes: DogAliasOption = None,
 ) -> None:
     """Pull historical UNVR footage for a camera/day in chunks and harvest spans.
 
@@ -858,8 +913,14 @@ def harvest_camera_command(
 
     start_utc, end_utc = _resolve_harvest_window(date, start, end, utc_offset)
 
+    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes, config)
     detector = DogDetector(
-        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+        model_name=model,
+        long_edge=long_edge,
+        conf_threshold=conf,
+        device="auto",
+        alias_classes=alias_classes,
+        alias_nms_iou=alias_nms_iou,
     )
 
     harvest_kwargs = dict(
@@ -1139,6 +1200,7 @@ def export_dataset_command(
         float,
         typer.Option("--min-iou", min=0.0, max=1.0, help="Track-binding IoU gate."),
     ] = 0.3,
+    dog_alias_classes: DogAliasOption = None,
 ) -> None:
     """Build classifier crops + a CSV manifest from labeled harvested clips.
 
@@ -1150,8 +1212,14 @@ def export_dataset_command(
 
     from detectivepotty.dataset_export import export_dataset
 
+    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
     detector = DogDetector(
-        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+        model_name=model,
+        long_edge=long_edge,
+        conf_threshold=conf,
+        device="auto",
+        alias_classes=alias_classes,
+        alias_nms_iou=alias_nms_iou,
     )
     stats = export_dataset(
         clips_root,
@@ -1230,6 +1298,7 @@ def experiment_bakeoff_command(
         int,
         typer.Option("--pad-s", min=0, help="Seconds to dilate each motion hit (recall guard)."),
     ] = 1,
+    dog_alias_classes: DogAliasOption = None,
 ) -> None:
     """Score retro-harvest window strategies against an exhaustive dense-YOLO truth.
 
@@ -1260,8 +1329,14 @@ def experiment_bakeoff_command(
         if not chunks:
             raise typer.BadParameter(f"no chunk videos found in {input_dir}")
 
+    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
     detector = DogDetector(
-        model_name=model, long_edge=long_edge, conf_threshold=conf, device="auto"
+        model_name=model,
+        long_edge=long_edge,
+        conf_threshold=conf,
+        device="auto",
+        alias_classes=alias_classes,
+        alias_nms_iou=alias_nms_iou,
     )
     typer.echo(
         f"Building ground truth (model={detector.model_name}, device={detector.device}, "

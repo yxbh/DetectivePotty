@@ -20,6 +20,22 @@ SourceKind = Literal["protect", "file", "rtsp"]
 PoseBackend = Literal["superanimal", "mock"]
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Curated set of YOLO/COCO classes a dog is plausibly *confused with* but that have
+# ~0% chance of really being present in a suburban backyard. Accepting these recovers
+# dog boxes on frames where YOLO misclassifies WALL-E/Gromit (e.g. as "sheep"), at
+# near-zero false-positive risk. Excludes plausible real-yard classes (cat, bird,
+# person) and static background clutter (potted plant, vase, ...). Default-ON; set
+# ``dog_alias_classes: []`` in config to disable.
+DEFAULT_DOG_ALIAS_CLASSES: tuple[str, ...] = (
+    "sheep",
+    "zebra",
+    "cow",
+    "bear",
+    "horse",
+    "giraffe",
+    "elephant",
+)
+
 
 class RuntimeSecrets(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DETECTIVEPOTTY_", extra="ignore")
@@ -43,6 +59,16 @@ class GlobalSettings(BaseModel):
     device: Device = "auto"
     log_level: str = "INFO"
     dogs: list[str] = Field(default_factory=list)
+    # Extra YOLO classes accepted as dog candidates. YOLO sometimes misclassifies the
+    # dogs as a dog-confusable but yard-implausible animal (e.g. WALL-E read as
+    # "sheep"); accepting these recovers the otherwise-dropped box. The detector then
+    # runs a class-agnostic NMS over the {dog} ∪ {alias} union (governed by
+    # ``dog_alias_nms_iou``) so duplicate reads of the same animal collapse while
+    # distinct dogs survive. Set to an empty list to disable (legacy dog-only).
+    dog_alias_classes: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_DOG_ALIAS_CLASSES)
+    )
+    dog_alias_nms_iou: float = Field(default=0.65, ge=0.0, le=1.0)
     dedupe_reruns: bool = True
     rerun_match_tolerance_s: float = Field(default=5.0, ge=0)
     # Batched detection raises GPU utilization on recorded files: the file backfill
@@ -71,6 +97,17 @@ class GlobalSettings(BaseModel):
             stripped = name.strip()
             if stripped and stripped not in cleaned:
                 cleaned.append(stripped)
+        return cleaned
+
+    @field_validator("dog_alias_classes")
+    @classmethod
+    def clean_dog_alias_classes(cls, value: list[str]) -> list[str]:
+        # Lower-case, de-dupe, drop blanks and the redundant "dog" (always accepted).
+        cleaned: list[str] = []
+        for name in value:
+            normalized = name.strip().lower()
+            if normalized and normalized != "dog" and normalized not in cleaned:
+                cleaned.append(normalized)
         return cleaned
 
 

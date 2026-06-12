@@ -456,7 +456,13 @@ class SceneFakeDetector:
         return []
 
     def detect_scene_objects(self, frame, top_n=8):  # noqa: ANN001
-        ranked = [("dog", 0.42), ("cat", 0.88), ("person", 0.55)]
+        from detectivepotty.geometry import BBox
+
+        ranked = [
+            ("dog", 0.42, BBox(1.0, 1.0, 2.0, 2.0)),
+            ("cat", 0.88, BBox(3.0, 4.0, 30.0, 40.0)),
+            ("person", 0.55, BBox(5.0, 6.0, 50.0, 60.0)),
+        ]
         ranked.sort(key=lambda item: item[1], reverse=True)
         return ranked[:top_n]
 
@@ -474,6 +480,11 @@ def test_tune_scene_returns_top_all_class_objects(tmp_path: Path) -> None:
     # No dog filter: highest-confidence classes surface, sorted desc, capped to top_n.
     assert [o["class_name"] for o in body["objects"]] == ["cat", "person"]
     assert body["objects"][0]["confidence"] == pytest.approx(0.88)
+    # Each object carries its original-frame box so the client can overlay it.
+    cat = body["objects"][0]
+    assert (cat["x1"], cat["y1"], cat["x2"], cat["y2"]) == pytest.approx(
+        (3.0, 4.0, 30.0, 40.0)
+    )
 
 
 def test_tune_scene_rejects_unknown_model(tmp_path: Path) -> None:
@@ -487,21 +498,29 @@ def test_tune_scene_rejects_unknown_model(tmp_path: Path) -> None:
 
 
 def test_detect_scene_objects_no_dog_filter_and_floor() -> None:
-    """The DogDetector helper surfaces all classes >= floor, sorted desc."""
+    """The DogDetector helper surfaces all classes >= floor, sorted desc, with boxes."""
 
     from detectivepotty.detect.yolo import DogDetector
+    from detectivepotty.geometry import BBox
 
     detector = DogDetector.__new__(DogDetector)
     detector.conf_threshold = 0.05
     detector._predict = lambda frame: ["result"]  # type: ignore[attr-defined]
     detector._iter_boxes = lambda results: [  # type: ignore[attr-defined]
         ((0.0, 0.0, 1.0, 1.0), 0.9, "cat"),
-        ((0.0, 0.0, 1.0, 1.0), 0.6, "dog"),
+        ((0.0, 0.0, 2.0, 3.0), 0.6, "dog"),
         ((0.0, 0.0, 1.0, 1.0), 0.02, "bird"),  # below floor -> dropped
-        ((0.0, 0.0, 1.0, 1.0), 0.3, "person"),
+        ((0.0, 0.0, 10.0, 10.0), 0.3, "person"),  # clipped to the 4x4 frame
     ]
     objects = detector.detect_scene_objects(np.zeros((4, 4, 3), dtype=np.uint8), top_n=3)
-    assert objects == [("cat", 0.9), ("dog", 0.6), ("person", 0.3)]
+    assert [(name, conf) for name, conf, _box in objects] == [
+        ("cat", 0.9),
+        ("dog", 0.6),
+        ("person", 0.3),
+    ]
+    # Boxes are returned alongside, clipped to the original frame.
+    assert objects[0][2] == BBox(0.0, 0.0, 1.0, 1.0)
+    assert objects[2][2] == BBox(0.0, 0.0, 4.0, 4.0)
 
 
 class FrameKeyedBatchDetector:

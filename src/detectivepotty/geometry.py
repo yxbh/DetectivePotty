@@ -75,6 +75,21 @@ class BBox:
             y2=max(self.y2, other.y2),
         )
 
+    def iou(self, other: "BBox") -> float:
+        """Return intersection-over-union with ``other`` (0.0 when disjoint)."""
+
+        x1 = max(self.x1, other.x1)
+        y1 = max(self.y1, other.y1)
+        x2 = min(self.x2, other.x2)
+        y2 = min(self.y2, other.y2)
+        intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if intersection <= 0.0:
+            return 0.0
+        denom = self.area + other.area - intersection
+        if denom <= 0.0:
+            return 0.0
+        return intersection / denom
+
     def expand(
         self,
         margin_frac: float,

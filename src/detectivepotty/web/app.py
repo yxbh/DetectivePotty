@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import datetime, timezone
 import json
 import logging
@@ -123,14 +124,22 @@ def _ultralytics_tracking_available() -> bool:
     return importlib.util.find_spec("lap") is not None
 
 
-def _ultralytics_dog_class_indices(model: object) -> list[int]:
-    """Class indices whose name is ``dog`` for ``model`` (fallback COCO 16)."""
+def _ultralytics_dog_class_indices(
+    model: object, alias_classes: Iterable[str] = ()
+) -> list[int]:
+    """Class indices accepted as dogs for ``model`` (``dog`` + any ``alias_classes``).
 
+    Alias classes (e.g. ``sheep``/``cow`` — dog-confusable but yard-implausible) are
+    folded in so the native Ultralytics tracker recovers the same boxes the detector
+    does. Falls back to COCO ``16`` (``dog``) when no class names match.
+    """
+
+    accepted = {"dog", *(str(c).lower() for c in alias_classes)}
     names = getattr(model, "names", None) or {}
     if isinstance(names, dict):
-        idxs = [int(i) for i, n in names.items() if str(n).lower() == "dog"]
+        idxs = [int(i) for i, n in names.items() if str(n).lower() in accepted]
     else:  # pragma: no cover - list-style names are rare
-        idxs = [i for i, n in enumerate(names) if str(n).lower() == "dog"]
+        idxs = [i for i, n in enumerate(names) if str(n).lower() in accepted]
     return idxs or [16]
 
 
@@ -504,6 +513,8 @@ def create_app(
                     long_edge=config.global_settings.inference_long_edge_px,
                     conf_threshold=TUNE_DETECTION_FLOOR,
                     device=config.global_settings.device,
+                    alias_classes=config.global_settings.dog_alias_classes,
+                    alias_nms_iou=config.global_settings.dog_alias_nms_iou,
                 )
                 app.state.tune_detectors[name] = cached
             return cached, name
@@ -610,13 +621,14 @@ def create_app(
         model_name: str,
         top_n: int,
     ) -> dict:
-        """Top-N all-class detections for one frame (diagnostic, no image/boxes).
+        """Top-N all-class detections for one frame (diagnostic, boxes but no image).
 
         Mirrors ``_detect_payload`` but skips the dog-class filter, so the reviewer
         can see whether a frame with no dog box is empty, a sub-threshold dog, or an
-        animal classed as something else (cat/person/...). Read-only — runs the same
-        detector at the confidence floor under ``tune_infer_lock`` and never touches
-        the harvest/detection pipeline.
+        animal classed as something else (cat/person/...). Each object carries its
+        original-frame box (``x1,y1,x2,y2``) so the client can overlay it. Read-only —
+        runs the same detector at the confidence floor under ``tune_infer_lock`` and
+        never touches the harvest/detection pipeline.
         """
 
         from detectivepotty.web import tune as tune_mod
@@ -635,8 +647,15 @@ def create_app(
             "model": model_used,
             "detection_floor": TUNE_DETECTION_FLOOR,
             "objects": [
-                {"class_name": class_name, "confidence": confidence}
-                for class_name, confidence in objects
+                {
+                    "class_name": class_name,
+                    "confidence": confidence,
+                    "x1": float(bbox.x1),
+                    "y1": float(bbox.y1),
+                    "x2": float(bbox.x2),
+                    "y2": float(bbox.y2),
+                }
+                for class_name, confidence, bbox in objects
             ],
         }
 
@@ -923,7 +942,9 @@ def create_app(
         total = 0
         try:
             model = YOLO(model_name)
-            dog_idxs = _ultralytics_dog_class_indices(model)
+            dog_idxs = _ultralytics_dog_class_indices(
+                model, app.state.config.global_settings.dog_alias_classes
+            )
             cursor = start
             end = start + count
             with app.state.tune_infer_lock:

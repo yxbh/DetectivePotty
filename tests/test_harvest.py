@@ -543,3 +543,78 @@ def test_harvest_clips_is_idempotent(tmp_path: Path) -> None:
     second = run()
     assert first == second
     assert len(first) == 1
+
+class AliasModelDetector:
+    """Detector exposing ``model_name`` that emits dog + one alias class.
+
+    Frames in ``[present_start, present_end]`` get a box; even source frames are
+    the real ``dog`` class, odd ones come in as the accepted alias ``sheep`` (as
+    the committed class-agnostic-NMS recovery would). Used to assert harvest now
+    records detector provenance + per-detection class without shifting spans.
+    """
+
+    model_name = "models/yolo11m.pt"
+
+    def __init__(self, present_start: int, present_end: int) -> None:
+        self.present_start = present_start
+        self.present_end = present_end
+
+    def detect(self, frame: np.ndarray, frame_idx: int = 0) -> list[Detection]:
+        if not (self.present_start <= frame_idx <= self.present_end):
+            return []
+        class_name = "dog" if frame_idx % 2 == 0 else "sheep"
+        return [
+            Detection(
+                bbox=BBox(10, 10, 30, 30),
+                confidence=0.9,
+                class_name=class_name,
+                frame_idx=frame_idx,
+                mono_ts=0.0,
+                wall_ts=datetime.now(timezone.utc),
+            )
+        ]
+
+
+def _harvest_one(detector: Any, tmp_path: Path) -> Any:
+    FakeClipWriter.written = {}
+    results = harvest_clips(
+        tmp_path / "fake.mp4",
+        tmp_path / "harvest",
+        detector=detector,
+        sample_every=5,
+        merge_gap_s=2.0,
+        pad_s=0.0,
+        min_len_s=0.0,
+        max_len_s=60.0,
+        source_start_utc=datetime(2026, 6, 6, 9, 0, tzinfo=timezone.utc),
+        capture_factory=lambda _p: FakeCapture(60, fps=10.0),
+        clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+    )
+    assert len(results) == 1
+    return results[0]
+
+
+def test_harvest_records_model_name_and_per_detection_class(tmp_path: Path) -> None:
+    result = _harvest_one(AliasModelDetector(10, 30), tmp_path)
+    meta = json.loads(result.metadata_path.read_text())
+    assert meta["schema_version"] == "harvest-1.1"
+    assert meta["model_name"] == "models/yolo11m.pt"
+    classes = {d["class_name"] for d in meta["detections"]}
+    assert classes == {"dog", "sheep"}  # alias preserved for audit
+
+
+def test_harvest_model_name_none_when_detector_lacks_it(tmp_path: Path) -> None:
+    # FakeDetector has no ``model_name`` attr -> recorded as None (legacy/fake).
+    result = _harvest_one(FakeDetector(present_start=10, present_end=30), tmp_path)
+    meta = json.loads(result.metadata_path.read_text())
+    assert meta["model_name"] is None
+    assert all(d["class_name"] == "dog" for d in meta["detections"])
+
+
+def test_harvest_class_provenance_does_not_shift_spans(tmp_path: Path) -> None:
+    """Extra-fields-only invariant: alias/model recording can't move span math."""
+    dog_only = _harvest_one(FakeDetector(present_start=10, present_end=30), tmp_path / "a")
+    aliased = _harvest_one(AliasModelDetector(10, 30), tmp_path / "b")
+    assert aliased.span.start_frame == dog_only.span.start_frame
+    assert aliased.span.end_frame == dog_only.span.end_frame
+    assert aliased.span.frame_count == dog_only.span.frame_count

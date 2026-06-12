@@ -9,6 +9,7 @@
     formatTime,
   } from "./format";
   import { poseOverlay } from "./prefs";
+  import { formatDetLabel } from "./overlayStyle";
 
   interface Props {
     detail: EventDetail | null;
@@ -44,6 +45,65 @@
   let hasOverlays = $derived(overlayByName.size > 0);
   let showOverlay = $derived(hasOverlays && $poseOverlay);
   let eventHint = $derived(basisHint(summary?.time_basis));
+
+  interface CropLabel {
+    cls: string;
+    conf: number;
+    alias: boolean;
+  }
+
+  // Map each crop file (e.g. "000.jpg") to the detected class + confidence of the
+  // box it was cropped from. The crop's class/conf aren't stored on the crop
+  // record, but `crop_boxes[].bbox` is copied verbatim from the source detection,
+  // so we recover them by matching frame_idx + bbox against `detections` —
+  // purely client-side, so it works on every existing event with no re-record.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let cropLabels = $derived.by<Map<string, CropLabel>>(() => {
+    const out = new Map<string, CropLabel>();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const boxes = (meta.crop_boxes ?? []) as Array<Record<string, any>>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dets = (meta.detections ?? []) as Array<Record<string, any>>;
+    if (!boxes.length || !dets.length) {
+      return out;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const byFrame = new Map<number, Array<Record<string, any>>>();
+    for (const d of dets) {
+      const f = Number(d?.frame_idx);
+      if (!Number.isFinite(f)) continue;
+      const bucket = byFrame.get(f);
+      if (bucket) bucket.push(d);
+      else byFrame.set(f, [d]);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dist = (a: any, b: any) =>
+      Math.abs((a?.x1 ?? 0) - (b?.x1 ?? 0)) +
+      Math.abs((a?.y1 ?? 0) - (b?.y1 ?? 0)) +
+      Math.abs((a?.x2 ?? 0) - (b?.x2 ?? 0)) +
+      Math.abs((a?.y2 ?? 0) - (b?.y2 ?? 0));
+    for (const cb of boxes) {
+      const name = (cb?.path ?? "").toString().split("/").pop() ?? "";
+      if (!name) continue;
+      const cands = byFrame.get(Number(cb?.frame_idx)) ?? [];
+      if (!cands.length) continue;
+      let best = cands[0];
+      if (cands.length > 1) {
+        let bestD = Infinity;
+        for (const d of cands) {
+          const dd = dist(d?.bbox, cb?.bbox);
+          if (dd < bestD) {
+            bestD = dd;
+            best = d;
+          }
+        }
+      }
+      const cls = (best?.class_name ?? "dog").toString() || "dog";
+      const conf = Number(best?.confidence);
+      out.set(name, { cls, conf: Number.isFinite(conf) ? conf : 0, alias: cls.toLowerCase() !== "dog" });
+    }
+    return out;
+  });
 
   let duration = $derived.by<string | null>(() => {
     if (!summary) {
@@ -119,6 +179,22 @@
     if (meta.ambiguous) {
       flags.push("ambiguous");
     }
+    const model = meta.model_name
+      ? `${meta.model_name}${meta.model_version ? ` (${meta.model_version})` : ""}`
+      : "unknown";
+    const classCounts = new Map<string, number>();
+    for (const d of (meta.detections ?? []) as Array<Record<string, unknown>>) {
+      const cls = (d?.class_name ?? "").toString() || "unknown";
+      classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
+    }
+    const sortedClasses = [...classCounts.entries()].sort(
+      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+    );
+    const hasAlias = sortedClasses.some(([c]) => c.toLowerCase() !== "dog");
+    const detectedClass = sortedClasses.length
+      ? sortedClasses.map(([c, n]) => `${c} ×${n}`).join(" · ") +
+        (hasAlias ? " · ⚠ alias" : "")
+      : "none";
     return [
       {
         title: "Guess",
@@ -129,6 +205,16 @@
         title: "Saved label",
         value: `${meta.label || "unknown"} / ${meta.label_status || "unlabeled"}`,
         hint: "The human-reviewed label + status currently written to metadata.json.",
+      },
+      {
+        title: "Model",
+        value: model,
+        hint: "The detector model (name + version) that produced these boxes. 'unknown' if the event predates provenance recording.",
+      },
+      {
+        title: "Detected class",
+        value: detectedClass,
+        hint: "Object classes YOLO assigned to the detections (count desc). Non-dog classes (sheep/zebra/cow/…) are accepted dog aliases recovered via class-agnostic NMS — '⚠ alias' flags that some boxes came in as a non-dog class.",
       },
       {
         title: "Dog",
@@ -349,6 +435,7 @@
         <div class="strip-grid">
           {#each media.crops as crop (crop.name)}
             {@const posed = overlayByName.has(crop.name)}
+            {@const cl = cropLabels.get(crop.name)}
             <button
               type="button"
               class="strip-item"
@@ -358,6 +445,7 @@
               onclick={() => showHero(cropUrl(crop.name, crop.url), crop.name)}
             >
               <img src={cropUrl(crop.name, crop.url)} alt={crop.name} loading="lazy" />
+              {#if cl}<span class="crop-label" class:alias={cl.alias} title="The detected object class + confidence of the box this crop came from. Cyan = an accepted non-dog alias (sheep/zebra/…) recovered via class-agnostic NMS.">{formatDetLabel(cl.cls, cl.conf)}</span>{/if}
               {#if posed}<span class="pose-badge" aria-hidden="true"></span>{/if}
             </button>
           {/each}
@@ -760,6 +848,29 @@
     border-radius: 50%;
     background: var(--teal);
     box-shadow: 0 0 0 2px var(--bg-1), 0 0 6px color-mix(in srgb, var(--teal) 70%, transparent);
+  }
+
+  .crop-label {
+    position: absolute;
+    left: 0.2rem;
+    bottom: 0.2rem;
+    max-width: calc(100% - 0.4rem);
+    padding: 0 0.22rem;
+    border-radius: 3px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.6rem;
+    font-weight: 600;
+    line-height: 1.5;
+    letter-spacing: 0.02em;
+    color: var(--green);
+    background: rgba(0, 0, 0, 0.82);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  .crop-label.alias {
+    color: var(--teal);
   }
 
   .strip-note {

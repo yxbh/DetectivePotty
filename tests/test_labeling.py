@@ -48,6 +48,8 @@ def _make_clip_dir(
     source_start_utc: str | None = None,
     start_s: float | None = None,
     det_time_s: list[float] | None = None,
+    model_name: str | None = None,
+    class_names: list[str] | None = None,
 ) -> Path:
     clip_dir = root / span_id
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -60,6 +62,11 @@ def _make_clip_dir(
             "track_id": track_id,
             "bbox": {"x1": 10.0 + i, "y1": 12.0, "x2": 80.0 + i, "y2": 90.0},
             "confidence": 0.7,
+            **(
+                {"class_name": class_names[i % len(class_names)]}
+                if class_names
+                else {}
+            ),
         }
         for i in range(n_det)
     ]
@@ -80,6 +87,8 @@ def _make_clip_dir(
         meta["camera_name"] = camera_name
     if detect_conf is not None:
         meta["detect_conf"] = detect_conf
+    if model_name is not None:
+        meta["model_name"] = model_name
     if span_end_utc is not None:
         meta["source_span_end_utc"] = span_end_utc
     if source_start_utc is not None:
@@ -152,6 +161,39 @@ def test_clip_detail_groups_tracks(tmp_path: Path) -> None:
     self_track = detail["present_tracks"]["span_a:3"]
     assert self_track["is_self"] is True
     assert self_track["track_id"] == "3"
+
+
+def test_summarize_records_model_and_class_distribution(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    # dog ×3, sheep ×1 -> distribution sorted by count desc.
+    clip_dir = _make_clip_dir(
+        root,
+        "span_a",
+        n_det=4,
+        model_name="models/yolo11m.pt",
+        class_names=["dog", "dog", "dog", "sheep"],
+    )
+    summary = labeling.summarize_clip(clip_dir)
+    assert summary["model_name"] == "models/yolo11m.pt"
+    assert summary["class_distribution"] == [
+        {"class_name": "dog", "count": 3},
+        {"class_name": "sheep", "count": 1},
+    ]
+    # The alias class is also carried per-box in the detail tracks.
+    detail = labeling.clip_detail(clip_dir)
+    classes = {b.get("class_name") for b in detail["tracks"]["1"]}
+    assert classes == {"dog", "sheep"}
+
+
+def test_summarize_legacy_metadata_defaults_model_and_class(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    # Legacy clip: no model_name, no per-detection class_name.
+    clip_dir = _make_clip_dir(root, "span_a", n_det=4)
+    summary = labeling.summarize_clip(clip_dir)
+    assert summary["model_name"] is None  # frontend renders "unknown"
+    assert summary["class_distribution"] == [{"class_name": "dog", "count": 4}]
+    detail = labeling.clip_detail(clip_dir)
+    assert all(b["class_name"] == "dog" for b in detail["tracks"]["1"])
 
 
 def test_summarize_exposes_identity_and_timestamps(tmp_path: Path) -> None:

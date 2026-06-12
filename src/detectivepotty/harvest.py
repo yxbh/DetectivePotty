@@ -67,7 +67,7 @@ DEFAULT_DETECT_BATCH_SIZE = 32
 
 CLIP_NAME = "clip.mp4"
 METADATA_NAME = "metadata.json"
-SCHEMA_VERSION = "harvest-1.0"
+SCHEMA_VERSION = "harvest-1.1"
 TIME_BASIS_CLIP_FRAMES = "clip_frames"
 
 
@@ -98,6 +98,7 @@ class FrameSample:
     time_s: float
     bbox: BBox
     confidence: float
+    class_name: str = "dog"
 
 
 @dataclass(slots=True)
@@ -353,6 +354,7 @@ def harvest_clips(
         sample_every=sample_every,
         camera_name=camera_name,
         detect_conf=detect_conf,
+        model_name=getattr(detector, "model_name", None),
         capture_factory=capture_factory,
         clip_writer_factory=clip_writer_factory,
     )
@@ -406,6 +408,7 @@ def _scan_for_dogs(
                     time_s=time_s,
                     bbox=latest.bbox,
                     confidence=latest.confidence,
+                    class_name=latest.class_name,
                 )
             )
 
@@ -463,6 +466,7 @@ def _write_spans(
     sample_every: int,
     camera_name: str | None = None,
     detect_conf: float | None = None,
+    model_name: str | None = None,
     capture_factory: Callable[[str], Any],
     clip_writer_factory: Callable[[Path, float, tuple[int, int]], ClipWriter],
 ) -> list[HarvestResult]:
@@ -498,6 +502,7 @@ def _write_spans(
             sample_every=sample_every,
             camera_name=camera_name,
             detect_conf=detect_conf,
+            model_name=model_name,
         )
         results.append(
             HarvestResult(
@@ -639,6 +644,7 @@ def _write_clip_metadata(
     sample_every: int,
     camera_name: str | None = None,
     detect_conf: float | None = None,
+    model_name: str | None = None,
 ) -> Path:
     source_span_start_utc = source_start_utc + timedelta(seconds=span.start_s)
     source_span_end_utc = source_start_utc + timedelta(seconds=span.end_s)
@@ -653,6 +659,7 @@ def _write_clip_metadata(
                 "track_id": span.track_id,
                 "bbox": _jsonify(sample.bbox),
                 "confidence": sample.confidence,
+                "class_name": sample.class_name,
             }
         )
 
@@ -663,6 +670,7 @@ def _write_clip_metadata(
         "source_path": source_id,
         "camera_name": camera_name,
         "detect_conf": detect_conf,
+        "model_name": model_name,
         "source_start_utc": source_start_utc.isoformat(),
         "source_span_start_utc": source_span_start_utc.isoformat(),
         "source_span_end_utc": source_span_end_utc.isoformat(),

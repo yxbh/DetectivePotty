@@ -39,3 +39,32 @@ export const liveNotifications = boolStore("liveNotifications", false);
 
 /** Live page: play a short chime for each new event (default off). */
 export const liveSound = boolStore("liveSound", false);
+
+const TUNE_LAST_DIR_KEY = "tuneLastDir";
+
+/**
+ * Last directory the Tune file browser was viewing, so reopening the tab resumes
+ * where the reviewer left off instead of dropping back to the root list. Stored
+ * as the server-resolved absolute path ("" = the synthetic root list). Read/write
+ * are explicit (not a reactive store) so only *successfully loaded* dirs persist —
+ * a stale/removed path must never get pinned.
+ */
+export function loadTuneLastDir(): string {
+  try {
+    return localStorage.getItem(TUNE_LAST_DIR_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function saveTuneLastDir(path: string): void {
+  try {
+    if (path) {
+      localStorage.setItem(TUNE_LAST_DIR_KEY, path);
+    } else {
+      localStorage.removeItem(TUNE_LAST_DIR_KEY);
+    }
+  } catch {
+    /* ignore storage failures (private mode, etc.) */
+  }
+}

@@ -285,6 +285,12 @@ export interface TuneTrackerParams {
 // --- Range labeling (/label) ---------------------------------------------
 
 /** One harvested clip's listing row (identity + labeling progress). */
+/** A detected-object class and how many of this clip's detections carried it. */
+export interface ClassCount {
+  class_name: string;
+  count: number;
+}
+
 export interface LabelClipSummary {
   span_id: string;
   clip_path: string;
@@ -300,6 +306,8 @@ export interface LabelClipSummary {
   height: number;
   duration_s: number;
   detect_conf: number | null;
+  model_name: string | null;
+  class_distribution: ClassCount[];
   track_id: string | null;
   n_detections: number;
   labeled: boolean;
@@ -316,6 +324,7 @@ export interface LabelTrackBox {
   clip_frame_idx: number;
   bbox: { x1: number; y1: number; x2: number; y2: number };
   confidence: number;
+  class_name?: string;
 }
 
 /** A dog track present in a clip's window (own track or a sibling's). */

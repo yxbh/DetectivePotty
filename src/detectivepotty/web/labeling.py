@@ -168,6 +168,19 @@ def summarize_clip(
     frame_count = int(meta.get("frame_count") or 0)
     detections = meta.get("detections") or []
     source_id = str(meta.get("source_id") or clip_dir.name)
+    # Per-detection class distribution (dog vs accepted aliases like sheep/zebra).
+    # Pre-alias clips lack ``class_name`` and were dog-class only, so a missing
+    # value reads as "dog"; the *model* name is genuinely unknown for legacy clips.
+    class_counts: dict[str, int] = {}
+    for det in detections:
+        cls = str(det.get("class_name") or "dog")
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+    class_distribution = [
+        {"class_name": cls, "count": count}
+        for cls, count in sorted(
+            class_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+    ]
     labels = _labels_for(clip_dir)
     ranges = list(labels.ranges) if labels else []
     trainable = [r for r in ranges if r.is_trainable]
@@ -195,6 +208,8 @@ def summarize_clip(
         "detect_conf": (
             float(meta["detect_conf"]) if meta.get("detect_conf") is not None else None
         ),
+        "model_name": str(meta["model_name"]) if meta.get("model_name") else None,
+        "class_distribution": class_distribution,
         "track_id": str(meta.get("track_id")) if meta.get("track_id") is not None else None,
         "n_detections": len(detections),
         "labeled": bool(trainable),
@@ -319,6 +334,7 @@ def clip_detail(clip_dir: Path, root: str | Path | None = None) -> dict[str, Any
                     "y2": float(box.get("y2", 0.0)),
                 },
                 "confidence": float(det.get("confidence", 0.0)),
+                "class_name": str(det.get("class_name") or "dog"),
             }
         )
     for entries in tracks.values():
@@ -400,6 +416,7 @@ def _present_tracks(
                         "y2": float(box.get("y2", 0.0)),
                     },
                     "confidence": float(det.get("confidence", 0.0)),
+                    "class_name": str(det.get("class_name") or "dog"),
                 }
             )
         for track_id, boxes in grouped.items():

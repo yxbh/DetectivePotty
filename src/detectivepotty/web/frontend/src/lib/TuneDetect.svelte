@@ -23,6 +23,19 @@
     TuneTrackStats,
     TuneTrackedDetection,
   } from "./types";
+  import Transport from "./Transport.svelte";
+  import {
+    classBoxColor,
+    trackColor,
+    drawCanvasBoxLabel,
+    boxLabelFontPx,
+    formatDetLabel,
+    formatTrackLabel,
+    BOX_DOG,
+    BOX_SIBLING,
+    BOX_WEAK,
+  } from "./overlayStyle";
+  import { loadTuneLastDir, saveTuneLastDir } from "./prefs";
 
   // How many frames Shift+Arrow skips.
   const SKIP_N = 10;
@@ -268,7 +281,7 @@
   // capped). Each carries the best-matching pose (by box IoU) for its crop.
   const zoomCards = $derived(buildZoomCards(frameDetections, framePose, threshold));
 
-  void loadListing("");
+  void loadInitialListing();
   void loadModels();
 
   onDestroy(() => {
@@ -305,10 +318,35 @@
     listingError = null;
     try {
       listing = await fetchTuneFiles(path);
+      // Remember the dir we actually landed on (server-resolved path) so reopening
+      // the tab resumes here. "" = root list, which clears the saved pref.
+      saveTuneLastDir(listing.path);
     } catch (err) {
       listingError = err instanceof Error ? err.message : String(err);
     } finally {
       listingLoading = false;
+    }
+  }
+
+  // Mount: resume the browser at the last viewed directory. If that path is gone
+  // (deleted, moved, or now outside the roots), the request 400s — clear the
+  // stale pref and fall back to the root list so the browser is never stuck.
+  async function loadInitialListing(): Promise<void> {
+    const remembered = loadTuneLastDir();
+    if (!remembered) {
+      void loadListing("");
+      return;
+    }
+    listingLoading = true;
+    listingError = null;
+    try {
+      listing = await fetchTuneFiles(remembered);
+      saveTuneLastDir(listing.path);
+      listingLoading = false;
+    } catch {
+      saveTuneLastDir("");
+      listingLoading = false;
+      void loadListing("");
     }
   }
 
@@ -844,16 +882,6 @@
     // Switching to "off" just stops drawing tracked boxes; switching to a real
     // tracker shows the last pass if one exists, else waits for "Track range".
     syncTracks();
-  }
-
-  // Deterministic vivid color per track id (hash → HSL hue), so the same id
-  // keeps its color across frames and runs.
-  function trackColor(id: string): string {
-    let h = 0;
-    for (let i = 0; i < id.length; i++) {
-      h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    }
-    return `hsl(${h % 360}, 85%, 58%)`;
   }
 
   // Run a stateful track pass over the whole clip (server caps the range) and
@@ -1403,12 +1431,10 @@
     ctx.clearRect(0, 0, w, h);
 
     const lineW = Math.max(2, Math.round(w / 400));
-    const fontPx = Math.max(12, Math.round(w / 45));
+    const fontPx = boxLabelFontPx(Math.max(w, h));
 
     if (overlayMode === "boxes" || overlayMode === "both") {
       ctx.lineWidth = lineW;
-      ctx.font = `${fontPx}px ui-monospace, monospace`;
-      ctx.textBaseline = "bottom";
       if (trackingActive) {
         // Persistent track-id boxes: color hashed from the id, id label drawn at
         // the corner. Below-threshold boxes are drawn dashed so the conf gate is
@@ -1420,25 +1446,20 @@
           ctx.setLineDash(keep ? [] : [Math.max(4, lineW * 2), lineW * 2]);
           ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
           ctx.setLineDash([]);
-          const label = `#${det.track_id} ${det.confidence.toFixed(2)}`;
-          ctx.fillStyle = color;
-          const ty = det.y1 > fontPx + 4 ? det.y1 - 2 : det.y1 + fontPx + 2;
-          ctx.fillText(label, det.x1, ty);
+          const label = formatTrackLabel(det.track_id, det.confidence);
+          drawCanvasBoxLabel(ctx, label, det.x1, det.y1, color, fontPx);
         }
       } else {
         for (const det of frameDetections) {
           const keep = det.confidence >= threshold;
           // Alias-sourced boxes (a dog read as sheep/zebra/cow/... and accepted as a
-          // dog) keep their real class name; draw kept ones in a distinct cyan so the
-          // reviewer can see the box came from an alias read, not a true "dog" box.
-          const isAlias = det.class_name.toLowerCase() !== "dog";
-          const color = keep ? (isAlias ? "#3fb6ff" : "#28d17c") : "#e0556b";
+          // dog) keep their real class name; kept aliases draw in the shared teal so
+          // the reviewer can see the box came from an alias read, not a true "dog" box.
+          const color = classBoxColor(det.class_name, keep);
           ctx.strokeStyle = color;
           ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
-          const label = `${det.class_name} ${det.confidence.toFixed(2)}`;
-          ctx.fillStyle = color;
-          const ty = det.y1 > fontPx + 4 ? det.y1 - 2 : det.y1 + fontPx + 2;
-          ctx.fillText(label, det.x1, ty);
+          const label = formatDetLabel(det.class_name, det.confidence);
+          drawCanvasBoxLabel(ctx, label, det.x1, det.y1, color, fontPx);
         }
       }
     }
@@ -1458,18 +1479,14 @@
       sceneIndex === presentedIndex
     ) {
       ctx.lineWidth = lineW;
-      ctx.font = `${fontPx}px ui-monospace, monospace`;
-      ctx.textBaseline = "bottom";
       ctx.setLineDash([Math.max(4, lineW * 2), lineW * 2]);
       for (const obj of sceneObjects) {
         const isDog = obj.class_name.toLowerCase() === "dog";
-        const color = isDog ? "#28d17c" : "#f5a623";
+        const color = isDog ? BOX_DOG : BOX_SIBLING;
         ctx.strokeStyle = color;
         ctx.strokeRect(obj.x1, obj.y1, obj.x2 - obj.x1, obj.y2 - obj.y1);
-        const label = `${obj.class_name} ${obj.confidence.toFixed(2)}`;
-        ctx.fillStyle = color;
-        const ty = obj.y1 > fontPx + 4 ? obj.y1 - 2 : obj.y1 + fontPx + 2;
-        ctx.fillText(label, obj.x1, ty);
+        const label = formatDetLabel(obj.class_name, obj.confidence);
+        drawCanvasBoxLabel(ctx, label, obj.x1, obj.y1, color, fontPx);
       }
       ctx.setLineDash([]);
     }
@@ -1749,7 +1766,7 @@
       return; // video not sampleable this tick
     }
     ctx.lineWidth = 2;
-    ctx.strokeStyle = card.kept ? "#28d17c" : "#e0556b";
+    ctx.strokeStyle = card.kept ? BOX_DOG : BOX_WEAK;
     ctx.strokeRect(
       (det.x1 - sx) * scale,
       (det.y1 - sy) * scale,
@@ -1946,15 +1963,16 @@
         </div>
 
         <div class="controls">
-          <div class="transport">
-            <button type="button" onclick={() => step(-SKIP_N)} title="Back {SKIP_N} (Shift+←)">⏮</button>
-            <button type="button" onclick={() => step(-1)} title="Back 1 (←)">◀</button>
-            <button type="button" class="play" onclick={togglePlay} title="Play/pause (Space)">
-              {playing ? "⏸" : "▶"}
-            </button>
-            <button type="button" onclick={() => step(1)} title="Forward 1 (→)">▶</button>
-            <button type="button" onclick={() => step(SKIP_N)} title="Forward {SKIP_N} (Shift+→)">⏭</button>
-          </div>
+          <Transport
+            playing={playing}
+            frame={displayIndex}
+            total={totalFrames}
+            fps={fps}
+            skipN={SKIP_N}
+            showReadout={false}
+            onTogglePlay={togglePlay}
+            onStep={step}
+          />
 
           {#if models.length > 1}
             <label class="model">
@@ -2764,30 +2782,6 @@
 
   .scene-empty {
     padding: 0.2rem 0;
-  }
-
-  .transport {
-    display: flex;
-    gap: 0.25rem;
-  }
-
-  .transport button {
-    background: var(--bg-1, #141a24);
-    border: 1px solid var(--line-strong, #324056);
-    color: var(--text, #d8e0ec);
-    border-radius: 6px;
-    padding: 0.3rem 0.55rem;
-    cursor: pointer;
-    font-size: 0.9rem;
-    min-width: 2.1rem;
-  }
-
-  .transport button:hover {
-    background: var(--bg-2, #1b2330);
-  }
-
-  .transport .play {
-    background: var(--accent-dim, #1d3346);
   }
 
   .slider {

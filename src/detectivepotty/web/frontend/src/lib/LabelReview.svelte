@@ -16,6 +16,8 @@
   } from "./types";
   import { boxAtFrame } from "./labelBox";
   import { formatClock } from "./format";
+  import { BOX_DOG, BOX_SIBLING, boxLabelFontPx, formatDetLabel, formatTrackLabel, isAliasClass } from "./overlayStyle";
+  import Transport from "./Transport.svelte";
 
   const BEHAVIOR_KEYS: Record<string, string> = {
     "1": "pee",
@@ -24,10 +26,10 @@
     "4": "excluded",
   };
   const BEH_COLOR: Record<string, string> = {
-    pee: "#2d6cdf",
-    poop: "#8a5a2b",
-    not_potty: "#444c5a",
-    excluded: "#7a3550",
+    pee: "#f1cf5b",
+    poop: "#c08a55",
+    not_potty: "#8290a8",
+    excluded: "#a35a74",
   };
   const MAX_FILMSTRIP = 24;
 
@@ -64,6 +66,9 @@
   const fps = $derived(detail && detail.fps > 0 ? detail.fps : 30);
   const totalFrames = $derived(detail ? Math.max(1, detail.frame_count) : 1);
   const trackId = $derived(detail?.track_id ?? null);
+  // Detector provenance + detected-object-class mix surfaced in the clip header.
+  const modelLabel = $derived(detail?.model_name || "unknown");
+  const classCounts = $derived(detail?.class_distribution ?? []);
   const hasRvfc =
     typeof window !== "undefined" &&
     "requestVideoFrameCallback" in HTMLVideoElement.prototype;
@@ -86,13 +91,23 @@
 
   // Sibling boxes at the current frame (dimmed, click to jump).
   const siblingBoxes = $derived.by(() => {
-    const out: { track: LabelPresentTrack; bbox: { x1: number; y1: number; x2: number; y2: number } }[] = [];
+    const out: {
+      track: LabelPresentTrack;
+      bbox: { x1: number; y1: number; x2: number; y2: number };
+      class_name: string;
+      confidence: number;
+    }[] = [];
     for (const t of siblingTracks) {
       const b = boxAtFrame(t.boxes, currentFrame);
-      if (b && !b.extrapolated) out.push({ track: t, bbox: b.bbox });
+      if (b && !b.extrapolated) out.push({ track: t, bbox: b.bbox, class_name: b.class_name, confidence: b.confidence });
     }
     return out;
   });
+
+  // Box-label font sized off the larger image edge so it reads consistently
+  // on screen regardless of source resolution (overlay scales uniformly).
+  const labelFont = $derived(detail ? boxLabelFontPx(Math.max(detail.width, detail.height)) : 14);
+  const isAlias = isAliasClass;
 
   // Group the clip list into scenes (siblings clustered, first-appearance order).
   interface ClipGroup {
@@ -346,7 +361,7 @@
       const conf = Math.max(0, Math.min(1, b.confidence));
       const bh = Math.max(2, conf * h);
       const passed = gate == null || conf >= gate;
-      ctx.fillStyle = passed ? "#36d07a" : "#c79a3a";
+      ctx.fillStyle = passed ? BOX_DOG : BOX_SIBLING;
       ctx.fillRect(x, h - bh, 2, bh);
     }
 
@@ -621,6 +636,14 @@
             <span class="ch-when" title="Clip window (local time)">
               {formatClock(detail.span_start_utc)} → {formatClock(detail.span_end_utc)}
             </span>
+            <span class="ch-prov" title="Detector model · detected object classes (dog vs accepted aliases like sheep/zebra)">
+              <span class="prov-model" class:unknown={!detail.model_name}>{modelLabel}</span>
+              {#each classCounts as c}
+                <span class="prov-class" class:alias={c.class_name.toLowerCase() !== "dog"}>{c.class_name} ×{c.count}</span>
+              {:else}
+                <span class="prov-class">—</span>
+              {/each}
+            </span>
           </div>
           <div class="ch-meta">
             <span class="pill" title="The single track segment this clip follows. Its boxes/labels bind to this track.">Following Track {trackId ?? "?"}</span>
@@ -660,6 +683,13 @@
                 tabindex="-1"
                 onclick={() => void selectClip(sb.track.span_id)}
               ><title>Other segment (Track {sb.track.track_id}) — may be the same dog; click to open its clip</title></rect>
+              <text
+                x={sb.bbox.x1 + labelFont * 0.2}
+                y={sb.bbox.y1 - labelFont * 0.3 < labelFont ? sb.bbox.y1 + labelFont : sb.bbox.y1 - labelFont * 0.3}
+                class="box-label sibling"
+                class:alias={isAlias(sb.class_name)}
+                font-size={labelFont}
+              >{formatTrackLabel(sb.track.track_id, sb.confidence, sb.class_name)}</text>
             {/each}
             {#if activeBox && !activeBox.extrapolated}
               <rect
@@ -669,6 +699,13 @@
                 height={activeBox.bbox.y2 - activeBox.bbox.y1}
                 class="box active"
               />
+              <text
+                x={activeBox.bbox.x1 + labelFont * 0.2}
+                y={activeBox.bbox.y1 - labelFont * 0.3 < labelFont ? activeBox.bbox.y1 + labelFont : activeBox.bbox.y1 - labelFont * 0.3}
+                class="box-label active"
+                class:alias={isAlias(activeBox.class_name)}
+                font-size={labelFont}
+              >{formatDetLabel(activeBox.class_name, activeBox.confidence)}</text>
             {/if}
           </svg>
           {#if activeBox && activeBox.extrapolated}
@@ -683,18 +720,16 @@
           {/if}
         </div>
 
-        <div class="transport">
-          <button type="button" onclick={() => stepFrame(-10)} title="Back 10 frames (Shift+←)">⏪</button>
-          <button type="button" onclick={() => stepFrame(-1)} title="Back 1 frame (←)">◀</button>
-          <button type="button" class="play" onclick={togglePlay} title="Play / Pause (Space)">
-            {playing ? "❚❚" : "►"}
-          </button>
-          <button type="button" onclick={() => stepFrame(1)} title="Forward 1 frame (→)">▶</button>
-          <button type="button" onclick={() => stepFrame(10)} title="Forward 10 frames (Shift+→)">⏩</button>
-          <span class="frame-readout mono" title="Current frame / last frame · time">
-            f{currentFrame} / {totalFrames - 1} · {(currentFrame / fps).toFixed(2)}s
-          </span>
-        </div>
+        <Transport
+          playing={playing}
+          frame={currentFrame}
+          total={totalFrames}
+          fps={fps}
+          skipN={10}
+          showReadout={true}
+          onTogglePlay={togglePlay}
+          onStep={stepFrame}
+        />
 
         <input
           class="scrub"
@@ -878,7 +913,7 @@
     min-height: 0;
   }
   .clip-list {
-    border-right: 1px solid var(--border, #243042);
+    border-right: 1px solid var(--line-strong);
     overflow-y: auto;
     min-height: 0;
   }
@@ -890,7 +925,7 @@
     position: sticky;
     top: 0;
     background: var(--bg, #0c1018);
-    border-bottom: 1px solid var(--border, #243042);
+    border-bottom: 1px solid var(--line-strong);
     z-index: 1;
   }
   .list-head h2 {
@@ -898,7 +933,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin: 0;
-    color: var(--muted, #8aa);
+    color: var(--text-dim);
   }
   .clip-list ul {
     list-style: none;
@@ -911,8 +946,8 @@
     gap: 0.4rem;
     padding: 0.3rem 0.6rem 0.15rem;
     font-size: 0.68rem;
-    color: var(--muted, #8aa);
-    border-top: 1px solid var(--border, #1b2433);
+    color: var(--text-dim);
+    border-top: 1px solid var(--line-strong);
   }
   .scene-cam { font-weight: 600; color: #b9c6d6; }
   .scene-when { margin-left: auto; }
@@ -935,7 +970,7 @@
     text-align: left;
     background: transparent;
     border: none;
-    border-bottom: 1px solid var(--border, #1b2433);
+    border-bottom: 1px solid var(--line-strong);
     color: inherit;
     padding: 0.32rem 0.6rem;
     cursor: pointer;
@@ -943,7 +978,7 @@
   .clip-list li button:hover { background: var(--hover, #131c28); }
   .clip-list li button.active {
     background: var(--hover, #16202e);
-    box-shadow: inset 3px 0 0 var(--accent, #2d6cdf);
+    box-shadow: inset 3px 0 0 var(--amber);
   }
   .row1 {
     display: flex;
@@ -963,7 +998,7 @@
     align-items: center;
     gap: 0.45rem;
     font-size: 0.7rem;
-    color: var(--muted, #9ab);
+    color: var(--text-dim);
   }
   .row2 .trk { margin-left: auto; }
   .row3 {
@@ -976,20 +1011,20 @@
     font-size: 0.62rem;
     padding: 0.02rem 0.32rem;
     border-radius: 4px;
-    background: var(--border, #243042);
-    color: #cdd;
+    background: var(--bg-3);
+    color: var(--text-dim);
   }
-  .chip.b-pee { background: #2d6cdf; color: #fff; }
-  .chip.b-poop { background: #8a5a2b; color: #fff; }
-  .chip.b-not_potty { background: #444c5a; color: #cdd; }
-  .chip.b-excluded { background: #7a3550; color: #fdd; }
+  .chip.b-pee { background: #f1cf5b; color: #1a1204; }
+  .chip.b-poop { background: #c08a55; color: #1a1204; }
+  .chip.b-not_potty { background: #3a4150; color: var(--text); }
+  .chip.b-excluded { background: #5a2f42; color: #fdd; }
   .chip.dog { background: #2f5d4a; color: #dfe; }
   .badge {
     font-size: 0.66rem;
     padding: 0.03rem 0.38rem;
     border-radius: 999px;
-    background: var(--border, #243042);
-    color: var(--muted, #9ab);
+    background: var(--bg-3);
+    color: var(--text-dim);
     flex: none;
   }
   .badge.done { background: #1f7a3f; color: #d6ffe2; }
@@ -1026,13 +1061,36 @@
   }
   .ch-main { display: flex; flex-direction: column; min-width: 0; }
   .ch-main strong { font-size: 0.95rem; }
-  .ch-when { font-size: 0.72rem; color: var(--muted, #9ab); }
+  .ch-when { font-size: 0.72rem; color: var(--text-dim); }
+  .ch-prov {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    align-items: center;
+    margin-top: 0.2rem;
+    font-size: 0.68rem;
+  }
+  .prov-model {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--text-dim);
+  }
+  .prov-model.unknown { font-style: italic; opacity: 0.7; }
+  .prov-class {
+    padding: 0.05rem 0.35rem;
+    border-radius: 0.5rem;
+    background: rgba(120, 140, 160, 0.18);
+    color: var(--text-dim);
+  }
+  .prov-class.alias {
+    background: rgba(34, 211, 238, 0.18);
+    color: #22d3ee;
+  }
   .ch-meta { display: flex; gap: 0.3rem; flex-wrap: wrap; }
   .pill {
     font-size: 0.68rem;
     padding: 0.1rem 0.45rem;
     border-radius: 999px;
-    background: var(--border, #243042);
+    background: var(--bg-3);
     color: #bcd;
     white-space: nowrap;
   }
@@ -1062,7 +1120,20 @@
     pointer-events: none;
   }
   .overlay .box { fill: none; vector-effect: non-scaling-stroke; }
-  .overlay .box.active { stroke: #36d07a; stroke-width: 3; }
+  .overlay .box.active { stroke: var(--green); stroke-width: 3; }
+  .overlay .box-label {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-weight: 600;
+    paint-order: stroke;
+    stroke: rgba(0, 0, 0, 0.82);
+    stroke-width: 4px;
+    vector-effect: non-scaling-stroke;
+    pointer-events: none;
+    dominant-baseline: alphabetic;
+  }
+  .overlay .box-label.active { fill: var(--green); }
+  .overlay .box-label.sibling { fill: var(--amber); opacity: 0.85; }
+  .overlay .box-label.alias { fill: var(--teal); }
   .no-detect {
     position: absolute;
     left: 50%;
@@ -1082,14 +1153,14 @@
     gap: 0.75rem;
     padding: 0.2rem 0.1rem 0;
     font-size: 0.7rem;
-    color: var(--muted, #8aa);
+    color: var(--text-dim);
   }
   .box-legend .lg { display: inline-flex; align-items: center; gap: 0.3rem; }
   .box-legend .sw { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
-  .box-legend .sw.own { border-top-color: #36d07a; }
-  .box-legend .sw.sib { border-top-color: #f0a93a; border-top-style: dashed; }
+  .box-legend .sw.own { border-top-color: var(--green); }
+  .box-legend .sw.sib { border-top-color: var(--amber); border-top-style: dashed; }
   .overlay .box.sibling {
-    stroke: #f0a93a;
+    stroke: var(--amber);
     stroke-width: 2;
     stroke-dasharray: 5 4;
     opacity: 0.8;
@@ -1097,35 +1168,12 @@
     cursor: pointer;
     fill: rgba(240, 169, 58, 0.06);
   }
-  .transport {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-  }
-  .transport button {
-    background: var(--border, #243042);
-    border: none;
-    color: inherit;
-    border-radius: 6px;
-    padding: 0.25rem 0.55rem;
-    cursor: pointer;
-    font-size: 0.85rem;
-  }
-  .transport button.play {
-    background: var(--accent, #2d6cdf);
-    min-width: 2.8rem;
-  }
-  .frame-readout {
-    margin-left: auto;
-    font-size: 0.76rem;
-    color: var(--muted, #9ab);
-  }
   .scrub { width: 100%; }
   .lane {
     width: 100%;
     height: 44px;
     border-radius: 6px;
-    border: 1px solid var(--border, #243042);
+    border: 1px solid var(--line-strong);
     cursor: pointer;
     display: block;
   }
@@ -1141,13 +1189,13 @@
     flex-direction: column;
     align-items: center;
     gap: 0.1rem;
-    background: var(--border, #1b2433);
+    background: var(--bg-3);
     border: 1px solid transparent;
     border-radius: 5px;
     padding: 0.15rem;
     cursor: pointer;
   }
-  .film-card.cur { border-color: #36d07a; }
+  .film-card.cur { border-color: var(--green); }
   .film-card img {
     width: 72px;
     height: 54px;
@@ -1163,7 +1211,7 @@
     background: #0a0e16;
     display: block;
   }
-  .film-f { font-size: 0.6rem; color: var(--muted, #9ab); }
+  .film-f { font-size: 0.6rem; color: var(--text-dim); }
 
   .editor-col {
     display: flex;
@@ -1189,7 +1237,7 @@
   }
   .marks button {
     flex: 1;
-    background: var(--border, #243042);
+    background: var(--bg-3);
     border: none;
     color: inherit;
     border-radius: 6px;
@@ -1211,14 +1259,14 @@
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--muted, #9ab);
+    color: var(--text-dim);
     flex: none;
   }
   .lbl {
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--muted, #9ab);
+    color: var(--text-dim);
   }
   .seg {
     display: flex;
@@ -1229,7 +1277,7 @@
     display: inline-flex;
     align-items: center;
     gap: 0.25rem;
-    background: var(--border, #243042);
+    background: var(--bg-3);
     border: 1px solid transparent;
     color: inherit;
     border-radius: 6px;
@@ -1238,8 +1286,9 @@
     font-size: 0.78rem;
   }
   .seg button.active {
-    background: var(--accent, #2d6cdf);
-    border-color: #5b8cf0;
+    background: var(--amber);
+    border-color: var(--amber-bright);
+    color: #1a1204;
   }
   .kh {
     font-size: 0.6rem;
@@ -1264,21 +1313,21 @@
     font-weight: 600;
   }
   .actions .save {
-    background: var(--border, #243042);
+    background: var(--bg-3);
     border: none;
     color: inherit;
     border-radius: 6px;
     padding: 0.4rem 0.7rem;
     cursor: pointer;
   }
-  .actions .save.dirty { background: var(--accent, #2d6cdf); color: #fff; }
+  .actions .save.dirty { background: var(--amber); color: #1a1204; }
   .actions .save:disabled { opacity: 0.6; cursor: default; }
   .ranges { display: flex; flex-direction: column; min-height: 0; }
   .ranges h3 {
     font-size: 0.74rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--muted, #9ab);
+    color: var(--text-dim);
     margin: 0.2rem 0;
   }
   .ranges ul {
@@ -1299,7 +1348,7 @@
     display: flex;
     align-items: center;
     background: var(--hover, #131c28);
-    border: 1px solid var(--border, #243042);
+    border: 1px solid var(--line-strong);
     border-radius: 6px;
     padding: 0.3rem 0.45rem;
     cursor: pointer;
@@ -1308,9 +1357,9 @@
   }
   .r-frames { font-size: 0.7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .r-sel {
-    background: var(--border, #243042);
+    background: var(--bg-3);
     color: inherit;
-    border: 1px solid var(--border, #2a3850);
+    border: 1px solid var(--line-strong);
     border-radius: 6px;
     font-size: 0.7rem;
     padding: 0.15rem 0.2rem;
@@ -1318,8 +1367,8 @@
   }
   .ranges .del {
     background: transparent;
-    border: 1px solid var(--border, #243042);
-    color: var(--muted, #c88);
+    border: 1px solid var(--line-strong);
+    color: var(--red);
     border-radius: 6px;
     width: 1.8rem;
     cursor: pointer;
@@ -1327,27 +1376,27 @@
   }
   .legend {
     font-size: 0.68rem;
-    color: var(--muted, #7e8ea0);
-    border-top: 1px solid var(--border, #1b2433);
+    color: var(--text-dim);
+    border-top: 1px solid var(--line-strong);
     padding-top: 0.4rem;
     margin-top: auto;
   }
 
   .pad { padding: 1rem; }
   .small { font-size: 0.72rem; }
-  .muted { color: var(--muted, #7e8ea0); }
+  .muted { color: var(--text-dim); }
   .error { color: #ff6b6b; }
-  .ok { color: #36d07a; }
+  .ok { color: var(--green); }
   .ghost {
     background: transparent;
-    border: 1px solid var(--border, #243042);
+    border: 1px solid var(--line-strong);
     color: inherit;
     border-radius: 6px;
     cursor: pointer;
     padding: 0.12rem 0.38rem;
   }
   code {
-    background: var(--border, #243042);
+    background: var(--bg-3);
     padding: 0.05rem 0.3rem;
     border-radius: 4px;
     font-size: 0.85em;

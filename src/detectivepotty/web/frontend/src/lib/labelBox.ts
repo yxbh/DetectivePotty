@@ -17,6 +17,8 @@ export interface ResolvedBox {
   extrapolated: boolean;
   /** Confidence of the nearest underlying sample (for tinting). */
   confidence: number;
+  /** Detected class of the nearest underlying sample (dog or an alias). */
+  class_name: string;
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -51,6 +53,7 @@ export function boxAtFrame(
       interpolated: false,
       extrapolated: frame < first.clip_frame_idx,
       confidence: first.confidence,
+      class_name: first.class_name ?? "dog",
     };
   }
   if (frame >= last.clip_frame_idx) {
@@ -59,6 +62,7 @@ export function boxAtFrame(
       interpolated: false,
       extrapolated: frame > last.clip_frame_idx,
       confidence: last.confidence,
+      class_name: last.class_name ?? "dog",
     };
   }
 
@@ -74,10 +78,10 @@ export function boxAtFrame(
   }
 
   if (frame === lo.clip_frame_idx) {
-    return { bbox: { ...lo.bbox }, interpolated: false, extrapolated: false, confidence: lo.confidence };
+    return { bbox: { ...lo.bbox }, interpolated: false, extrapolated: false, confidence: lo.confidence, class_name: lo.class_name ?? "dog" };
   }
   if (frame === hi.clip_frame_idx) {
-    return { bbox: { ...hi.bbox }, interpolated: false, extrapolated: false, confidence: hi.confidence };
+    return { bbox: { ...hi.bbox }, interpolated: false, extrapolated: false, confidence: hi.confidence, class_name: hi.class_name ?? "dog" };
   }
 
   const span = hi.clip_frame_idx - lo.clip_frame_idx;
@@ -92,5 +96,6 @@ export function boxAtFrame(
     interpolated: true,
     extrapolated: false,
     confidence: t < 0.5 ? lo.confidence : hi.confidence,
+    class_name: (t < 0.5 ? lo.class_name : hi.class_name) ?? "dog",
   };
 }

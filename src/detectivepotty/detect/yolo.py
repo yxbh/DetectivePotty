@@ -202,6 +202,36 @@ class DogDetector:
             )
         return outputs
 
+    def detect_scene_objects(
+        self,
+        frame_bgr_original: np.ndarray,
+        top_n: int = 8,
+    ) -> list[tuple[str, float]]:
+        """Top-``top_n`` detections of **any** class in the frame (diagnostic only).
+
+        Unlike :meth:`detect` this does *not* filter to the dog class — it surfaces
+        whatever the detector sees (cat, person, etc.) so a reviewer can tell whether
+        a "no dog box" frame is an empty scene, a sub-threshold dog, or the animal
+        being classified as something else. Runs at the configured confidence floor.
+        Returns ``(class_name, confidence)`` pairs sorted by confidence descending.
+        This is read-only and never touches the detection/harvest pipeline.
+        """
+
+        if frame_bgr_original.ndim < 2:
+            raise ValueError("frame_bgr_original must be an image array")
+
+        results = self._predict(frame_bgr_original)
+        result = results[0] if len(results) else None
+        if result is None:
+            return []
+        objects = [
+            (class_name, confidence)
+            for _xyxy, confidence, class_name in self._iter_boxes([result])
+            if confidence >= self.conf_threshold
+        ]
+        objects.sort(key=lambda item: item[1], reverse=True)
+        return objects[: max(0, top_n)]
+
     def _inference_info(
         self, original_w: int, original_h: int, latency_ms: float
     ) -> InferenceInfo:

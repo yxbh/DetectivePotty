@@ -13,7 +13,7 @@ import time
 from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
-from fastapi.concurrency import run_in_threadpool
+from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -82,6 +82,14 @@ TUNE_DETECTION_FLOOR = 0.05
 # ~8 frames x ~1 box, far under this.
 TUNE_POSE_MAX_CROPS = 64
 
+# Upper bound on the number of source frames one "Track range" request will decode.
+# Tracking must decode the whole requested range sequentially (in `sample_every`
+# stride) under the single clip reader, so this caps how long one request runs /
+# how much it decodes. ~6000 frames ≈ 200s at 30fps — generous for eyeballing a
+# dog visit, while keeping the synchronous request bounded. The client marks an
+# in/out sub-range; the server clamps `count` to this.
+TUNE_TRACK_MAX_FRAMES = 6000
+
 # Suffix -> MIME for the tuner clip endpoint. Browsers play mp4/mov/webm
 # natively; mkv/avi are served with a correct type even if a given browser
 # can't decode them.
@@ -93,6 +101,68 @@ _VIDEO_MIME = {
     ".mkv": "video/x-matroska",
     ".avi": "video/x-msvideo",
 }
+
+# Tune "Track range" tracker backends. ``off``/``ours`` use the harvest IoU
+# ``Tracker`` replay (every model incl. CoreML); the three native values map to
+# Ultralytics built-in trackers (``.pt``-only — Ultralytics tracking won't run on
+# a CoreML package). ``botsort_reid`` is BoT-SORT with appearance ReID enabled.
+TUNE_TRACKERS = ("off", "ours", "bytetrack", "botsort", "botsort_reid")
+_ULTRALYTICS_TRACKERS = ("bytetrack", "botsort", "botsort_reid")
+
+
+def _ultralytics_tracking_available() -> bool:
+    """True when Ultralytics native tracking can run (its ``lap`` dep imports).
+
+    Ultralytics' association step needs ``lap`` (linear assignment); it is a core
+    dependency, but the endpoint feature-detects it so a stripped env degrades to a
+    clear 400 instead of an opaque import error mid-request.
+    """
+
+    import importlib.util
+
+    return importlib.util.find_spec("lap") is not None
+
+
+def _ultralytics_dog_class_indices(model: object) -> list[int]:
+    """Class indices whose name is ``dog`` for ``model`` (fallback COCO 16)."""
+
+    names = getattr(model, "names", None) or {}
+    if isinstance(names, dict):
+        idxs = [int(i) for i, n in names.items() if str(n).lower() == "dog"]
+    else:  # pragma: no cover - list-style names are rare
+        idxs = [i for i, n in enumerate(names) if str(n).lower() == "dog"]
+    return idxs or [16]
+
+
+def _ultralytics_boxes(result: object) -> list[dict]:
+    """Map one Ultralytics tracking ``Results`` to Tune track-box dicts.
+
+    Returns ``[{x1,y1,x2,y2,confidence,class_name,track_id}...]`` in original-image
+    coordinates (Ultralytics already maps boxes back from the letterboxed input).
+    Boxes the tracker hasn't assigned an ID yet (``boxes.id is None``) are skipped —
+    only persistent tracks contribute to the overlay + de-fragmentation stats.
+    """
+
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or getattr(boxes, "id", None) is None:
+        return []
+    xyxy = boxes.xyxy.tolist()
+    confs = boxes.conf.tolist()
+    ids = boxes.id.tolist()
+    out: list[dict] = []
+    for (x1, y1, x2, y2), conf, tid in zip(xyxy, confs, ids):
+        out.append(
+            {
+                "x1": float(x1),
+                "y1": float(y1),
+                "x2": float(x2),
+                "y2": float(y2),
+                "confidence": float(conf),
+                "class_name": "dog",
+                "track_id": str(int(tid)),
+            }
+        )
+    return out
 
 
 class LabelUpdate(BaseModel):
@@ -534,6 +604,42 @@ def create_app(
             payload["image"] = tune_mod.encode_jpeg_dataurl(frame)
         return payload
 
+    def _scene_payload(
+        file_path: Path,
+        index: int,
+        model_name: str,
+        top_n: int,
+    ) -> dict:
+        """Top-N all-class detections for one frame (diagnostic, no image/boxes).
+
+        Mirrors ``_detect_payload`` but skips the dog-class filter, so the reviewer
+        can see whether a frame with no dog box is empty, a sub-threshold dog, or an
+        animal classed as something else (cat/person/...). Read-only — runs the same
+        detector at the confidence floor under ``tune_infer_lock`` and never touches
+        the harvest/detection pipeline.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        frame, idx, total, fps, width, height = tune_mod.read_frame(file_path, index)
+        detector, model_used = _get_tune_detector(model_name)
+        with app.state.tune_infer_lock:
+            objects = detector.detect_scene_objects(frame, top_n=top_n)
+        return {
+            "path": str(file_path),
+            "index": idx,
+            "total_frames": total or None,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "model": model_used,
+            "detection_floor": TUNE_DETECTION_FLOOR,
+            "objects": [
+                {"class_name": class_name, "confidence": confidence}
+                for class_name, confidence in objects
+            ],
+        }
+
     def _detect_range_payload(
         file_path: Path,
         start: int,
@@ -594,6 +700,326 @@ def create_app(
             for (idx, _frame), detections in zip(frames, results)
         ]
         return {"model": model_used, "frames": out_frames}
+
+    def _iter_track_range(
+        file_path: Path,
+        start: int,
+        count: int,
+        model_name: str,
+        *,
+        sample_every: int,
+        iou_threshold: float,
+        max_age_frames: int,
+        center_dist_gate: float,
+    ):
+        """Streaming generator core of the ``ours`` Track-range backend.
+
+        Decodes ``[start, start+count)`` in ``tune_detection_batch_size`` chunks,
+        batch-detects the **sampled** frames (``frame_idx % sample_every == 0`` in
+        source numbering, matching the harvest scan), and replays each chunk's
+        detections through a single persistent harvest ``Tracker`` **in ascending
+        frame order** — so a track's id is consistent across the whole pass. Yields
+        ``{"type":"frames","frames":[...]}`` per non-empty chunk (forward-fill /
+        progress), then a final ``{"type":"done", ...stats}``. Because chunks and the
+        frames within them are already ascending, draining this reproduces
+        :func:`tune.track_detections`'s output byte-for-byte (see ``_track_range_payload``).
+        Inference is serialized per chunk by ``tune_infer_lock`` (released between
+        chunks so other detect requests can interleave). Works with any model
+        including CoreML. ``count`` is pre-clamped by the caller.
+        """
+
+        from detectivepotty.detect.yolo import FrameMeta
+        from detectivepotty.tracking import Tracker
+        from detectivepotty.web import tune as tune_mod
+
+        detector, model_used = _get_tune_detector(model_name)
+        batch = getattr(detector, "detect_batch", None)
+        decode_cap = max(1, app.state.config.global_settings.tune_detection_batch_size)
+        stride = max(1, sample_every)
+
+        tracker = Tracker(
+            iou_threshold=iou_threshold,
+            max_age_frames=max_age_frames,
+            center_dist_gate=center_dist_gate,
+        )
+        out_frames: list[dict] = []
+        fps = 0.0
+        total = 0
+        cursor = start
+        end = start + count
+        wall = datetime.now(timezone.utc)
+        mono = time.monotonic()
+        while cursor < end:
+            chunk_count = min(decode_cap, end - cursor)
+            try:
+                frames, total, fps, _w, _h = tune_mod.read_frames(
+                    file_path, cursor, chunk_count
+                )
+            except IndexError:
+                break  # past EOF: track what we have
+            sampled = [(idx, frame) for idx, frame in frames if idx % stride == 0]
+            chunk_out: list[dict] = []
+            if sampled:
+                bgr_list = [frame for _idx, frame in sampled]
+                metas = [
+                    FrameMeta(frame_idx=idx, mono_ts=mono, wall_ts=wall)
+                    for idx, _frame in sampled
+                ]
+                with app.state.tune_infer_lock:
+                    if batch is not None:
+                        results = batch(bgr_list, metas)
+                    else:
+                        results = [
+                            detector.detect(
+                                frame, frame_idx=idx, mono_ts=mono, wall_ts=wall
+                            )
+                            for idx, frame in sampled
+                        ]
+                for (idx, _frame), dets in zip(sampled, results):
+                    record = tune_mod.track_step(tracker, idx, list(dets))
+                    out_frames.append(record)
+                    chunk_out.append(record)
+            if chunk_out:
+                yield {"type": "frames", "frames": chunk_out}
+            # Advance by the frames actually decoded (handles short EOF reads).
+            last_decoded = frames[-1][0]
+            if last_decoded < cursor:  # pragma: no cover - defensive
+                break
+            cursor = last_decoded + 1
+
+        stats = tune_mod.summarize_tracked_frames(
+            out_frames,
+            fps=fps or 30.0,
+            total_frames=total or None,
+            sample_every=stride,
+            tracker="ours",
+            iou_threshold=iou_threshold,
+            max_age_frames=max_age_frames,
+            center_dist_gate=center_dist_gate,
+        )
+        yield {
+            "type": "done",
+            "model": model_used,
+            "start": start,
+            "count": count,
+            "fps": fps,
+            "total_frames": total or None,
+            "detection_floor": TUNE_DETECTION_FLOOR,
+            "stats": stats,
+        }
+
+    def _track_range_payload(
+        file_path: Path,
+        start: int,
+        count: int,
+        model_name: str,
+        *,
+        sample_every: int,
+        iou_threshold: float,
+        max_age_frames: int,
+        center_dist_gate: float,
+    ) -> dict:
+        """Non-streaming ``ours`` Track-range payload (drains :func:`_iter_track_range`).
+
+        Kept byte-identical to the pre-streaming behaviour by collecting every
+        ``frames`` record and merging the final ``done`` record — so the existing
+        ``/api/tune/track_range`` contract + tests are unchanged.
+        """
+
+        frames: list[dict] = []
+        done: dict = {}
+        for rec in _iter_track_range(
+            file_path,
+            start,
+            count,
+            model_name,
+            sample_every=sample_every,
+            iou_threshold=iou_threshold,
+            max_age_frames=max_age_frames,
+            center_dist_gate=center_dist_gate,
+        ):
+            if rec["type"] == "frames":
+                frames.extend(rec["frames"])
+            elif rec["type"] == "done":
+                done = rec
+        return {
+            "model": done.get("model", model_name),
+            "start": start,
+            "count": count,
+            "fps": done.get("fps", 0.0),
+            "total_frames": done.get("total_frames"),
+            "detection_floor": TUNE_DETECTION_FLOOR,
+            "frames": frames,
+            "stats": done.get("stats", {}),
+        }
+
+    def _iter_track_range_ultralytics(
+        file_path: Path,
+        start: int,
+        count: int,
+        model_name: str,
+        *,
+        tracker: str,
+        sample_every: int,
+    ):
+        """Streaming generator core of the ``.pt``-only Ultralytics tracker backend.
+
+        Streams the **sampled** frames (harvest scan stride) sequentially through
+        ``model.track(persist=True, tracker=<yaml>)`` so the built-in motion/appearance
+        association assigns persistent IDs, yielding ``{"type":"frames","frames":[...]}``
+        per decode chunk (forward-fill / progress) then a final ``{"type":"done",
+        ...stats}`` via :func:`tune.summarize_tracked_frames`. ``botsort_reid`` is
+        BoT-SORT with ``with_reid: True`` (appearance ReID from the detector's own
+        features). A **fresh** ``YOLO`` is built per call so ``persist`` tracker state
+        never leaks across requests; the lock is held for the whole pass because the
+        online tracker's per-frame state must be updated atomically. Draining this
+        reproduces ``_track_range_ultralytics_payload``. ``count`` is pre-clamped by the
+        caller.
+        """
+
+        import tempfile
+
+        from detectivepotty.device import resolve_device
+        from detectivepotty.web import tune as tune_mod
+
+        # Allow-list + `.pt` guard (also enforced by the endpoint, kept here so the
+        # generator is safe if ever driven directly).
+        if model_name not in app.state.tune_models:
+            raise ValueError(f"unknown model: {model_name}")
+        if not model_name.endswith(".pt"):
+            raise ValueError("Ultralytics tracking requires a .pt model")
+        if not _ultralytics_tracking_available():
+            raise ValueError("Ultralytics tracking unavailable (install `lap`)")
+
+        from ultralytics import YOLO
+
+        device = resolve_device(app.state.config.global_settings.device)
+        long_edge = app.state.config.global_settings.inference_long_edge_px
+        decode_cap = max(1, app.state.config.global_settings.tune_detection_batch_size)
+        stride = max(1, sample_every)
+
+        # Resolve the tracker yaml. bytetrack/botsort ship with Ultralytics; the ReID
+        # variant is botsort.yaml with `with_reid: True` written to a temp file.
+        from ultralytics.utils import ROOT as _ULTRA_ROOT
+
+        trackers_dir = Path(_ULTRA_ROOT) / "cfg" / "trackers"
+        tmp_yaml: Path | None = None
+        if tracker == "bytetrack":
+            tracker_yaml = str(trackers_dir / "bytetrack.yaml")
+        elif tracker == "botsort":
+            tracker_yaml = str(trackers_dir / "botsort.yaml")
+        elif tracker == "botsort_reid":
+            base = (trackers_dir / "botsort.yaml").read_text()
+            base = base.replace("with_reid: False", "with_reid: True")
+            tmp = Path(tempfile.mkdtemp(prefix="dp_reid_")) / "botsort_reid.yaml"
+            tmp.write_text(base)
+            tmp_yaml = tmp
+            tracker_yaml = str(tmp)
+        else:  # pragma: no cover - guarded by the endpoint
+            raise ValueError(f"unknown ultralytics tracker: {tracker}")
+
+        out_frames: list[dict] = []
+        fps = 0.0
+        total = 0
+        try:
+            model = YOLO(model_name)
+            dog_idxs = _ultralytics_dog_class_indices(model)
+            cursor = start
+            end = start + count
+            with app.state.tune_infer_lock:
+                while cursor < end:
+                    chunk_count = min(decode_cap, end - cursor)
+                    try:
+                        frames, total, fps, _w, _h = tune_mod.read_frames(
+                            file_path, cursor, chunk_count
+                        )
+                    except IndexError:
+                        break  # past EOF: track what we have
+                    chunk_out: list[dict] = []
+                    for idx, frame in frames:
+                        if idx % stride != 0:
+                            continue
+                        result = model.track(
+                            frame,
+                            persist=True,
+                            tracker=tracker_yaml,
+                            classes=dog_idxs,
+                            imgsz=long_edge,
+                            device=device,
+                            conf=TUNE_DETECTION_FLOOR,
+                            verbose=False,
+                        )[0]
+                        record = {
+                            "index": idx,
+                            "detections": _ultralytics_boxes(result),
+                        }
+                        out_frames.append(record)
+                        chunk_out.append(record)
+                    if chunk_out:
+                        yield {"type": "frames", "frames": chunk_out}
+                    last_decoded = frames[-1][0]
+                    if last_decoded < cursor:  # pragma: no cover - defensive
+                        break
+                    cursor = last_decoded + 1
+        finally:
+            if tmp_yaml is not None:
+                import shutil
+
+                shutil.rmtree(tmp_yaml.parent, ignore_errors=True)
+
+        stats = tune_mod.summarize_tracked_frames(
+            out_frames,
+            fps=fps or 30.0,
+            total_frames=total or None,
+            sample_every=stride,
+            tracker=tracker,
+        )
+        yield {
+            "type": "done",
+            "model": model_name,
+            "start": start,
+            "count": count,
+            "fps": fps,
+            "total_frames": total or None,
+            "detection_floor": TUNE_DETECTION_FLOOR,
+            "stats": stats,
+        }
+
+    def _track_range_ultralytics_payload(
+        file_path: Path,
+        start: int,
+        count: int,
+        model_name: str,
+        *,
+        tracker: str,
+        sample_every: int,
+    ) -> dict:
+        """Non-streaming Ultralytics Track-range payload (drains the generator)."""
+
+        frames: list[dict] = []
+        done: dict = {}
+        for rec in _iter_track_range_ultralytics(
+            file_path,
+            start,
+            count,
+            model_name,
+            tracker=tracker,
+            sample_every=sample_every,
+        ):
+            if rec["type"] == "frames":
+                frames.extend(rec["frames"])
+            elif rec["type"] == "done":
+                done = rec
+        return {
+            "model": done.get("model", model_name),
+            "start": start,
+            "count": count,
+            "fps": done.get("fps", 0.0),
+            "total_frames": done.get("total_frames"),
+            "detection_floor": TUNE_DETECTION_FLOOR,
+            "frames": frames,
+            "stats": done.get("stats", {}),
+        }
 
     def _pose_payload(
         file_path: Path,
@@ -833,6 +1259,34 @@ def create_app(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
+    @app.get("/api/tune/scene")
+    async def tune_scene(
+        path: str,
+        index: Annotated[int, Query(ge=0)] = 0,
+        top_n: Annotated[int, Query(ge=1, le=20)] = 8,
+        model: str | None = None,
+    ) -> dict:
+        """Top-N all-class detections for one frame (diagnostic, no dog filter)."""
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        model_name = _resolve_tune_model(model)
+
+        try:
+            return await run_in_threadpool(
+                _scene_payload,
+                file_path,
+                index,
+                model_name,
+                top_n,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
     @app.get("/api/tune/detect_range")
     async def tune_detect_range(
         path: str,
@@ -868,6 +1322,164 @@ def create_app(
             )
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.get("/api/tune/track_range")
+    async def tune_track_range(
+        path: str,
+        start: Annotated[int, Query(ge=0)] = 0,
+        count: Annotated[int, Query(ge=1)] = 1,
+        model: str | None = None,
+        tracker: str = "ours",
+        sample_every: Annotated[int, Query(ge=1, le=60)] = 5,
+        iou_threshold: Annotated[float, Query(ge=0.0, le=1.0)] = 0.3,
+        max_age_frames: Annotated[int, Query(ge=0, le=300)] = 15,
+        center_dist_gate: Annotated[float, Query(ge=0.0, le=20.0)] = 1.5,
+    ) -> dict:
+        """Track a ``[start, start+count)`` range with the chosen tracker backend.
+
+        ``tracker=off``/``ours`` use the harvest IoU ``Tracker`` replay (decode +
+        detect the sampled frames, replay through ``Tracker`` with the supplied
+        knobs) — works with every model including CoreML ``.mlpackage``.
+        ``tracker=bytetrack``/``botsort``/``botsort_reid`` use Ultralytics native
+        tracking (``.pt``-only, ``botsort_reid`` adds appearance ReID). Either way
+        returns persistent per-frame track-ID boxes + de-fragmentation stats
+        (distinct tracks, spans, presence windows, spans-per-window). ``count`` is
+        capped by ``TUNE_TRACK_MAX_FRAMES``.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        if tracker not in TUNE_TRACKERS:
+            raise HTTPException(status_code=400, detail=f"unknown tracker: {tracker}")
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        model_name = _resolve_tune_model(model)
+        bounded = min(count, TUNE_TRACK_MAX_FRAMES)
+
+        if tracker in _ULTRALYTICS_TRACKERS:
+            if not model_name.endswith(".pt"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ultralytics tracking requires a .pt model",
+                )
+            if not _ultralytics_tracking_available():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ultralytics tracking unavailable (install `lap`)",
+                )
+            try:
+                return await run_in_threadpool(
+                    _track_range_ultralytics_payload,
+                    file_path,
+                    start,
+                    bounded,
+                    model_name,
+                    tracker=tracker,
+                    sample_every=sample_every,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (FileNotFoundError, IndexError) as exc:
+                raise HTTPException(
+                    status_code=404, detail="frame not available"
+                ) from exc
+
+        try:
+            return await run_in_threadpool(
+                _track_range_payload,
+                file_path,
+                start,
+                bounded,
+                model_name,
+                sample_every=sample_every,
+                iou_threshold=iou_threshold,
+                max_age_frames=max_age_frames,
+                center_dist_gate=center_dist_gate,
+            )
+        except (FileNotFoundError, IndexError) as exc:
+            raise HTTPException(status_code=404, detail="frame not available") from exc
+
+    @app.get("/api/tune/track_range_stream")
+    async def tune_track_range_stream(
+        path: str,
+        start: Annotated[int, Query(ge=0)] = 0,
+        count: Annotated[int, Query(ge=1)] = 1,
+        model: str | None = None,
+        tracker: str = "ours",
+        sample_every: Annotated[int, Query(ge=1, le=60)] = 5,
+        iou_threshold: Annotated[float, Query(ge=0.0, le=1.0)] = 0.3,
+        max_age_frames: Annotated[int, Query(ge=0, le=300)] = 15,
+        center_dist_gate: Annotated[float, Query(ge=0.0, le=20.0)] = 1.5,
+    ) -> StreamingResponse:
+        """Stream a Track-range pass as newline-delimited JSON (forward-fill + progress).
+
+        The streaming sibling of :func:`tune_track_range`: identical params/backends,
+        but instead of buffering the whole pass it emits one
+        ``{"type":"frames","frames":[...]}`` line per decode chunk as the in-order
+        0→end pass computes (so the client can fill the timeline + show progress live),
+        then a final ``{"type":"done", ...stats}`` line. All guards (unknown tracker,
+        bad path, ultra ``.pt``/availability) run **before** streaming starts so they
+        still surface as a 400; a mid-stream failure emits a final
+        ``{"type":"error","detail":...}`` line. ``count`` is capped by
+        ``TUNE_TRACK_MAX_FRAMES``. The sync generator runs in the threadpool, so its
+        blocking decode/inference never blocks the event loop.
+        """
+
+        from detectivepotty.web import tune as tune_mod
+
+        if tracker not in TUNE_TRACKERS:
+            raise HTTPException(status_code=400, detail=f"unknown tracker: {tracker}")
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+        model_name = _resolve_tune_model(model)
+        bounded = min(count, TUNE_TRACK_MAX_FRAMES)
+
+        if tracker in _ULTRALYTICS_TRACKERS:
+            if not model_name.endswith(".pt"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ultralytics tracking requires a .pt model",
+                )
+            if not _ultralytics_tracking_available():
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ultralytics tracking unavailable (install `lap`)",
+                )
+            gen = _iter_track_range_ultralytics(
+                file_path,
+                start,
+                bounded,
+                model_name,
+                tracker=tracker,
+                sample_every=sample_every,
+            )
+        else:
+            gen = _iter_track_range(
+                file_path,
+                start,
+                bounded,
+                model_name,
+                sample_every=sample_every,
+                iou_threshold=iou_threshold,
+                max_age_frames=max_age_frames,
+                center_dist_gate=center_dist_gate,
+            )
+
+        async def _ndjson():
+            try:
+                async for rec in iterate_in_threadpool(gen):
+                    yield json.dumps(rec) + "\n"
+            except (ValueError, FileNotFoundError, IndexError) as exc:
+                yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
+            except Exception as exc:  # pragma: no cover - defensive
+                logging.getLogger(__name__).exception("track_range_stream failed")
+                yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
+
+        return StreamingResponse(_ndjson(), media_type="application/x-ndjson")
 
     @app.post("/api/tune/pose")
     async def tune_pose(req: TunePoseRequest) -> dict:

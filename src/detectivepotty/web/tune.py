@@ -504,6 +504,190 @@ def detections_payload(detections: Sequence[Detection]) -> list[dict[str, Any]]:
     ]
 
 
+def track_step(
+    tracker: Any,
+    frame_idx: int,
+    detections: Sequence[Detection],
+) -> dict[str, Any]:
+    """Advance ``tracker`` by one sampled frame and shape its tracked boxes.
+
+    The single-frame primitive shared by the batch :func:`track_detections` replay
+    and the streaming ``app._iter_track_range`` generator, so both produce
+    byte-identical per-frame records. Calls ``tracker.update(...)`` (which mutates
+    the tracker's state) and returns ``{"index", "detections": [{x1,y1,x2,y2,
+    confidence,class_name,track_id}...]}`` for the active tracks visible at
+    ``frame_idx``. Must be called in ascending ``frame_idx`` order (tracking is
+    stateful). Pure aside from the tracker mutation; no model, no I/O.
+    """
+
+    from detectivepotty.harvest import _latest_detection_at
+
+    tracks = tracker.update(list(detections))
+    boxes: list[dict[str, Any]] = []
+    for track in tracks:
+        latest = _latest_detection_at(track, frame_idx)
+        if latest is None:
+            continue
+        boxes.append(
+            {
+                "x1": float(latest.bbox.x1),
+                "y1": float(latest.bbox.y1),
+                "x2": float(latest.bbox.x2),
+                "y2": float(latest.bbox.y2),
+                "confidence": float(latest.confidence),
+                "class_name": latest.class_name,
+                "track_id": track.track_id,
+            }
+        )
+    return {"index": frame_idx, "detections": boxes}
+
+
+def track_detections(
+    per_frame: Sequence[tuple[int, Sequence[Detection]]],
+    *,
+    fps: float,
+    total_frames: int | None = None,
+    sample_every: int = 5,
+    iou_threshold: float = 0.3,
+    max_age_frames: int = 15,
+    center_dist_gate: float = 1.5,
+) -> dict[str, Any]:
+    """Replay per-frame detections through the harvest ``Tracker`` and shape it.
+
+    This is the GUI-free, model-free core of the Tune "Track range" feature: given
+    the per-frame detection lists the detect path already produces (one ``(frame_idx,
+    detections)`` pair per *sampled* frame, in any order), it replays them through
+    :class:`detectivepotty.tracking.Tracker` **in ascending frame order** — exactly
+    as :func:`detectivepotty.harvest._scan_for_dogs` does — and returns persistent
+    per-frame track-ID boxes plus de-fragmentation stats.
+
+    The tracker knobs (``iou_threshold`` / ``max_age_frames`` / ``center_dist_gate``)
+    and ``sample_every`` mirror the harvest scan, so tuning them here directly
+    previews the harvest segmentation. ``fps`` + ``total_frames`` feed
+    :func:`detectivepotty.harvest.compute_spans` (using harvest's default span params)
+    so the ``spans`` / ``presence_windows`` / ``spans_per_window`` stats match what a
+    harvest with the same knobs would produce. ``total_frames`` defaults to the
+    highest seen frame index + 1.
+
+    Returns ``{"frames": [{"index", "detections": [{x1,y1,x2,y2,confidence,
+    class_name,track_id}...]}...], "stats": {...}}``. Pure: no model, no I/O.
+    """
+
+    from detectivepotty.tracking import Tracker
+
+    ordered = sorted(per_frame, key=lambda item: item[0])
+    tracker = Tracker(
+        iou_threshold=iou_threshold,
+        max_age_frames=max_age_frames,
+        center_dist_gate=center_dist_gate,
+    )
+    out_frames = [track_step(tracker, frame_idx, detections) for frame_idx, detections in ordered]
+
+    stats = summarize_tracked_frames(
+        out_frames,
+        fps=fps,
+        total_frames=total_frames,
+        sample_every=sample_every,
+        tracker="ours",
+        iou_threshold=iou_threshold,
+        max_age_frames=max_age_frames,
+        center_dist_gate=center_dist_gate,
+    )
+    return {"frames": out_frames, "stats": stats}
+
+
+def summarize_tracked_frames(
+    out_frames: Sequence[dict[str, Any]],
+    *,
+    fps: float,
+    total_frames: int | None,
+    sample_every: int,
+    tracker: str,
+    iou_threshold: float | None = None,
+    max_age_frames: int | None = None,
+    center_dist_gate: float | None = None,
+) -> dict[str, Any]:
+    """Compute de-fragmentation stats for already-tracked per-frame boxes.
+
+    The backend-agnostic stats tail shared by both Tune tracker backends: the
+    ``ours`` :class:`~detectivepotty.tracking.Tracker` replay
+    (:func:`track_detections`) and the Ultralytics native path
+    (``app._track_range_ultralytics_payload``). Given ``out_frames`` —
+    ``[{"index", "detections": [{x1,y1,x2,y2,confidence,class_name,track_id}...]}...]``
+    in any order — it rebuilds the per-track presence, runs the harvest
+    :func:`~detectivepotty.harvest.compute_spans` (so ``spans`` / presence windows /
+    ``spans_per_window`` match a harvest with the same stride), and returns the stats
+    dict the Tune stats readout consumes. ``iou_threshold`` / ``max_age_frames`` /
+    ``center_dist_gate`` are the ``ours`` knobs (``None`` for native trackers, which
+    use their own yaml params). Pure: no model, no I/O.
+    """
+
+    from detectivepotty.geometry import BBox
+    from detectivepotty.harvest import (
+        FrameSample,
+        _merge_frame_ranges,
+        compute_spans,
+    )
+
+    fps_safe = fps if fps and fps > 0 else 30.0
+    presence: dict[str, list[FrameSample]] = {}
+    max_idx = -1
+    n_detections = 0
+    for frame in out_frames:
+        frame_idx = int(frame["index"])
+        max_idx = max(max_idx, frame_idx)
+        time_s = frame_idx / fps_safe
+        for det in frame["detections"]:
+            n_detections += 1
+            presence.setdefault(str(det["track_id"]), []).append(
+                FrameSample(
+                    frame_idx=frame_idx,
+                    time_s=time_s,
+                    bbox=BBox(
+                        float(det["x1"]),
+                        float(det["y1"]),
+                        float(det["x2"]),
+                        float(det["y2"]),
+                    ),
+                    confidence=float(det["confidence"]),
+                )
+            )
+
+    resolved_total = total_frames if total_frames and total_frames > 0 else max_idx + 1
+    spans = (
+        compute_spans(presence, fps=fps_safe, total_frames=resolved_total)
+        if resolved_total > 0
+        else []
+    )
+    windows = _merge_frame_ranges(
+        [(span.start_frame, span.end_frame) for span in spans]
+    )
+    n_spans = len(spans)
+    n_windows = len(windows)
+    track_ids = sorted(presence.keys(), key=_track_id_sort_key)
+    return {
+        "tracker": tracker,
+        "n_tracks": len(track_ids),
+        "track_ids": track_ids,
+        "n_sampled_frames": len(out_frames),
+        "n_detections": n_detections,
+        "n_spans": n_spans,
+        "n_presence_windows": n_windows,
+        "spans_per_window": (n_spans / n_windows) if n_windows else 0.0,
+        "sample_every": sample_every,
+        "iou_threshold": iou_threshold,
+        "max_age_frames": max_age_frames,
+        "center_dist_gate": center_dist_gate,
+    }
+
+
+def _track_id_sort_key(track_id: str) -> tuple[int, str]:
+    try:
+        return (int(track_id), track_id)
+    except ValueError:
+        return (0, track_id)
+
+
 def _pose_entry(bbox: BBox, keypoints: PoseKeypoints) -> dict[str, Any]:
     """Shape one (bbox, keypoints) pair into the overlay payload.
 

@@ -184,6 +184,99 @@ export interface TuneDetectRangeResult {
   frames: TuneDetectResult[];
 }
 
+/** One top-N "object in scene" row (any class, no dog filter). */
+export interface TuneSceneObject {
+  class_name: string;
+  confidence: number;
+}
+
+/** Top-N all-class detections for one frame (`GET /api/tune/scene`) — the
+ *  diagnostic "objects in scene" list. No boxes are drawn; this just tells the
+ *  reviewer what the detector sees on a frame, including non-dog classes. */
+export interface TuneSceneResult {
+  path: string;
+  index: number;
+  total_frames: number | null;
+  fps: number;
+  width: number;
+  height: number;
+  model: string;
+  detection_floor: number;
+  objects: TuneSceneObject[];
+}
+
+/** One detection box carrying a persistent track ID (the tracker overlay). */
+export interface TuneTrackedDetection {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  confidence: number;
+  class_name: string;
+  track_id: string;
+}
+
+/** Per-frame tracked boxes for one sampled frame (`GET /api/tune/track_range`). */
+export interface TuneTrackedFrame {
+  index: number;
+  detections: TuneTrackedDetection[];
+}
+
+/** De-fragmentation stats for a tracked range — the model x tracker comparison. */
+export interface TuneTrackStats {
+  /** Which backend produced these: `ours` | `bytetrack` | `botsort` | `botsort_reid`. */
+  tracker: string;
+  n_tracks: number;
+  track_ids: string[];
+  n_sampled_frames: number;
+  n_detections: number;
+  n_spans: number;
+  n_presence_windows: number;
+  spans_per_window: number;
+  sample_every: number;
+  /** `ours`-tracker knobs; `null` for the Ultralytics backends (own yaml params). */
+  iou_threshold: number | null;
+  max_age_frames: number | null;
+  center_dist_gate: number | null;
+}
+
+/** Result of tracking a `[start, start+count)` range with a chosen tracker. */
+export interface TuneTrackRangeResult {
+  model: string;
+  start: number;
+  count: number;
+  fps: number;
+  total_frames: number | null;
+  detection_floor: number;
+  frames: TuneTrackedFrame[];
+  stats: TuneTrackStats;
+}
+
+/** Terminal record of the NDJSON Track-range stream (everything but the frames,
+ *  which arrive incrementally as `frames` records during the forward pass). */
+export interface TuneTrackStreamDone {
+  model: string;
+  start: number;
+  count: number;
+  fps: number;
+  total_frames: number | null;
+  detection_floor: number;
+  stats: TuneTrackStats;
+}
+
+/** The tracker backends the Tune surface offers. `off` = per-frame boxes (no
+ *  tracking); `ours` = the harvest IoU `Tracker` replay (every model incl. CoreML);
+ *  the `bytetrack`/`botsort*` options are Ultralytics native tracking (`.pt`-only). */
+export type TuneTracker = "off" | "ours" | "bytetrack" | "botsort" | "botsort_reid";
+
+/** Harvest-tracker knobs surfaced for the `ours` backend. */
+export interface TuneTrackerParams {
+  sample_every: number;
+  iou_threshold: number;
+  max_age_frames: number;
+  center_dist_gate: number;
+}
+
 // --- Range labeling (/label) ---------------------------------------------
 
 /** One harvested clip's listing row (identity + labeling progress). */

@@ -8,6 +8,8 @@
     fetchTuneMeta,
     fetchTuneModels,
     fetchTunePoseRange,
+    fetchTuneScene,
+    streamTuneTrackRange,
     tuneClipUrl,
   } from "./api";
   import type {
@@ -16,6 +18,10 @@
     TuneListing,
     TuneMeta,
     TunePose,
+    TuneSceneObject,
+    TuneTracker,
+    TuneTrackStats,
+    TuneTrackedDetection,
   } from "./types";
 
   // How many frames Shift+Arrow skips.
@@ -156,6 +162,61 @@
   // and HUD counts update when the playhead or buffer changes.
   let frameDetections = $state<TuneDetection[]>([]);
   let framePose = $state<TunePose[]>([]);
+
+  // --- tracking (P1j) -------------------------------------------------------
+  // Tracking is a stateful, order-dependent batch pass: the user picks a tracker
+  // + knobs and hits "Track range", the server decodes+detects+tracks the whole
+  // clip in frame order (exactly like the harvest scan), and we cache the
+  // per-frame track-id assignments. Scrub/play then draws persistent colored
+  // boxes from the cache — the client stays stateless.
+  let tracker = $state<TuneTracker>("off");
+  // Harvest `ours` (IoU + center-gate) knobs — tuning these here tunes the
+  // harvest segmentation, since both replay through the same `Tracker`.
+  let trackSampleEvery = $state(5);
+  let trackIou = $state(0.3);
+  let trackMaxAge = $state(15);
+  let trackCenterGate = $state(1.5);
+  let tracking = $state(false);
+  let trackError = $state<string | null>(null);
+  let trackStats = $state<TuneTrackStats | null>(null);
+  // Streaming progress: how many sampled frames the forward pass has filled, and
+  // the total expected for the bar. Tracking is sequential + stateful, so the pass
+  // is always a single 0→end sweep we can show a progress readout for.
+  let trackDone = $state(0);
+  let trackExpected = $state(0);
+  // AbortController for the in-flight streaming pass; switching clip/model/tracker
+  // or clearing aborts it.
+  let trackController: AbortController | null = null;
+  // Debounce timer for the `ours` auto-run (knob typing shouldn't flood passes).
+  let trackAutoTimer: ReturnType<typeof setTimeout> | null = null;
+  // Tracked boxes per *sampled* source frame index. Non-reactive (like `buffer`);
+  // the presented frame's boxes are mirrored into `frameTracks` by syncView.
+  const trackByIndex = new Map<number, TuneTrackedDetection[]>();
+  // The sample stride the cached track pass was run at (for nearest-sample snap).
+  let trackedStride = 1;
+  // The tracked boxes for the currently presented frame (reactive draw input).
+  let frameTracks = $state<TuneTrackedDetection[]>([]);
+  // True once a track pass has populated the cache for this clip/model scope.
+  let tracked = $state(false);
+
+  // --- Objects-in-scene diagnostic (top-N all-class detections) --------------
+  // A read-only list (no boxes drawn) of what the detector sees on the current
+  // frame, INCLUDING non-dog classes. Answers "is this gap an empty scene, a
+  // sub-threshold dog, or the dog classed as a cat?". Fetched on the presented
+  // frame (debounced, stale-aborted) only while the panel is open.
+  let sceneOpen = $state(false);
+  let sceneObjects = $state<TuneSceneObject[]>([]);
+  let sceneLoading = $state(false);
+  let sceneError = $state<string | null>(null);
+  let sceneIndex = $state<number | null>(null);
+  let sceneController: AbortController | null = null;
+  let sceneTimer: ReturnType<typeof setTimeout> | null = null;
+  const SCENE_TOP_N = 8;
+
+  const trackingActive = $derived(tracker !== "off" && tracked);
+  // Ultralytics backends are .pt-only and not yet wired (tune-track-ultra);
+  // offer them disabled so the picker shows the roadmap.
+  const isMlpackage = $derived(selectedModel.endsWith(".mlpackage"));
 
   // Async overlay buffer: detections (+pose) per frame index, each tagged with the
   // (path, model) scope it was fetched under so a stale draw is impossible.
@@ -324,6 +385,81 @@
     bufferedCount = 0;
     detectedCount = 0;
     posedCount = 0;
+    clearTracks();
+    clearScene();
+  }
+
+  // Drop the cached track pass (clip/model change invalidates track ids).
+  function clearTracks(): void {
+    if (trackAutoTimer !== null) {
+      clearTimeout(trackAutoTimer);
+      trackAutoTimer = null;
+    }
+    if (trackController) {
+      trackController.abort();
+      trackController = null;
+    }
+    trackByIndex.clear();
+    trackStats = null;
+    trackError = null;
+    tracked = false;
+    tracking = false;
+    trackedStride = 1;
+    trackDone = 0;
+    trackExpected = 0;
+    frameTracks = [];
+  }
+
+  // Drop the objects-in-scene result + cancel any in-flight fetch/debounce.
+  function clearScene(): void {
+    if (sceneTimer !== null) {
+      clearTimeout(sceneTimer);
+      sceneTimer = null;
+    }
+    sceneController?.abort();
+    sceneController = null;
+    sceneObjects = [];
+    sceneLoading = false;
+    sceneError = null;
+    sceneIndex = null;
+  }
+
+  // Fetch the top-N all-class objects for `index` (stale-aborted). One inference
+  // per frame; the debounced effect throttles scrubbing so we don't flood it.
+  async function loadScene(index: number): Promise<void> {
+    if (!selectedPath) return;
+    const path = selectedPath;
+    const reqModel = selectedModel;
+    sceneController?.abort();
+    const controller = new AbortController();
+    sceneController = controller;
+    sceneLoading = true;
+    sceneError = null;
+    try {
+      const res = await fetchTuneScene(
+        path,
+        index,
+        reqModel,
+        SCENE_TOP_N,
+        controller.signal,
+      );
+      // Ignore a result that raced past a clip/model/frame change.
+      if (
+        controller.signal.aborted ||
+        path !== selectedPath ||
+        reqModel !== selectedModel ||
+        index !== presentedIndex
+      ) {
+        return;
+      }
+      sceneObjects = res.objects;
+      sceneIndex = res.index;
+      sceneLoading = false;
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      sceneError = err instanceof Error ? err.message : String(err);
+      sceneLoading = false;
+    }
   }
 
   // Drop any in-flight/queued seek bookkeeping so a new clip doesn't inherit a
@@ -453,6 +589,20 @@
       frameDetections = [];
       framePose = [];
     }
+    syncTracks();
+  }
+
+  // Mirror the presented frame's tracked boxes from the cache. The track pass
+  // only sampled every `trackedStride` frames, so snap the playhead to the
+  // nearest sampled index and hold those boxes (persistent IDs across scrub).
+  function syncTracks(): void {
+    if (!tracked || tracker === "off") {
+      frameTracks = [];
+      return;
+    }
+    const stride = Math.max(1, trackedStride);
+    const snapped = Math.round(presentedIndex / stride) * stride;
+    frameTracks = trackByIndex.get(snapped) ?? [];
   }
 
   // --- transport ------------------------------------------------------------
@@ -683,6 +833,114 @@
     clearBuffers();
     syncView();
     pump();
+  }
+
+  // --- tracking (P1j) -------------------------------------------------------
+
+  function setTracker(value: TuneTracker): void {
+    if (value === tracker) return;
+    tracker = value;
+    // Switching to "off" just stops drawing tracked boxes; switching to a real
+    // tracker shows the last pass if one exists, else waits for "Track range".
+    syncTracks();
+  }
+
+  // Deterministic vivid color per track id (hash → HSL hue), so the same id
+  // keeps its color across frames and runs.
+  function trackColor(id: string): string {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) {
+      h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    }
+    return `hsl(${h % 360}, 85%, 58%)`;
+  }
+
+  // Run a stateful track pass over the whole clip (server caps the range) and
+  // fill the per-frame track-id cache incrementally as the forward pass streams,
+  // so the timeline lights up and a progress bar advances live. Tracking is
+  // sequential + stateful, so this is always a single 0→end sweep — never
+  // cursor-first like detect/pose. The `ours` backend auto-runs; the Ultralytics
+  // backends stay button-driven (slower, hold the inference lock for the whole
+  // pass). Switching clip/model/tracker aborts any in-flight pass.
+  async function runTrackRange(): Promise<void> {
+    if (!selectedPath || !meta || totalFrames <= 0) return;
+    if (tracker === "off") return;
+    // Cancel any pass already in flight before starting a fresh one.
+    if (trackController) trackController.abort();
+    const controller = new AbortController();
+    trackController = controller;
+    const seq = selectSeq;
+    const stride = Math.max(1, trackSampleEvery);
+
+    tracking = true;
+    trackError = null;
+    trackByIndex.clear();
+    trackedStride = stride;
+    tracked = false;
+    trackDone = 0;
+    // Approx number of sampled frames in the (capped) pass, for the progress bar.
+    trackExpected = Math.max(1, Math.ceil(totalFrames / stride));
+    frameTracks = [];
+
+    try {
+      await streamTuneTrackRange(
+        selectedPath,
+        0,
+        totalFrames,
+        selectedModel,
+        tracker,
+        {
+          sampleEvery: trackSampleEvery,
+          iouThreshold: trackIou,
+          maxAgeFrames: trackMaxAge,
+          centerDistGate: trackCenterGate,
+        },
+        {
+          onFrames: (frames) => {
+            if (seq !== selectSeq || controller.signal.aborted) return;
+            for (const frame of frames) {
+              trackByIndex.set(frame.index, frame.detections);
+            }
+            trackDone += frames.length;
+            // Light up the playhead as the sweep passes it; first batch flips
+            // `tracked` so the overlay switches from per-frame to tracked boxes.
+            if (!tracked) tracked = true;
+            syncTracks();
+          },
+          onDone: (done) => {
+            if (seq !== selectSeq || controller.signal.aborted) return;
+            trackedStride = done.stats.sample_every || stride;
+            trackStats = done.stats;
+            trackDone = done.stats.n_sampled_frames;
+            trackExpected = done.stats.n_sampled_frames;
+            tracked = true;
+            syncTracks();
+          },
+          onError: (message) => {
+            if (seq !== selectSeq || controller.signal.aborted) return;
+            trackError = message || "Track pass failed";
+          },
+        },
+        controller.signal,
+      );
+    } catch (err) {
+      if (seq !== selectSeq || controller.signal.aborted) return;
+      trackError = err instanceof Error ? err.message : "Track pass failed";
+    } finally {
+      if (trackController === controller) {
+        trackController = null;
+        if (seq === selectSeq) tracking = false;
+      }
+    }
+  }
+
+  // The Track button doubles as Cancel while a pass streams.
+  function cancelTrackRange(): void {
+    if (trackController) {
+      trackController.abort();
+      trackController = null;
+    }
+    tracking = false;
   }
 
   // --- detection buffer / background filler --------------------------------
@@ -1046,6 +1304,8 @@
     void framePose;
     void threshold;
     void overlayMode;
+    void frameTracks;
+    void trackingActive;
     drawOverlay();
   });
 
@@ -1060,6 +1320,9 @@
     void totalFrames;
     void threshold;
     void poseAvailable;
+    void trackDone;
+    void trackingActive;
+    void tracker;
     updateStrip();
   });
 
@@ -1072,6 +1335,51 @@
     if (showZoom) {
       drawZoom();
     }
+  });
+
+  // Fetch objects-in-scene for the presented frame while the panel is open
+  // (debounced so scrubbing doesn't flood inference). Clip/model change clears
+  // the cache via clearScene(); this just refreshes on the settled frame.
+  $effect(() => {
+    void sceneOpen;
+    void presentedIndex;
+    void selectedPath;
+    void selectedModel;
+    if (sceneTimer !== null) {
+      clearTimeout(sceneTimer);
+      sceneTimer = null;
+    }
+    if (!sceneOpen || !selectedPath) return;
+    const idx = presentedIndex;
+    sceneTimer = setTimeout(() => {
+      sceneTimer = null;
+      void loadScene(idx);
+    }, 180);
+  });
+
+  // Auto-run the `ours` track pass when the clip/model/tracker or a knob settles.
+  // Tracking with `ours` is fast + batched (~8–12 s), so it can feel as live as
+  // detect/pose. The Ultralytics backends are slower + hold the inference lock for
+  // the whole pass, so they stay button-driven (no auto-run). Debounced so typing
+  // a knob value doesn't kick off a pass per keystroke.
+  $effect(() => {
+    void selectedPath;
+    void selectedModel;
+    void tracker;
+    void trackSampleEvery;
+    void trackIou;
+    void trackMaxAge;
+    void trackCenterGate;
+    void totalFrames;
+    if (trackAutoTimer !== null) {
+      clearTimeout(trackAutoTimer);
+      trackAutoTimer = null;
+    }
+    if (tracker !== "ours" || !selectedPath || totalFrames <= 0) return;
+    trackAutoTimer = setTimeout(() => {
+      trackAutoTimer = null;
+      void runTrackRange();
+    }, 350);
   });
 
   function drawOverlay(): void {
@@ -1096,15 +1404,33 @@
       ctx.lineWidth = lineW;
       ctx.font = `${fontPx}px ui-monospace, monospace`;
       ctx.textBaseline = "bottom";
-      for (const det of frameDetections) {
-        const keep = det.confidence >= threshold;
-        const color = keep ? "#28d17c" : "#e0556b";
-        ctx.strokeStyle = color;
-        ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
-        const label = `${det.class_name} ${det.confidence.toFixed(2)}`;
-        ctx.fillStyle = color;
-        const ty = det.y1 > fontPx + 4 ? det.y1 - 2 : det.y1 + fontPx + 2;
-        ctx.fillText(label, det.x1, ty);
+      if (trackingActive) {
+        // Persistent track-id boxes: color hashed from the id, id label drawn at
+        // the corner. Below-threshold boxes are drawn dashed so the conf gate is
+        // still legible.
+        for (const det of frameTracks) {
+          const keep = det.confidence >= threshold;
+          const color = trackColor(det.track_id);
+          ctx.strokeStyle = color;
+          ctx.setLineDash(keep ? [] : [Math.max(4, lineW * 2), lineW * 2]);
+          ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
+          ctx.setLineDash([]);
+          const label = `#${det.track_id} ${det.confidence.toFixed(2)}`;
+          ctx.fillStyle = color;
+          const ty = det.y1 > fontPx + 4 ? det.y1 - 2 : det.y1 + fontPx + 2;
+          ctx.fillText(label, det.x1, ty);
+        }
+      } else {
+        for (const det of frameDetections) {
+          const keep = det.confidence >= threshold;
+          const color = keep ? "#28d17c" : "#e0556b";
+          ctx.strokeStyle = color;
+          ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
+          const label = `${det.class_name} ${det.confidence.toFixed(2)}`;
+          ctx.fillStyle = color;
+          const ty = det.y1 > fontPx + 4 ? det.y1 - 2 : det.y1 + fontPx + 2;
+          ctx.fillText(label, det.x1, ty);
+        }
       }
     }
 
@@ -1175,6 +1501,8 @@
   const LANE1_BRIGHT: readonly [number, number, number] = [40, 209, 124]; // #28d17c
   const LANE2_TRACK: readonly [number, number, number] = [44, 85, 102]; // #2c5566
   const LANE2_BRIGHT: readonly [number, number, number] = [90, 209, 255]; // #5ad1ff
+  const LANE3_TRACK: readonly [number, number, number] = [58, 53, 96]; // #3a3560
+  const LANE3_BRIGHT: readonly [number, number, number] = [179, 136, 255]; // #b388ff
 
   function updateStrip(): void {
     const c = stripEl;
@@ -1184,7 +1512,7 @@
     const w = c.clientWidth || 300;
     const laneH = 8;
     const gap = 2;
-    const h = laneH * 2 + gap;
+    const h = laneH * 3 + gap * 2;
     if (c.width !== w) c.width = w;
     if (c.height !== h) c.height = h;
     const ctx = c.getContext("2d");
@@ -1192,11 +1520,13 @@
       return;
     }
     const lane2Y = laneH + gap;
+    const lane3Y = (laneH + gap) * 2;
     ctx.clearRect(0, 0, w, h);
     // Lane backgrounds.
     ctx.fillStyle = "#1b2532";
     ctx.fillRect(0, 0, w, laneH);
     ctx.fillRect(0, lane2Y, w, laneH);
+    ctx.fillRect(0, lane3Y, w, laneH);
 
     const span = Math.max(1, totalFrames - 1);
     const colW = Math.max(1, Math.ceil(w / totalFrames));
@@ -1204,8 +1534,10 @@
     // Per-column aggregates (max). -1 marks "no bright signal" for the conf lanes.
     const analyzed = new Uint8Array(w);
     const detected = new Uint8Array(w);
+    const tracked = new Uint8Array(w);
     const keptConf = new Float32Array(w).fill(-1);
     const poseConf = new Float32Array(w).fill(-1);
+    const trackConf = new Float32Array(w).fill(-1);
     const key = currentScopeKey();
     for (const [idx, entry] of buffer) {
       if (entry.scopeKey !== key) continue;
@@ -1233,11 +1565,35 @@
       }
     }
 
+    // Lane 3 (track): the forward 0→end sweep fills `trackByIndex` in frame order,
+    // so painting each sampled frame's full stride span makes the lane fill
+    // left→right as the pass streams — the lane IS the progress bar. Bright fill
+    // (violet) where a track sits above the conf threshold, shaded by top track
+    // confidence (matches lane 1's threshold gating). Cleared on tracker=off / reset
+    // because `trackByIndex` is emptied there.
+    if (trackingActive || tracking) {
+      const tStride = Math.max(1, trackedStride);
+      for (const [idx, dets] of trackByIndex) {
+        const x0 = clamp(Math.floor((idx / span) * w), 0, maxX);
+        const x1 = clamp(Math.floor(((idx + tStride - 1) / span) * w), 0, maxX);
+        let top = -1;
+        for (const d of dets) {
+          if (d.confidence >= threshold && d.confidence > top) top = d.confidence;
+        }
+        for (let x = x0; x <= x1; x++) {
+          tracked[x] = 1;
+          if (top > trackConf[x]) trackConf[x] = top;
+        }
+      }
+    }
+
     // Faint tracks first.
     ctx.fillStyle = "#33506b";
     for (let x = 0; x < w; x++) if (analyzed[x]) ctx.fillRect(x, 0, colW, laneH);
     ctx.fillStyle = "#2c5566";
     for (let x = 0; x < w; x++) if (detected[x]) ctx.fillRect(x, lane2Y, colW, laneH);
+    ctx.fillStyle = "#3a3560";
+    for (let x = 0; x < w; x++) if (tracked[x]) ctx.fillRect(x, lane3Y, colW, laneH);
 
     // Bright fills on top, opaque color (not alpha) encoding confidence so
     // overlapping 1px columns overwrite instead of double-compositing (no moiré).
@@ -1251,6 +1607,12 @@
       if (poseConf[x] >= 0) {
         ctx.fillStyle = lerpColor(LANE2_TRACK, LANE2_BRIGHT, 0.4 + 0.6 * poseConf[x]);
         ctx.fillRect(x, lane2Y, colW, laneH);
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      if (trackConf[x] >= 0) {
+        ctx.fillStyle = lerpColor(LANE3_TRACK, LANE3_BRIGHT, 0.4 + 0.6 * trackConf[x]);
+        ctx.fillRect(x, lane3Y, colW, laneH);
       }
     }
   }
@@ -1541,6 +1903,7 @@
             <div class="strip-legend mono small muted">
               <span><i class="sw yolo"></i> YOLO (analyzed · detected)</span>
               <span><i class="sw pose"></i> pose</span>
+              <span><i class="sw track"></i> track</span>
             </div>
           </div>
         </div>
@@ -1624,7 +1987,132 @@
           >
             ⛶ zoom
           </button>
+
+          <button
+            type="button"
+            class="zoom-toggle"
+            class:active={sceneOpen}
+            onclick={() => (sceneOpen = !sceneOpen)}
+            title="List the top objects the detector sees on this frame, including non-dog classes (cat/person/…) — helps explain frames with no dog box"
+          >
+            🔎 objects
+          </button>
         </div>
+
+        <div class="track-row">
+          <label class="tracker">
+            <span class="mono muted small">tracker</span>
+            <select
+              value={tracker}
+              onchange={(e) =>
+                setTracker((e.currentTarget as HTMLSelectElement).value as TuneTracker)}
+            >
+              <option value="off">Off (per-frame)</option>
+              <option value="ours">Ours (IoU + gate)</option>
+              <option value="bytetrack" disabled={isMlpackage}>ByteTrack</option>
+              <option value="botsort" disabled={isMlpackage}>BoT-SORT</option>
+              <option value="botsort_reid" disabled={isMlpackage}>BoT-SORT + ReID</option>
+            </select>
+          </label>
+
+          {#if tracker === "ours"}
+            <div class="track-knobs mono small">
+              <label title="Sample every N frames (matches the harvest scan stride)">
+                stride
+                <input type="number" min="1" max="60" step="1" bind:value={trackSampleEvery} />
+              </label>
+              <label title="IoU association threshold">
+                iou
+                <input type="number" min="0" max="1" step="0.05" bind:value={trackIou} />
+              </label>
+              <label title="Frames an unmatched track survives before it dies">
+                max-age
+                <input type="number" min="0" max="300" step="1" bind:value={trackMaxAge} />
+              </label>
+              <label title="Center-distance OR-gate, in box diagonals (0 = IoU only)">
+                gate
+                <input type="number" min="0" max="20" step="0.1" bind:value={trackCenterGate} />
+              </label>
+            </div>
+          {:else if tracker !== "off" && !isMlpackage}
+            <span class="track-note mono small muted">Ultralytics defaults</span>
+          {/if}
+
+          {#if tracker !== "off"}
+            <button
+              type="button"
+              class="track-btn"
+              class:cancel={tracking}
+              onclick={tracking ? cancelTrackRange : runTrackRange}
+              disabled={!tracking && (!selectedPath || (isMlpackage && tracker !== "ours"))}
+              title={tracking
+                ? "Cancel the in-progress track pass"
+                : "Decode + detect + track the whole clip in frame order, then scrub to see persistent track IDs"}
+            >
+              {tracking ? "Cancel" : tracked ? "Re-track range" : "Track range"}
+            </button>
+          {/if}
+
+          {#if tracking}
+            <span
+              class="track-progress mono small muted"
+              title="Forward 0→end track sweep progress (shown live in the track lane of the timeline strip)"
+            >
+              tracking… {Math.min(100, Math.round((trackDone / Math.max(1, trackExpected)) * 100))}%
+              ({trackDone}/{trackExpected})
+            </span>
+          {/if}
+
+          {#if trackError}
+            <span class="export-error mono small" role="alert">{trackError}</span>
+          {/if}
+
+          {#if isMlpackage && tracker !== "off" && tracker !== "ours"}
+            <span class="track-note mono small muted">
+              Ultralytics trackers need a .pt model — pick a .pt to use this.
+            </span>
+          {/if}
+
+          {#if trackStats}
+            <div
+              class="track-stats mono small"
+              title="Distinct track IDs · harvest spans · merged presence windows · spans-per-window (the de-fragmentation metric)"
+            >
+              <span class="hud-yolo">{trackStats.tracker}</span>
+              <span>tracks {trackStats.n_tracks}</span>
+              <span>spans {trackStats.n_spans}</span>
+              <span>windows {trackStats.n_presence_windows}</span>
+              <span class="frag">spans/win {trackStats.spans_per_window.toFixed(2)}</span>
+            </div>
+          {/if}
+        </div>
+
+        {#if sceneOpen}
+          <div class="scene-panel">
+            <div class="scene-head">
+              <span class="eyebrow">OBJECTS IN SCENE</span>
+              <span class="mono muted small">
+                {#if sceneLoading}…{:else}frame {sceneIndex ?? presentedIndex}{/if}
+              </span>
+            </div>
+            {#if sceneError}
+              <span class="export-error mono small" role="alert">{sceneError}</span>
+            {:else if sceneObjects.length > 0}
+              <ul class="scene-list mono small">
+                {#each sceneObjects as obj, i (obj.class_name + ":" + i)}
+                  <li class:non-dog={obj.class_name.toLowerCase() !== "dog"}>
+                    <span class="scene-cls">{obj.class_name}</span>
+                    <span class="scene-conf">{obj.confidence.toFixed(2)}</span>
+                  </li>
+                {/each}
+              </ul>
+            {:else if !sceneLoading}
+              <div class="scene-empty muted small">
+                Nothing detected on this frame (above the detector floor).
+              </div>
+            {/if}
+          </div>
+        {/if}
 
         {#if overlayMode !== "boxes" && !poseAvailable}
           <p class="pose-hint muted small">
@@ -1954,7 +2442,7 @@
   .strip-wrap .strip {
     display: block;
     width: 100%;
-    height: 18px;
+    height: 28px;
     border-radius: 3px;
   }
 
@@ -1980,6 +2468,10 @@
 
   .strip-legend .sw.pose {
     background: #5ad1ff;
+  }
+
+  .strip-legend .sw.track {
+    background: #b388ff;
   }
 
   .model {
@@ -2074,6 +2566,150 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 1rem;
+  }
+
+  .track-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.8rem;
+    margin-top: 0.6rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--line, #243042);
+  }
+
+  .tracker {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .tracker select {
+    background: var(--bg-1, #141a24);
+    border: 1px solid var(--line-strong, #324056);
+    color: var(--text, #d8e0ec);
+    border-radius: 6px;
+    padding: 0.25rem 0.4rem;
+    font-size: 0.78rem;
+    font-family: ui-monospace, monospace;
+  }
+
+  .track-knobs {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+
+  .track-knobs label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    color: var(--muted, #8a97a8);
+  }
+
+  .track-knobs input {
+    width: 4.2rem;
+    background: var(--bg-1, #141a24);
+    border: 1px solid var(--line-strong, #324056);
+    color: var(--text, #d8e0ec);
+    border-radius: 5px;
+    padding: 0.2rem 0.3rem;
+    font-family: ui-monospace, monospace;
+    font-size: 0.74rem;
+  }
+
+  .track-btn {
+    background: var(--bg-1, #141a24);
+    border: 1px solid var(--accent, #3f7d5a);
+    color: var(--text, #d8e0ec);
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.76rem;
+    font-family: ui-monospace, monospace;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .track-btn:hover:not(:disabled) {
+    border-color: var(--amber, #f0b35a);
+  }
+
+  .track-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .track-btn.cancel {
+    border-color: var(--amber, #f0b35a);
+    color: var(--amber, #f0b35a);
+  }
+
+  .track-progress {
+    color: var(--text, #d8e0ec);
+  }
+
+  .track-note {
+    max-width: 28ch;
+  }
+
+  .track-stats {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.7rem;
+    color: var(--text, #d8e0ec);
+  }
+
+  .track-stats .frag {
+    color: var(--amber, #f0b35a);
+  }
+
+  .scene-panel {
+    margin-top: 0.6rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--line, #243042);
+  }
+
+  .scene-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .scene-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.5rem;
+  }
+
+  .scene-list li {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--bg-1, #141a24);
+    border: 1px solid var(--line-strong, #324056);
+    border-radius: 6px;
+    padding: 0.15rem 0.45rem;
+  }
+
+  .scene-list li.non-dog {
+    border-color: var(--amber, #f0b35a);
+  }
+
+  .scene-cls {
+    color: var(--text, #d8e0ec);
+  }
+
+  .scene-conf {
+    color: var(--muted, #8a97a8);
+  }
+
+  .scene-empty {
+    padding: 0.2rem 0;
   }
 
   .transport {

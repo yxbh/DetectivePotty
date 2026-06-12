@@ -209,12 +209,15 @@ def summarize_clip(
 
 
 def list_clips(root: str | Path) -> list[dict[str, Any]]:
-    """All harvested clips under ``root``, newest day first, unlabeled surfaced first.
+    """All harvested clips under ``root``, newest first, unlabeled surfaced first.
 
     Sort key puts unlabeled clips ahead of labeled ones (the labeler's queue),
-    then newest date, then span id for stability. Clips that overlap in absolute
-    time on the same camera are tagged with a shared ``scene_id`` (multi-dog
-    scenes) so the UI can group them.
+    then newest ``span_start_utc`` *timestamp* (not just the day), then span id
+    for stability. Sorting on the parsed datetime — rather than a day bucket with
+    a ``span_id`` string fallback — is what keeps same-day clips chronological
+    (a string fallback ordered ``"11…"`` before ``"0903…"``). Clips that overlap
+    in absolute time on the same camera are tagged with a shared ``scene_id``
+    (multi-dog scenes) so the UI can group them.
     """
 
     camera_names = load_camera_names(root)
@@ -223,7 +226,7 @@ def list_clips(root: str | Path) -> list[dict[str, Any]]:
         for clip_dir in discover_clip_dirs(root)
     ]
     _assign_scenes(rows)
-    rows.sort(key=lambda r: (r["labeled"], _neg_date_key(r["date"]), r["span_id"]))
+    rows.sort(key=lambda r: (r["labeled"], _neg_ts_key(r), r["span_id"]))
     return rows
 
 
@@ -276,12 +279,13 @@ def _assign_scenes(rows: list[dict[str, Any]]) -> None:
         row.pop("_win", None)
 
 
-def _neg_date_key(date: str) -> str:
-    # Newest first without parsing: invert each digit of an ISO date so plain
-    # ascending string sort yields descending dates. Non-dates sort last.
-    if len(date) == 10 and date[4] == "-" and date[7] == "-":
-        return "".join("9" if c == "-" else str(9 - int(c)) for c in date if c != "-")
-    return "~~~~~~~~"
+def _neg_ts_key(row: dict[str, Any]) -> float:
+    # Newest first: negative epoch seconds, so a plain ascending sort yields
+    # descending time. Sorts on the full ``span_start_utc`` timestamp (falling
+    # back to the day ``date``), so same-day clips stay chronological instead of
+    # tie-breaking on the ``span_id`` string. Unparseable clips sort last (+inf).
+    dt = _parse_dt(row.get("span_start_utc")) or _parse_dt(row.get("date"))
+    return -dt.timestamp() if dt is not None else float("inf")
 
 
 def clip_detail(clip_dir: Path, root: str | Path | None = None) -> dict[str, Any]:

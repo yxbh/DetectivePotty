@@ -8,6 +8,7 @@ real YOLO/pose model, GPU, or network is touched.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 
@@ -445,6 +446,64 @@ def test_tune_detect_includes_pose_when_requested(tmp_path: Path) -> None:
     assert {kp["name"] for kp in body["pose"][0]["keypoints"]}
 
 
+class SceneFakeDetector:
+    """Detector exposing ``detect_scene_objects`` with mixed (non-dog) classes."""
+
+    device = "cpu"
+    last_inference = None
+
+    def detect(self, frame, frame_idx=0, mono_ts=None, wall_ts=None):  # noqa: ANN001
+        return []
+
+    def detect_scene_objects(self, frame, top_n=8):  # noqa: ANN001
+        ranked = [("dog", 0.42), ("cat", 0.88), ("person", 0.55)]
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        return ranked[:top_n]
+
+
+def test_tune_scene_returns_top_all_class_objects(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4", frames=6)
+    config = make_config(tmp_path, clip)
+    client = TestClient(create_app(config, tune_detector=SceneFakeDetector()))
+    body = client.get(
+        "/api/tune/scene", params={"path": str(clip), "index": 1, "top_n": 2}
+    ).json()
+    assert body["index"] == 1
+    assert body["model"] == "models/yolo11m.pt"
+    assert body["detection_floor"] == pytest.approx(0.05)
+    # No dog filter: highest-confidence classes surface, sorted desc, capped to top_n.
+    assert [o["class_name"] for o in body["objects"]] == ["cat", "person"]
+    assert body["objects"][0]["confidence"] == pytest.approx(0.88)
+
+
+def test_tune_scene_rejects_unknown_model(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    config = make_config(tmp_path, clip)
+    client = TestClient(create_app(config, tune_detector=SceneFakeDetector()))
+    resp = client.get(
+        "/api/tune/scene", params={"path": str(clip), "index": 0, "model": "nope.pt"}
+    )
+    assert resp.status_code == 400
+
+
+def test_detect_scene_objects_no_dog_filter_and_floor() -> None:
+    """The DogDetector helper surfaces all classes >= floor, sorted desc."""
+
+    from detectivepotty.detect.yolo import DogDetector
+
+    detector = DogDetector.__new__(DogDetector)
+    detector.conf_threshold = 0.05
+    detector._predict = lambda frame: ["result"]  # type: ignore[attr-defined]
+    detector._iter_boxes = lambda results: [  # type: ignore[attr-defined]
+        ((0.0, 0.0, 1.0, 1.0), 0.9, "cat"),
+        ((0.0, 0.0, 1.0, 1.0), 0.6, "dog"),
+        ((0.0, 0.0, 1.0, 1.0), 0.02, "bird"),  # below floor -> dropped
+        ((0.0, 0.0, 1.0, 1.0), 0.3, "person"),
+    ]
+    objects = detector.detect_scene_objects(np.zeros((4, 4, 3), dtype=np.uint8), top_n=3)
+    assert objects == [("cat", 0.9), ("dog", 0.6), ("person", 0.3)]
+
+
 class FrameKeyedBatchDetector:
     """Per-frame-varying detector exposing ``detect`` and ``detect_batch``.
 
@@ -559,6 +618,315 @@ def test_tune_detect_range_rejects_unknown_model(tmp_path: Path) -> None:
         params={"path": str(clip), "start": 0, "count": 2, "model": "models/bogus.pt"},
     )
     assert resp.status_code == 400
+
+
+# --- tracking (track_detections + /api/tune/track_range) ------------------
+
+
+def _det(frame_idx: int, x1: float, y1: float, x2: float, y2: float, conf: float = 0.7):
+    """Build one ``Detection`` for a track_detections unit test (no model)."""
+
+    return Detection(
+        bbox=BBox(x1, y1, x2, y2),
+        confidence=conf,
+        class_name="dog",
+        frame_idx=frame_idx,
+        mono_ts=0.0,
+        wall_ts=datetime.now(timezone.utc),
+    )
+
+
+def test_track_detections_keeps_overlapping_boxes_on_one_track() -> None:
+    # A single dog drifting a few pixels per sample keeps high IoU, so the tracker
+    # holds one persistent id across all sampled frames.
+    per_frame = [
+        (0, [_det(0, 10, 10, 80, 90)]),
+        (5, [_det(5, 15, 10, 85, 90)]),
+        (10, [_det(10, 20, 10, 90, 90)]),
+    ]
+    out = tune_mod.track_detections(per_frame, fps=30.0)
+    assert out["stats"]["n_tracks"] == 1
+    ids = {d["track_id"] for f in out["frames"] for d in f["detections"]}
+    assert len(ids) == 1
+    # Every sampled frame carries exactly that one tracked box.
+    assert [f["index"] for f in out["frames"]] == [0, 5, 10]
+    assert all(len(f["detections"]) == 1 for f in out["frames"])
+    assert out["stats"]["n_detections"] == 3
+    assert out["stats"]["n_sampled_frames"] == 3
+
+
+def test_track_detections_center_gate_reassociates_far_jump() -> None:
+    # Two sampled frames whose boxes do NOT overlap (IoU=0) but whose centers are
+    # within ~0.9 box-diagonals. The center-distance gate decides id continuity.
+    per_frame = [
+        (0, [_det(0, 10, 10, 50, 50)]),
+        (5, [_det(5, 60, 10, 100, 50)]),
+    ]
+    # Gate disabled (pure IoU): the far jump spawns a second track.
+    off = tune_mod.track_detections(per_frame, fps=30.0, center_dist_gate=0.0)
+    assert off["stats"]["n_tracks"] == 2
+    # Gate on (harvest default 1.5): re-associated to one track.
+    on = tune_mod.track_detections(per_frame, fps=30.0, center_dist_gate=1.5)
+    assert on["stats"]["n_tracks"] == 1
+
+
+def test_track_detections_is_order_independent() -> None:
+    # Replay must be in ascending frame order regardless of input order, so a
+    # shuffled per_frame yields the identical result.
+    frames = [
+        (0, [_det(0, 10, 10, 80, 90)]),
+        (5, [_det(5, 15, 10, 85, 90)]),
+        (10, [_det(10, 20, 10, 90, 90)]),
+    ]
+    ordered = tune_mod.track_detections(list(frames), fps=30.0)
+    shuffled = tune_mod.track_detections([frames[2], frames[0], frames[1]], fps=30.0)
+    assert ordered == shuffled
+    assert [f["index"] for f in shuffled["frames"]] == [0, 5, 10]
+
+
+def test_track_detections_stats_report_fragmentation() -> None:
+    # One clean continuous presence -> one span, one presence window, ratio 1.0.
+    per_frame = [(idx, [_det(idx, 10, 10, 80, 90)]) for idx in range(0, 30, 5)]
+    out = tune_mod.track_detections(per_frame, fps=30.0, total_frames=30)
+    stats = out["stats"]
+    assert stats["n_presence_windows"] == 1
+    assert stats["spans_per_window"] == stats["n_spans"] / stats["n_presence_windows"]
+    # The knobs are echoed back so the UI can label the comparison.
+    assert stats["sample_every"] == 5
+    assert stats["iou_threshold"] == 0.3
+    assert stats["max_age_frames"] == 15
+    assert stats["center_dist_gate"] == 1.5
+
+
+def test_track_range_endpoint_returns_track_ids_and_stats(tmp_path: Path) -> None:
+    # The batch detector moves its box +1px/frame, so sampled frames overlap and
+    # the tracker keeps one persistent id across the tracked range.
+    clip = write_clip(tmp_path / "c.mp4", frames=16)
+    detector = FrameKeyedBatchDetector()
+    client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
+
+    body = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
+    ).json()
+    # Only multiples-of-5 frames are sampled/tracked (absolute source numbering).
+    assert [f["index"] for f in body["frames"]] == [0, 5, 10, 15]
+    ids = {d["track_id"] for f in body["frames"] for d in f["detections"]}
+    assert ids == {"1"}
+    assert body["stats"]["n_tracks"] == 1
+    assert body["stats"]["n_sampled_frames"] == 4
+    assert body["model"]
+    # Boxes carry a track_id on top of the detection fields.
+    first = body["frames"][0]["detections"][0]
+    assert set(first) >= {"x1", "y1", "x2", "y2", "confidence", "class_name", "track_id"}
+
+
+def test_track_range_endpoint_falls_back_without_detect_batch(tmp_path: Path) -> None:
+    # The plain FakeDetector has no detect_batch; the endpoint must still track by
+    # looping detect over the sampled frames.
+    clip = write_clip(tmp_path / "c.mp4", frames=16)
+    client = make_client(tmp_path, clip)
+    body = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
+    ).json()
+    assert [f["index"] for f in body["frames"]] == [0, 5, 10, 15]
+    assert body["stats"]["n_tracks"] == 1
+
+
+def test_track_range_endpoint_rejects_unknown_model(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "start": 0, "count": 4, "model": "models/bogus.pt"},
+    )
+    assert resp.status_code == 400
+
+
+def test_track_detections_stats_tagged_ours() -> None:
+    per_frame = [(idx, [_det(idx, 10, 10, 80, 90)]) for idx in range(0, 30, 5)]
+    out = tune_mod.track_detections(per_frame, fps=30.0, total_frames=30)
+    assert out["stats"]["tracker"] == "ours"
+
+
+def test_summarize_tracked_frames_counts_tracks_and_windows() -> None:
+    # Hand-built tracked frames (the shape the Ultralytics path emits): two distinct
+    # ids -> two tracks; ultra path passes no ours-knobs so they read back None.
+    box = {"x1": 10.0, "y1": 10.0, "x2": 80.0, "y2": 90.0, "class_name": "dog"}
+    out_frames = [
+        {"index": 0, "detections": [{**box, "confidence": 0.8, "track_id": "1"}]},
+        {"index": 5, "detections": [{**box, "confidence": 0.7, "track_id": "1"}]},
+        {"index": 10, "detections": [{**box, "confidence": 0.6, "track_id": "2"}]},
+    ]
+    stats = tune_mod.summarize_tracked_frames(
+        out_frames, fps=30.0, total_frames=30, sample_every=5, tracker="botsort"
+    )
+    assert stats["tracker"] == "botsort"
+    assert stats["n_tracks"] == 2
+    assert stats["track_ids"] == ["1", "2"]
+    assert stats["n_detections"] == 3
+    assert stats["n_sampled_frames"] == 3
+    assert stats["sample_every"] == 5
+    assert stats["iou_threshold"] is None
+    assert stats["max_age_frames"] is None
+    assert stats["center_dist_gate"] is None
+    assert stats["n_presence_windows"] >= 1
+    assert stats["n_spans"] >= stats["n_presence_windows"]
+    assert stats["spans_per_window"] == stats["n_spans"] / stats["n_presence_windows"]
+
+
+def test_summarize_tracked_frames_matches_track_detections() -> None:
+    # The summarizer, replayed over track_detections' own frames, reproduces the
+    # span/window/track stats it embedded — so ours + ultra share one stats path.
+    per_frame = [(idx, [_det(idx, 10, 10, 80, 90)]) for idx in range(0, 30, 5)]
+    out = tune_mod.track_detections(per_frame, fps=30.0, total_frames=30)
+    again = tune_mod.summarize_tracked_frames(
+        out["frames"], fps=30.0, total_frames=30, sample_every=5, tracker="ours"
+    )
+    for key in ("n_tracks", "n_spans", "n_presence_windows", "spans_per_window"):
+        assert again[key] == out["stats"][key]
+
+
+def test_track_range_default_tracker_is_ours(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4", frames=16)
+    client = make_client(tmp_path, clip)
+    body = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
+    ).json()
+    assert body["stats"]["tracker"] == "ours"
+
+
+def test_track_range_rejects_unknown_tracker(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "count": 4, "tracker": "nope"},
+    )
+    assert resp.status_code == 400
+
+
+def test_track_range_ultralytics_requires_pt_model(tmp_path: Path) -> None:
+    # An Ultralytics tracker against a CoreML model is rejected before any model
+    # build — the .pt guard, defense-in-depth behind the disabled UI option.
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    client.app.state.tune_models.append("models/yolo11m.mlpackage")
+    resp = client.get(
+        "/api/tune/track_range",
+        params={
+            "path": str(clip),
+            "count": 4,
+            "model": "models/yolo11m.mlpackage",
+            "tracker": "botsort",
+        },
+    )
+    assert resp.status_code == 400
+    assert ".pt" in resp.json()["detail"]
+
+
+def test_track_range_ultralytics_unavailable_returns_400(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When the `lap` association dep is missing, the ultra path 400s with a clear
+    # message instead of building a model and erroring mid-request.
+    import detectivepotty.web.app as app_mod
+
+    monkeypatch.setattr(app_mod, "_ultralytics_tracking_available", lambda: False)
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "count": 4, "tracker": "bytetrack"},
+    )
+    assert resp.status_code == 400
+    assert "lap" in resp.json()["detail"]
+
+
+# --- track_range_stream (NDJSON forward-fill) -----------------------------
+
+
+def _read_ndjson(resp) -> list[dict]:  # noqa: ANN001
+    """Parse a non-empty-line NDJSON body into a list of records."""
+
+    return [json.loads(line) for line in resp.text.splitlines() if line.strip()]
+
+
+def test_track_range_stream_emits_frames_then_done(tmp_path: Path) -> None:
+    # The ours backend streams one or more `frames` records then a final `done`,
+    # and the union of the streamed frames equals the non-streaming payload's frames.
+    clip = write_clip(tmp_path / "c.mp4", frames=16)
+    detector = FrameKeyedBatchDetector()
+    client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
+
+    resp = client.get(
+        "/api/tune/track_range_stream",
+        params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    records = _read_ndjson(resp)
+    assert records, "stream produced no records"
+    # Last record is the terminal done; everything before is a frames batch.
+    assert records[-1]["type"] == "done"
+    assert all(r["type"] == "frames" for r in records[:-1])
+
+    streamed_frames = [f for r in records[:-1] for f in r["frames"]]
+    assert [f["index"] for f in streamed_frames] == [0, 5, 10, 15]
+
+    # Draining-parity: the streamed frames + done.stats match the non-streaming call.
+    non_stream = client.get(
+        "/api/tune/track_range",
+        params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
+    ).json()
+    assert streamed_frames == non_stream["frames"]
+    assert records[-1]["stats"] == non_stream["stats"]
+    assert records[-1]["model"] == non_stream["model"]
+
+
+def test_track_range_stream_rejects_unknown_tracker(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.get(
+        "/api/tune/track_range_stream",
+        params={"path": str(clip), "count": 4, "tracker": "nope"},
+    )
+    assert resp.status_code == 400
+
+
+def test_track_range_stream_ultralytics_requires_pt_model(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    client.app.state.tune_models.append("models/yolo11m.mlpackage")
+    resp = client.get(
+        "/api/tune/track_range_stream",
+        params={
+            "path": str(clip),
+            "count": 4,
+            "model": "models/yolo11m.mlpackage",
+            "tracker": "botsort",
+        },
+    )
+    assert resp.status_code == 400
+    assert ".pt" in resp.json()["detail"]
+
+
+def test_track_range_stream_ultralytics_unavailable_returns_400(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import detectivepotty.web.app as app_mod
+
+    monkeypatch.setattr(app_mod, "_ultralytics_tracking_available", lambda: False)
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+    resp = client.get(
+        "/api/tune/track_range_stream",
+        params={"path": str(clip), "count": 4, "tracker": "bytetrack"},
+    )
+    assert resp.status_code == 400
+    assert "lap" in resp.json()["detail"]
 
 
 class _BatchRecordingEstimator(MockPoseEstimator):

@@ -15,6 +15,11 @@ import type {
   TuneMeta,
   TuneModelList,
   TunePoseRangeResult,
+  TuneSceneResult,
+  TuneTracker,
+  TuneTrackRangeResult,
+  TuneTrackStreamDone,
+  TuneTrackedFrame,
 } from "./types";
 
 const EVENTS_LIMIT = 200;
@@ -176,6 +181,27 @@ export async function fetchTuneDetect(
   return jsonOrThrow<TuneDetectResult>(response);
 }
 
+/** Top-N all-class detections for one frame (the "objects in scene" diagnostic).
+ *  Unlike `fetchTuneDetect` this skips the dog filter, so a reviewer can see whether
+ *  a frame with no dog box is empty, a sub-threshold dog, or an animal classed as
+ *  something else (cat/person/...). Read-only — never touches the harvest pipeline. */
+export async function fetchTuneScene(
+  path: string,
+  index: number,
+  model: string,
+  topN: number,
+  signal?: AbortSignal,
+): Promise<TuneSceneResult> {
+  const params = new URLSearchParams({
+    path,
+    index: String(index),
+    model,
+    top_n: String(topN),
+  });
+  const response = await fetch(`/api/tune/scene?${params.toString()}`, { signal });
+  return jsonOrThrow<TuneSceneResult>(response);
+}
+
 /** Batched detections for a contiguous `[start, start+count)` frame window. One
  *  sequential decode + one `detect_batch` forward replaces `count` single-frame
  *  round-trips, which is what lifts GPU utilization off the batch-1 floor. The
@@ -196,6 +222,113 @@ export async function fetchTuneDetectRange(
   });
   const response = await fetch(`/api/tune/detect_range?${params.toString()}`, { signal });
   return jsonOrThrow<TuneDetectRangeResult>(response);
+}
+
+/** Track a `[start, start+count)` range with the chosen tracker (the "Track range"
+ *  action). Decodes in frame order, detects the sampled frames, and replays through
+ *  the harvest IoU `Tracker` with the supplied knobs — returning persistent
+ *  per-frame track-ID boxes + de-fragmentation stats (distinct tracks,
+ *  spans-per-presence-window). Works with every model including CoreML. The backend
+ *  caps `count` at `TUNE_TRACK_MAX_FRAMES`. */
+export async function fetchTuneTrackRange(
+  path: string,
+  start: number,
+  count: number,
+  model: string,
+  tracker: TuneTracker,
+  params: {
+    sampleEvery: number;
+    iouThreshold: number;
+    maxAgeFrames: number;
+    centerDistGate: number;
+  },
+  signal?: AbortSignal,
+): Promise<TuneTrackRangeResult> {
+  const query = new URLSearchParams({
+    path,
+    start: String(start),
+    count: String(count),
+    model,
+    tracker,
+    sample_every: String(params.sampleEvery),
+    iou_threshold: String(params.iouThreshold),
+    max_age_frames: String(params.maxAgeFrames),
+    center_dist_gate: String(params.centerDistGate),
+  });
+  const response = await fetch(`/api/tune/track_range?${query.toString()}`, { signal });
+  return jsonOrThrow<TuneTrackRangeResult>(response);
+}
+
+/** Stream a Track-range pass as newline-delimited JSON so the timeline fills and a
+ *  progress bar advances as the in-order forward pass computes (instead of waiting
+ *  for the whole pass). `onFrames` fires per decode chunk, `onDone` once at the end,
+ *  `onError` on a non-200 or a mid-stream `error` line. Tracking is sequential +
+ *  stateful, so this is always a single 0→end pass (never cursor-first). */
+export async function streamTuneTrackRange(
+  path: string,
+  start: number,
+  count: number,
+  model: string,
+  tracker: TuneTracker,
+  params: {
+    sampleEvery: number;
+    iouThreshold: number;
+    maxAgeFrames: number;
+    centerDistGate: number;
+  },
+  handlers: {
+    onFrames: (frames: TuneTrackedFrame[]) => void;
+    onDone: (done: TuneTrackStreamDone) => void;
+    onError: (message: string) => void;
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const query = new URLSearchParams({
+    path,
+    start: String(start),
+    count: String(count),
+    model,
+    tracker,
+    sample_every: String(params.sampleEvery),
+    iou_threshold: String(params.iouThreshold),
+    max_age_frames: String(params.maxAgeFrames),
+    center_dist_gate: String(params.centerDistGate),
+  });
+  const response = await fetch(`/api/tune/track_range_stream?${query.toString()}`, {
+    signal,
+  });
+  if (!response.ok || !response.body) {
+    handlers.onError(await errorMessage(response));
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const rec = JSON.parse(trimmed) as
+      | { type: "frames"; frames: TuneTrackedFrame[] }
+      | ({ type: "done" } & TuneTrackStreamDone)
+      | { type: "error"; detail: string };
+    if (rec.type === "frames") handlers.onFrames(rec.frames);
+    else if (rec.type === "done") handlers.onDone(rec);
+    else if (rec.type === "error") handlers.onError(rec.detail);
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      handleLine(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.trim()) handleLine(buffer);
 }
 
 /** Pose pass for client-supplied boxes across a contiguous run of frames — no

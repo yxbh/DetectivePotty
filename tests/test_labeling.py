@@ -309,6 +309,24 @@ def test_save_clip_labels_roundtrip_and_validation(tmp_path: Path) -> None:
 # --- API ------------------------------------------------------------------
 
 
+def test_list_clips_sorts_same_day_by_timestamp_not_span_id(tmp_path: Path) -> None:
+    # Two unlabeled clips on the same day. Their span_id lexical order is the
+    # reverse of chronological order, so a (day, span_id) string sort would put
+    # the 09:00 clip first. The fix sorts on the full span_start_utc timestamp,
+    # so the newer 11:00 clip must come first.
+    root = tmp_path / "harvest"
+    _make_clip_dir(
+        root, "a_nine", date="2026-06-06",
+        span_start_utc="2026-06-06T09:00:00+00:00",
+    )
+    _make_clip_dir(
+        root, "z_eleven", date="2026-06-06",
+        span_start_utc="2026-06-06T11:00:00+00:00",
+    )
+    rows = labeling.list_clips(root)
+    assert [r["span_id"] for r in rows] == ["z_eleven", "a_nine"]
+
+
 def test_api_list_clips(tmp_path: Path) -> None:
     root = tmp_path / "harvest"
     _make_clip_dir(root, "span_a", date="2026-06-08")

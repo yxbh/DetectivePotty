@@ -14,6 +14,7 @@
   interface Props {
     detail: EventDetail | null;
     dogs: string[];
+    dogError: string | null;
     loading: boolean;
     error: string | null;
     draft: LabelDraft;
@@ -23,7 +24,7 @@
     onsave: () => void;
   }
 
-  let { detail, dogs, loading, error, draft, dirty, saving, saveStatus, onsave }: Props =
+  let { detail, dogs, dogError, loading, error, draft, dirty, saving, saveStatus, onsave }: Props =
     $props();
 
   const LABEL_BUTTONS: Array<[string, string, string]> = [
@@ -383,6 +384,9 @@
             </button>
           {/each}
         </div>
+        {#if dogError}
+          <p class="dog-warning">Dog roster unavailable: {dogError}</p>
+        {/if}
       </div>
       <div class="form-row">
         <label>
@@ -709,6 +713,12 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.4rem;
+  }
+
+  .dog-warning {
+    margin: 0.55rem 0 0;
+    color: var(--amber);
+    font-size: 0.78rem;
   }
 
   .dog-chip {

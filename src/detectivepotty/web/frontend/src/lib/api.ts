@@ -50,16 +50,12 @@ async function jsonOrThrow<T>(response: Response): Promise<T> {
 }
 
 export async function fetchDogs(): Promise<string[]> {
-  try {
-    const response = await fetch("/api/dogs");
-    if (!response.ok) {
-      return [];
-    }
-    const data = (await response.json()) as { dogs?: unknown };
-    return Array.isArray(data.dogs) ? (data.dogs as string[]) : [];
-  } catch {
-    return [];
+  const response = await fetch("/api/dogs");
+  const data = await jsonOrThrow<{ dogs?: unknown }>(response);
+  if (!Array.isArray(data.dogs) || data.dogs.some((dog) => typeof dog !== "string")) {
+    throw new Error("Invalid dog roster response");
   }
+  return data.dogs;
 }
 
 export async function fetchEvents(filters: EventFilters): Promise<EventsPage> {

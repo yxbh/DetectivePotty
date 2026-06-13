@@ -33,6 +33,7 @@
   ];
 
   let dogs = $state<string[]>([]);
+  let dogError = $state<string | null>(null);
   let events = $state<EventSummary[]>([]);
   let unfilteredTotal = $state<number | null>(null);
   let selectedId = $state<string | null>(null);
@@ -138,7 +139,13 @@
   }
 
   async function init(): Promise<void> {
-    dogs = await fetchDogs();
+    try {
+      dogs = await fetchDogs();
+      dogError = null;
+    } catch (err) {
+      dogs = [];
+      dogError = errMsg(err);
+    }
     await loadEvents();
     startLive();
   }
@@ -676,6 +683,7 @@
         <EventDetailView
           {detail}
           {dogs}
+          {dogError}
           {draft}
           {dirty}
           {saving}

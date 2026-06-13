@@ -56,6 +56,8 @@
   // The active view is derived from the URL so a refresh restores it (and deep
   // links work). `?event=<id>` on the review route restores the open event.
   let view = $derived(routeToView($route.path));
+  let tuneMounted = $state(false);
+  let labelMounted = $state(false);
   let toasts = $state<Array<{ id: string; summary: EventSummary }>>([]);
 
   // Single source of truth for the label editor (lifted out of EventDetail so a
@@ -105,6 +107,14 @@
     const ev = current.query.get("event");
     if (ev && ev !== selectedId) {
       void selectEvent(ev);
+    }
+  });
+
+  $effect(() => {
+    if (view === "tune") {
+      tuneMounted = true;
+    } else if (view === "label") {
+      labelMounted = true;
     }
   });
 
@@ -653,48 +663,50 @@
     </button>
   {/if}
 
-  {#if view === "live"}
-    <main class="live-main">
-      <LiveFeed events={$liveEvents} connected={$liveConnected} onpick={openLiveEvent} />
-    </main>
-  {:else if view === "tune"}
-    <main class="tune-main">
-      <TuneDetect />
-    </main>
-  {:else if view === "label"}
-    <main class="tune-main">
-      <LabelReview />
-    </main>
-  {:else}
-    <main class="layout">
-      <section class="sidebar">
-        <div class="list-scroll">
-          <EventList
-            {events}
-            {selectedId}
-            loading={listLoading}
-            error={listError}
-            onselect={selectEvent}
-          />
-        </div>
-      </section>
+  <main class="live-main" hidden={view !== "live"}>
+    <LiveFeed events={$liveEvents} connected={$liveConnected} onpick={openLiveEvent} />
+  </main>
 
-      <section class="detail-scroll detail">
-        <EventDetailView
-          {detail}
-          {dogs}
-          {dogError}
-          {draft}
-          {dirty}
-          {saving}
-          {saveStatus}
-          loading={detailLoading}
-          error={detailError}
-          onsave={save}
+  <main class="tune-main" hidden={view !== "tune"}>
+    {#if tuneMounted}
+      <TuneDetect />
+    {/if}
+  </main>
+
+  <main class="tune-main" hidden={view !== "label"}>
+    {#if labelMounted}
+      <LabelReview />
+    {/if}
+  </main>
+
+  <main class="layout" hidden={view !== "review"}>
+    <section class="sidebar">
+      <div class="list-scroll">
+        <EventList
+          {events}
+          {selectedId}
+          loading={listLoading}
+          error={listError}
+          onselect={selectEvent}
         />
-      </section>
-    </main>
-  {/if}
+      </div>
+    </section>
+
+    <section class="detail-scroll detail">
+      <EventDetailView
+        {detail}
+        {dogs}
+        {dogError}
+        {draft}
+        {dirty}
+        {saving}
+        {saveStatus}
+        loading={detailLoading}
+        error={detailError}
+        onsave={save}
+      />
+    </section>
+  </main>
 </div>
 
 {#if toasts.length > 0}
@@ -727,6 +739,10 @@
     flex-direction: column;
     height: 100dvh;
     min-height: 0;
+  }
+
+  main[hidden] {
+    display: none !important;
   }
 
   .bar {

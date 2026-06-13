@@ -39,87 +39,26 @@
     BOX_WEAK,
   } from "./overlayStyle";
   import { loadTuneLastDir, saveTuneLastDir } from "./prefs";
-
-  // How many frames Shift+Arrow skips.
-  const SKIP_N = 10;
-  // Cap concurrent detection fetches. Server serializes inference under a lock,
-  // so a deep queue just delays interactive seeks; 2 keeps the pipe busy while
-  // a fresh seek's frame can still jump the queue within one inference slot.
-  // This budget is shared by the YOLO detect filler AND the pose filler.
-  const MAX_INFLIGHT = 2;
-  // Backfill (non-urgent) YOLO is fetched a contiguous window at a time so the
-  // server runs one batched `detect_batch` forward instead of N batch-1 calls —
-  // the whole point of lifting GPU utilization off the batch-1 floor. Kept modest
-  // so a near-cursor "urgent" frame queued behind an in-flight batch waits at most
-  // RANGE_BATCH frames of inference; the server also caps this at its configured
-  // `tune_detection_batch_size`, returning fewer frames when smaller or at EOF.
-  const RANGE_BATCH = 8;
-  // Pose trails YOLO: at most one pose pass in flight, and only when YOLO has no
-  // urgent (near-cursor) work, so detection always wins the GPU lock.
-  const MAX_POSE_INFLIGHT = 1;
-  // Pose is batched across a contiguous run of detected frames in one request so
-  // the SuperAnimal backend runs a single multi-frame forward (measured ~9-14x
-  // faster than the batch-1 per-frame floor). Kept modest so one pose batch can't
-  // hog the GPU lock for long; the server also caps frames + total crops.
-  const POSE_RANGE_BATCH = 8;
-  // A YOLO-needed index this close to the playhead anchor is "urgent" and always
-  // preempts pose (so stepping/scrubbing stays snappy while pose backfills).
-  const URGENT_WINDOW = 30;
-  // The floor the slider can't go below (overwritten by the first detect result).
-  const DEFAULT_FLOOR = 0.05;
-  const ULTRA_TRACK_HIGH_DEFAULT = 0.25;
-  const ULTRA_TRACK_LOW_DEFAULT = 0.1;
-  const ULTRA_NEW_TRACK_DEFAULT = 0.25;
-  const ULTRA_TRACK_BUFFER_DEFAULT = 30;
-  const ULTRA_MATCH_DEFAULT = 0.8;
-  const ULTRA_PROXIMITY_DEFAULT = 0.5;
-  const ULTRA_APPEARANCE_DEFAULT = 0.25;
-
-  // Skeleton edges by raw DeepLabCut keypoint name. Drawn only when both
-  // endpoints are present, so the mock (a torso+paws subset) and the full
-  // 39-point SuperAnimal backend both render sensibly.
-  const POSE_EDGES: Array<[string, string]> = [
-    ["nose", "upper_jaw"],
-    ["nose", "neck_base"],
-    ["neck_base", "back_base"],
-    ["back_base", "neck_end"],
-    ["back_base", "back_middle"],
-    ["back_middle", "back_end"],
-    ["back_end", "tail_base"],
-    ["tail_base", "tail_end"],
-    ["back_base", "front_left_paw"],
-    ["back_base", "front_right_paw"],
-    ["front_left_thai", "front_left_knee"],
-    ["front_left_knee", "front_left_paw"],
-    ["front_right_thai", "front_right_knee"],
-    ["front_right_knee", "front_right_paw"],
-    ["back_end", "back_left_paw"],
-    ["back_end", "back_right_paw"],
-    ["back_left_thai", "back_left_knee"],
-    ["back_left_knee", "back_left_paw"],
-    ["back_right_thai", "back_right_knee"],
-    ["back_right_knee", "back_right_paw"],
-  ];
-
-  type OverlayMode = "boxes" | "pose" | "both";
-
-  interface BufferEntry {
-    scopeKey: string;
-    detections: TuneDetection[];
-    pose: TunePose[];
-    // Whether the decoupled pose pass has RUN for this frame (regardless of
-    // whether it produced keypoints — empty is a valid result, marked posed so
-    // it isn't retried forever). Boxes come from the detect filler (always
-    // pose=0); pose is filled in proactively afterwards via POST /api/tune/pose,
-    // so flipping the overlay to pose is instant and never rebuffers boxes.
-    posed: boolean;
-  }
-
-  interface ZoomCard {
-    det: TuneDetection;
-    pose: TunePose | null;
-    kept: boolean;
-  }
+  import {
+    DEFAULT_FLOOR,
+    MAX_INFLIGHT,
+    MAX_POSE_INFLIGHT,
+    POSE_EDGES,
+    POSE_RANGE_BATCH,
+    RANGE_BATCH,
+    SKIP_N,
+    ULTRA_APPEARANCE_DEFAULT,
+    ULTRA_MATCH_DEFAULT,
+    ULTRA_NEW_TRACK_DEFAULT,
+    ULTRA_PROXIMITY_DEFAULT,
+    ULTRA_TRACK_BUFFER_DEFAULT,
+    ULTRA_TRACK_HIGH_DEFAULT,
+    ULTRA_TRACK_LOW_DEFAULT,
+    URGENT_WINDOW,
+    buildZoomCards,
+    clamp,
+  } from "./tuneDetectCore";
+  import type { BufferEntry, OverlayMode, ZoomCard } from "./tuneDetectCore";
 
   const hasRvfc =
     typeof HTMLVideoElement !== "undefined" &&
@@ -304,10 +243,6 @@
   onDestroy(() => {
     teardownClip();
   });
-
-  function clamp(v: number, lo: number, hi: number): number {
-    return v < lo ? lo : v > hi ? hi : v;
-  }
 
   function effectiveFps(m: TuneMeta | null): number {
     if (!m) return 30;
@@ -1740,56 +1675,6 @@
   // --- zoom crops -----------------------------------------------------------
 
   const ZOOM_TARGET = 220; // longest-side px of a zoom crop
-
-  function boxIou(a: TuneDetection, b: number[]): number {
-    const ix1 = Math.max(a.x1, b[0]);
-    const iy1 = Math.max(a.y1, b[1]);
-    const ix2 = Math.min(a.x2, b[2]);
-    const iy2 = Math.min(a.y2, b[3]);
-    const iw = Math.max(0, ix2 - ix1);
-    const ih = Math.max(0, iy2 - iy1);
-    const inter = iw * ih;
-    if (inter <= 0) {
-      return 0;
-    }
-    const areaA = Math.max(0, a.x2 - a.x1) * Math.max(0, a.y2 - a.y1);
-    const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
-    const union = areaA + areaB - inter;
-    return union > 0 ? inter / union : 0;
-  }
-
-  // Pose payloads are 1:1 with detection boxes server-side (each pose carries
-  // the detector bbox), so the best IoU match recovers the dog for a crop.
-  function matchPose(det: TuneDetection, poses: TunePose[]): TunePose | null {
-    let best: TunePose | null = null;
-    let bestIou = 0.1; // require a little overlap to associate
-    for (const pose of poses) {
-      if (!pose.bbox || pose.bbox.length < 4) {
-        continue;
-      }
-      const score = boxIou(det, pose.bbox);
-      if (score > bestIou) {
-        bestIou = score;
-        best = pose;
-      }
-    }
-    return best;
-  }
-
-  function buildZoomCards(
-    dets: TuneDetection[],
-    poses: TunePose[],
-    thr: number,
-  ): ZoomCard[] {
-    return dets
-      .map((det) => ({
-        det,
-        pose: matchPose(det, poses),
-        kept: det.confidence >= thr,
-      }))
-      .sort((a, b) => b.det.confidence - a.det.confidence)
-      .slice(0, 8);
-  }
 
   function drawZoom(): void {
     if (!videoEl || !meta) {

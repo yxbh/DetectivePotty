@@ -39,7 +39,7 @@ class TunePoseRangeFrame(BaseModel):
 
 
 class TunePoseRangeRequest(BaseModel):
-    """Body for ``POST /api/tune/pose_range`` — the batched pose pass.
+    """Body for ``POST /api/tune/pose-range`` — the batched pose pass.
 
     Carries the buffered boxes for a run of frames so pose runs as **one batched
     GPU forward across the whole window** instead of one request per frame (the

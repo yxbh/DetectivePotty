@@ -809,7 +809,7 @@ def pose_payload_for_frames(
 ) -> list[tuple[int, list[dict[str, Any]]]]:
     """Estimate pose across **multiple frames** in one ``estimate_batch`` forward.
 
-    Drives the batched pose pass (``POST /api/tune/pose_range``). ``items`` is a
+    Drives the batched pose pass (``POST /api/tune/pose-range``). ``items`` is a
     sequence of ``(index, frame_bgr_or_None, boxes)``. Every frame's valid boxes
     are collected into a **single** ``estimate_batch`` call so the backend runs one
     batched GPU forward for the whole window (the SuperAnimal backend measured

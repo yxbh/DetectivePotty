@@ -33,7 +33,7 @@ from detectivepotty.web.tune_tracking import (
 
 logger = logging.getLogger(__name__)
 
-# Upper bound on total pose crops the batched pose pass (`POST /api/tune/pose_range`)
+# Upper bound on total pose crops the batched pose pass (`POST /api/tune/pose-range`)
 # will run for one request, regardless of how many frames/boxes the client sends.
 TUNE_POSE_MAX_CROPS = 64
 
@@ -417,7 +417,7 @@ def register_tune_routes(
 
         Kept byte-identical to the pre-streaming behaviour by collecting every
         ``frames`` record and merging the final ``done`` record — so the existing
-        ``/api/tune/track_range`` contract + tests are unchanged.
+        ``/api/tune/track-range`` contract + tests are unchanged.
         """
 
         frames: list[dict] = []
@@ -647,7 +647,7 @@ def register_tune_routes(
     ) -> dict:
         """Batched pose over a run of frames — one ``estimate_batch`` GPU forward.
 
-        Drives ``POST /api/tune/pose_range``. Each frame is decoded *outside*
+        Drives ``POST /api/tune/pose-range``. Each frame is decoded *outside*
         ``tune_infer_lock`` (CPU/IO shouldn't block the GPU); a frame that can't be
         decoded is carried as ``None`` so it still appears in the response (with
         empty pose) and the client can mark it terminal instead of retrying it
@@ -871,7 +871,8 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/tune/detect_range")
+    @app.get("/api/tune/detect_range", include_in_schema=False)
+    @app.get("/api/tune/detect-range")
     async def tune_detect_range(
         path: str,
         start: Annotated[int, Query(ge=0)] = 0,
@@ -907,7 +908,8 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/tune/track_range")
+    @app.get("/api/tune/track_range", include_in_schema=False)
+    @app.get("/api/tune/track-range")
     async def tune_track_range(
         path: str,
         start: Annotated[int, Query(ge=0)] = 0,
@@ -1004,7 +1006,8 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/tune/track_range_stream")
+    @app.get("/api/tune/track_range_stream", include_in_schema=False)
+    @app.get("/api/tune/track-range-stream")
     async def tune_track_range_stream(
         path: str,
         start: Annotated[int, Query(ge=0)] = 0,
@@ -1135,11 +1138,12 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.post("/api/tune/pose_range")
+    @app.post("/api/tune/pose_range", include_in_schema=False)
+    @app.post("/api/tune/pose-range")
     async def tune_pose_range(req: TunePoseRangeRequest) -> dict:
         """Batched pose for a run of frames' buffered boxes — one GPU forward.
 
-        The pose analogue of ``/api/tune/detect_range``: instead of one pose
+        The pose analogue of ``/api/tune/detect-range``: instead of one pose
         request per frame (the batch-1 floor that measured ~9-14x slower on the
         SuperAnimal backend), the tuner sends a window of frames + their boxes and
         pose runs as a single batched ``estimate_batch``. Frames are capped by
@@ -1175,4 +1179,3 @@ def register_tune_routes(
             )
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
-

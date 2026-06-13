@@ -132,7 +132,7 @@ export interface TunePoseResult {
 }
 
 /** Batched pose results for a contiguous run of frames
- *  (`POST /api/tune/pose_range`). Each entry is shaped like {@link TunePoseResult}. */
+ *  (`POST /api/tune/pose-range`). Each entry is shaped like {@link TunePoseResult}. */
 export interface TunePoseRangeResult {
   frames: TunePoseResult[];
 }
@@ -206,7 +206,7 @@ export interface TuneTrackedDetection {
   track_id: string;
 }
 
-/** Per-frame tracked boxes for one sampled frame (`GET /api/tune/track_range`). */
+/** Per-frame tracked boxes for one sampled frame (`GET /api/tune/track-range`). */
 export interface TuneTrackedFrame {
   index: number;
   detections: TuneTrackedDetection[];

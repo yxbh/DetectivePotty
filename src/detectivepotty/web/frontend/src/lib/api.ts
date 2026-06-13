@@ -204,7 +204,7 @@ export async function fetchTuneDetectRange(
     count: String(count),
     model,
   });
-  const response = await fetch(`/api/tune/detect_range?${params.toString()}`, { signal });
+  const response = await fetch(`/api/tune/detect-range?${params.toString()}`, { signal });
   return jsonOrThrow<TuneDetectRangeResult>(response);
 }
 
@@ -247,7 +247,7 @@ export async function streamTuneTrackRange(
     tracker,
   });
   addTrackParams(query, params);
-  const response = await fetch(`/api/tune/track_range_stream?${query.toString()}`, {
+  const response = await fetch(`/api/tune/track-range-stream?${query.toString()}`, {
     signal,
   });
   if (!response.ok || !response.body) {
@@ -292,7 +292,7 @@ export async function fetchTunePoseRange(
   frames: { index: number; boxes: number[][] }[],
   signal?: AbortSignal,
 ): Promise<TunePoseRangeResult> {
-  const response = await fetch("/api/tune/pose_range", {
+  const response = await fetch("/api/tune/pose-range", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, frames }),

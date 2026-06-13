@@ -600,7 +600,7 @@ def test_tune_detect_range_matches_single_frame_calls(tmp_path: Path) -> None:
     client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
 
     ranged = client.get(
-        "/api/tune/detect_range",
+        "/api/tune/detect-range",
         params={"path": str(clip), "start": 1, "count": 4},
     ).json()
     assert [f["index"] for f in ranged["frames"]] == [1, 2, 3, 4]
@@ -673,7 +673,7 @@ def test_tune_detect_range_rejects_unknown_model(tmp_path: Path) -> None:
     assert resp.status_code == 400
 
 
-# --- tracking (track_detections + /api/tune/track_range) ------------------
+# --- tracking (track_detections + /api/tune/track-range) ------------------
 
 
 def _det(frame_idx: int, x1: float, y1: float, x2: float, y2: float, conf: float = 0.7):
@@ -759,7 +759,7 @@ def test_track_range_endpoint_returns_track_ids_and_stats(tmp_path: Path) -> Non
     client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
 
     body = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
     ).json()
     # Only multiples-of-5 frames are sampled/tracked (absolute source numbering).
@@ -1023,7 +1023,7 @@ def test_track_range_stream_emits_frames_then_done(tmp_path: Path) -> None:
     client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
 
     resp = client.get(
-        "/api/tune/track_range_stream",
+        "/api/tune/track-range-stream",
         params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
     )
     assert resp.status_code == 200
@@ -1136,7 +1136,7 @@ def test_tune_detect_rejects_unknown_model(tmp_path: Path) -> None:
     assert resp.status_code == 400
 
 
-# --- batched pose pass (POST /api/tune/pose_range) ------------------------
+# --- batched pose pass (POST /api/tune/pose-range) ------------------------
 
 
 def test_tune_pose_range_matches_per_frame_pose(tmp_path: Path) -> None:
@@ -1155,7 +1155,7 @@ def test_tune_pose_range_matches_per_frame_pose(tmp_path: Path) -> None:
 
     batched = make_client(tmp_path, clip)
     body = batched.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={"path": str(clip), "frames": [{"index": i, "boxes": boxes} for i in indices]},
     ).json()
     got = {f["index"]: f["pose"] for f in body["frames"]}

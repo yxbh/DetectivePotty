@@ -7,6 +7,7 @@ import time
 
 import cv2
 import numpy as np
+import pytest
 
 from detectivepotty.config import CameraConfig, CameraInputConfig, Config, GlobalSettings
 from detectivepotty.events import Detection
@@ -177,6 +178,22 @@ def test_run_pipeline_isolates_failing_camera(tmp_path) -> None:
 
     assert len(event_dirs) == 1
     assert event_dirs[0].parent.parent.parent.name == "Camera_1"
+
+
+def test_run_pipeline_raises_file_camera_error_when_not_continuing(tmp_path) -> None:
+    video_path = tmp_path / "sample.mp4"
+    write_synthetic_video(video_path)
+    config = make_config(tmp_path / "dataset", video_path)
+
+    def failing_detector_factory(_camera_config):  # noqa: ANN001
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_pipeline(
+            config,
+            detector_factory=failing_detector_factory,
+            continue_on_camera_error=False,
+        )
 
 
 def test_run_pipeline_max_workers_one_forces_sequential(tmp_path) -> None:
@@ -378,6 +395,22 @@ def test_rtsp_camera_invalid_url_warns_and_skips(tmp_path, monkeypatch, caplog) 
 
     assert result == []
     assert "invalid URL" in caplog.text
+
+
+def test_rtsp_camera_error_raises_when_not_continuing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("POOL_RTSP_URL", "rtsp://192.168.1.37:554/cam")
+    config = _rtsp_config(tmp_path / "dataset", "POOL_RTSP_URL")
+
+    def factory(_url: str) -> VideoSource:
+        raise RuntimeError("rtsp boom")
+
+    with pytest.raises(RuntimeError, match="rtsp boom"):
+        run_pipeline(
+            config,
+            detector_factory=_no_detector_factory,
+            rtsp_source_factory=factory,
+            continue_on_camera_error=False,
+        )
 
 
 class _StopAfterFirstFrameSource(VideoSource):

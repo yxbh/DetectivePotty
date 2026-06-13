@@ -544,6 +544,57 @@ def test_harvest_clips_is_idempotent(tmp_path: Path) -> None:
     assert first == second
     assert len(first) == 1
 
+
+def test_harvest_releases_all_writers_when_one_release_fails(tmp_path: Path) -> None:
+    class TwoDogDetector:
+        def detect(self, frame: np.ndarray, frame_idx: int = 0) -> list[Detection]:
+            del frame
+            if not 10 <= frame_idx <= 30:
+                return []
+            return [
+                Detection(
+                    bbox=BBox(10, 10, 30, 30),
+                    confidence=0.9,
+                    class_name="dog",
+                    frame_idx=frame_idx,
+                    mono_ts=0.0,
+                    wall_ts=datetime.now(timezone.utc),
+                ),
+                Detection(
+                    bbox=BBox(40, 10, 60, 30),
+                    confidence=0.9,
+                    class_name="dog",
+                    frame_idx=frame_idx,
+                    mono_ts=0.0,
+                    wall_ts=datetime.now(timezone.utc),
+                ),
+            ]
+
+    class ReleaseFailWriter(FakeClipWriter):
+        released: list[str] = []
+
+        def release(self) -> None:
+            self.released.append(self.path.parent.name)
+            if len(self.released) == 1:
+                raise OSError("release boom")
+            super().release()
+
+    with pytest.raises(OSError, match="release boom"):
+        harvest_clips(
+            tmp_path / "fake.mp4",
+            tmp_path / "harvest",
+            detector=TwoDogDetector(),
+            sample_every=5,
+            pad_s=0.0,
+            min_len_s=0.0,
+            source_start_utc=datetime(2026, 6, 6, tzinfo=timezone.utc),
+            capture_factory=lambda _p: FakeCapture(60, fps=10.0),
+            clip_writer_factory=lambda p, fps, size: ReleaseFailWriter(p, fps, size),
+        )
+
+    assert len(ReleaseFailWriter.released) == 2
+
+
 class AliasModelDetector:
     """Detector exposing ``model_name`` that emits dog + one alias class.
 

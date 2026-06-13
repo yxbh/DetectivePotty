@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -428,11 +429,14 @@ def create_app(
     # default model and pins the allow-list to just that model, so no scanning or
     # real model build happens offline.
     if tune_detector is not None:
-        app.state.tune_detectors = {app.state.tune_default_model: tune_detector}
+        app.state.tune_detectors = OrderedDict(
+            [(app.state.tune_default_model, tune_detector)]
+        )
         app.state.tune_models = [app.state.tune_default_model]
     else:
-        app.state.tune_detectors = {}
+        app.state.tune_detectors = OrderedDict()
         app.state.tune_models = collect_tune_models(config)
+    app.state.tune_detector_cache_size = 2
     app.state.tune_detector_lock = threading.Lock()
     app.state.tune_infer_lock = threading.Lock()
     app.state.tune_pose_lock = threading.Lock()
@@ -590,9 +594,6 @@ def create_app(
         name = model_name or app.state.tune_default_model
         if name not in app.state.tune_models:
             raise ValueError(f"unknown model: {name}")
-        cached = app.state.tune_detectors.get(name)
-        if cached is not None:
-            return cached, name
         with app.state.tune_detector_lock:
             cached = app.state.tune_detectors.get(name)
             if cached is None:
@@ -607,6 +608,10 @@ def create_app(
                     alias_nms_iou=config.global_settings.dog_alias_nms_iou,
                 )
                 app.state.tune_detectors[name] = cached
+                while len(app.state.tune_detectors) > app.state.tune_detector_cache_size:
+                    app.state.tune_detectors.popitem(last=False)
+            else:
+                app.state.tune_detectors.move_to_end(name)
             return cached, name
 
     def _get_tune_pose():
@@ -681,12 +686,7 @@ def create_app(
                         estimator, frame, detections, frame_idx=idx
                     )
                 except Exception:
-                    # find_spec said the dep exists but inference failed (missing
-                    # model files, bad install, ...). Downgrade so the UI stops
-                    # promising pose and we don't retry the heavy path every frame.
-                    logger.warning("pose inference failed; disabling pose overlay")
-                    app.state.tune_pose_resolved = (None, False)
-                    pose_available = False
+                    logger.warning("pose inference failed for tune detect", exc_info=True)
                     pose_list = []
         payload = {
             "path": str(file_path),
@@ -1152,9 +1152,7 @@ def create_app(
                     estimator, frame, boxes, frame_idx=idx
                 )
             except Exception:
-                logger.warning("pose inference failed; disabling pose overlay")
-                app.state.tune_pose_resolved = (None, False)
-                pose_available = False
+                logger.warning("pose inference failed for tune pose", exc_info=True)
                 pose_list = []
         return {"index": idx, "pose": pose_list, "pose_available": pose_available}
 
@@ -1199,9 +1197,7 @@ def create_app(
             try:
                 results = tune_mod.pose_payload_for_frames(estimator, items)
             except Exception:
-                logger.warning("pose inference failed; disabling pose overlay")
-                app.state.tune_pose_resolved = (None, False)
-                pose_available = False
+                logger.warning("pose inference failed for tune pose range", exc_info=True)
                 results = [(index, []) for index, _frame, _boxes in items]
         return {
             "frames": [

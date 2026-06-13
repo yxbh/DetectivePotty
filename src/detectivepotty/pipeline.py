@@ -438,6 +438,8 @@ class PottyPipeline:
         try:
             return asyncio.run(self._process_protect_camera_async(camera_config))
         except Exception as exc:
+            if not self.continue_on_camera_error:
+                raise
             LOGGER.warning(
                 "Protect camera %s skipped: %s",
                 sanitize_source_id(camera_config.id),
@@ -464,6 +466,8 @@ class PottyPipeline:
         try:
             return asyncio.run(self._run_live_camera_async(camera_config, url, None))
         except Exception as exc:
+            if not self.continue_on_camera_error:
+                raise
             LOGGER.warning(
                 "RTSP camera %s skipped: %s",
                 sanitize_source_id(camera_config.id),

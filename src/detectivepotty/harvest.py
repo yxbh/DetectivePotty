@@ -624,9 +624,17 @@ def _extract_span_clips(
                 _emit(frame, decoded_idx)
                 decoded_idx += 1
     finally:
-        for writer in writers.values():
-            writer.release()
-        _release(capture)
+        release_errors: list[Exception] = []
+        try:
+            for writer in writers.values():
+                try:
+                    writer.release()
+                except Exception as exc:
+                    release_errors.append(exc)
+        finally:
+            _release(capture)
+        if release_errors:
+            raise release_errors[0]
     return sizes
 
 

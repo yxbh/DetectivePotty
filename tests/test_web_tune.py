@@ -68,6 +68,14 @@ class FakeDetector:
         ]
 
 
+class CountingDetector(FakeDetector):
+    built: list[str] = []
+
+    def __init__(self, model_name: str, **_kwargs) -> None:
+        self.model_name = model_name
+        self.built.append(model_name)
+
+
 def make_config(tmp_path: Path, clip: Path) -> Config:
     camera = CameraConfig(
         id="cam1",
@@ -127,6 +135,31 @@ def test_tune_files_lists_videos_and_dirs(tmp_path: Path) -> None:
     assert "notes.txt" not in names  # non-video files are hidden
     # dirs sort before videos
     assert names.index("sub") < names.index("c.mp4")
+
+
+def test_tune_detector_cache_is_bounded_lru(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import detectivepotty.detect.yolo as yolo_mod
+
+    CountingDetector.built = []
+    clip = write_clip(tmp_path / "c.mp4")
+    config = make_config(tmp_path, clip)
+    config.global_settings.model_name = "model-a.pt"
+    monkeypatch.setattr(yolo_mod, "DogDetector", CountingDetector)
+    client = TestClient(create_app(config))
+    client.app.state.tune_models = ["model-a.pt", "model-b.pt", "model-c.pt"]
+
+    for model in client.app.state.tune_models:
+        resp = client.get(
+            "/api/tune/detect",
+            params={"path": str(clip), "index": 0, "model": model},
+        )
+        assert resp.status_code == 200
+
+    assert CountingDetector.built == ["model-a.pt", "model-b.pt", "model-c.pt"]
+    assert list(client.app.state.tune_detectors) == ["model-b.pt", "model-c.pt"]
 
 
 def test_tune_files_rejects_traversal(tmp_path: Path) -> None:
@@ -1215,6 +1248,31 @@ def test_tune_pose_range_unavailable_without_estimator(tmp_path: Path) -> None:
     ).json()
     assert [f["index"] for f in body["frames"]] == [0, 1]
     assert all(f["pose_available"] is False and f["pose"] == [] for f in body["frames"])
+
+
+class FailingPoseEstimator(MockPoseEstimator):
+    def estimate_batch(self, requests):  # noqa: ANN001
+        raise RuntimeError("transient pose failure")
+
+
+def test_tune_pose_range_failure_does_not_disable_pose(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    estimator = FailingPoseEstimator()
+    client = TestClient(
+        create_app(
+            make_config(tmp_path, clip),
+            tune_detector=FakeDetector(),
+            tune_pose_estimator=estimator,
+        )
+    )
+
+    body = client.post(
+        "/api/tune/pose_range",
+        json={"path": str(clip), "frames": [{"index": 0, "boxes": [[10, 10, 80, 90]]}]},
+    ).json()
+
+    assert body["frames"] == [{"index": 0, "pose": [], "pose_available": True}]
+    assert client.app.state.tune_pose_resolved == (estimator, True)
 
 
 def test_tune_pose_range_rejects_invalid_path(tmp_path: Path) -> None:

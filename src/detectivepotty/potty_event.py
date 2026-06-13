@@ -137,6 +137,7 @@ class PottyEventDetector:
         # confidence scaling and review metadata.
         self._best_dwell_s: float = 0.0
         self._suppressed_track_ids: set[str] = set()
+        self._suppressed_until_mono: dict[str, float] = {}
         self._last_frame: Frame | None = None
         self._last_trigger_reason = TriggerReason.YOLO
 
@@ -148,12 +149,13 @@ class PottyEventDetector:
     ) -> list[PottyCandidate]:
         """Consume one frame's detections and return newly completed events."""
 
-        self._last_frame = frame
+        self._last_frame = self._lightweight_frame(frame)
         self._last_trigger_reason = trigger_reason
         filtered = self._filter_detections(detections, frame)
         if self.pose_gate is not None:
             self.pose_gate.observe(frame, filtered)
         active_tracks = self.tracker.update(list(filtered))
+        self._expire_suppressed(frame.mono_ts)
         current_tracks = [
             track
             for track in active_tracks
@@ -163,23 +165,30 @@ class PottyEventDetector:
             self.pose_gate.prune(self._pose_keep_ids(active_tracks, frame.mono_ts))
         emitted: list[PottyCandidate] = []
 
-        if current_tracks:
+        eligible_tracks = [
+            track
+            for track in current_tracks
+            if track.track_id not in self._suppressed_track_ids
+        ]
+        if eligible_tracks:
             if self._state == _DetectorState.IDLE:
                 self._start_window(frame)
             self._append_window(filtered, current_tracks)
             self._update_ambiguity(filtered, current_tracks)
             self._update_posture_state(frame, current_tracks)
+        elif self._state == _DetectorState.WATCHING:
+            self._reset_window()
 
         if self._state == _DetectorState.CANDIDATE and self._event_due_mono is not None:
             if frame.mono_ts >= self._event_due_mono:
                 emitted.append(self._finish_event(frame, near_miss=False))
-                self._suppress_tracks(emitted[-1])
+                self._suppress_tracks(emitted[-1], frame.mono_ts)
                 self._reset_window()
 
         if not active_tracks:
             if self._state == _DetectorState.CANDIDATE:
                 emitted.append(self._finish_event(frame, near_miss=False))
-                self._suppress_tracks(emitted[-1])
+                self._suppress_tracks(emitted[-1], frame.mono_ts)
             elif self._state == _DetectorState.WATCHING and self.emit_near_misses:
                 if self._near_miss_stats is not None:
                     emitted.append(self._finish_event(frame, near_miss=True))
@@ -195,7 +204,7 @@ class PottyEventDetector:
         emitted: list[PottyCandidate] = []
         if self._state == _DetectorState.CANDIDATE:
             emitted.append(self._finish_event(self._last_frame, near_miss=False))
-            self._suppress_tracks(emitted[-1])
+            self._suppress_tracks(emitted[-1], self._last_frame.mono_ts)
         elif self._state == _DetectorState.WATCHING and self.emit_near_misses:
             if self._near_miss_stats is not None:
                 emitted.append(self._finish_event(self._last_frame, near_miss=True))
@@ -518,8 +527,32 @@ class PottyEventDetector:
         # held still.
         return min(0.7, 0.4 + 0.03 * dwell_duration_s)
 
-    def _suppress_tracks(self, candidate: PottyCandidate) -> None:
-        self._suppressed_track_ids.update(track.track_id for track in candidate.tracks)
+    def _suppress_tracks(self, candidate: PottyCandidate, current_mono: float) -> None:
+        cooldown_s = max(
+            self.camera_config.dwell_trigger_s,
+            self.camera_config.stationary_threshold_s,
+            self.camera_config.event_duration_s,
+        )
+        until = current_mono + cooldown_s
+        for track in candidate.tracks:
+            self._suppressed_track_ids.add(track.track_id)
+            self._suppressed_until_mono[track.track_id] = until
+
+    def _expire_suppressed(self, current_mono: float) -> None:
+        for track_id, until in list(self._suppressed_until_mono.items()):
+            if current_mono >= until:
+                del self._suppressed_until_mono[track_id]
+                self._suppressed_track_ids.discard(track_id)
+
+    @staticmethod
+    def _lightweight_frame(frame: Frame) -> Frame:
+        return Frame(
+            bgr=frame.bgr[:0, :0].copy(),
+            frame_idx=frame.frame_idx,
+            mono_ts=frame.mono_ts,
+            wall_ts=frame.wall_ts,
+            source_id=frame.source_id,
+        )
 
     def _reset_window(self, clear_suppressed: bool = False) -> None:
         self._state = _DetectorState.IDLE
@@ -538,6 +571,7 @@ class PottyEventDetector:
         self._best_dwell_s = 0.0
         if clear_suppressed:
             self._suppressed_track_ids = set()
+            self._suppressed_until_mono = {}
 
 
 def _posture_rank(stats: _PostureStats) -> tuple[float, float]:

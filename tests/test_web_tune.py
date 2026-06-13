@@ -1223,16 +1223,32 @@ def test_tune_pose_range_caps_total_crops(tmp_path: Path) -> None:
     from detectivepotty.web.app import TUNE_POSE_MAX_CROPS
 
     clip = write_clip(tmp_path / "c.mp4")
-    client = make_client(tmp_path, clip)
-    full_boxes = [[10.0, 10.0, 80.0, 90.0]] * TUNE_POSE_MAX_CROPS  # one frame hits cap
+    estimator = _BatchRecordingEstimator()
+    client = TestClient(
+        create_app(
+            make_config(tmp_path, clip),
+            tune_detector=FakeDetector(),
+            tune_pose_estimator=estimator,
+        )
+    )
+    almost_full = [[10.0, 10.0, 80.0, 90.0]] * (TUNE_POSE_MAX_CROPS - 1)
+    full_boxes = [[20.0, 20.0, 90.0, 100.0]] * TUNE_POSE_MAX_CROPS
     body = client.post(
         "/api/tune/pose_range",
         json={
             "path": str(clip),
-            "frames": [{"index": 0, "boxes": full_boxes}, {"index": 1, "boxes": full_boxes}],
+            "frames": [
+                {"index": 0, "boxes": almost_full},
+                {"index": 1, "boxes": full_boxes},
+            ],
         },
     ).json()
-    assert [f["index"] for f in body["frames"]] == [0]  # 2nd frame dropped by crop cap
+    assert [f["index"] for f in body["frames"]] == [0, 1]
+    assert [len(f["pose"]) for f in body["frames"]] == [
+        TUNE_POSE_MAX_CROPS - 1,
+        1,
+    ]
+    assert estimator.batch_sizes == [TUNE_POSE_MAX_CROPS]
 
 
 def test_tune_pose_range_unavailable_without_estimator(tmp_path: Path) -> None:

@@ -488,7 +488,10 @@ def _write_spans(
     results: list[HarvestResult] = []
     for span, span_id, clip_dir in plans:
         clip_path = clip_dir / CLIP_NAME
-        width, height = sizes.get(span_id, (0, 0))
+        size = sizes.get(span_id)
+        if size is None:
+            raise RuntimeError(f"failed to extract clip for span {span_id}")
+        width, height = size
         metadata_path = _write_clip_metadata(
             clip_dir,
             span=span,
@@ -551,6 +554,10 @@ def _seek_capture(capture: Any, frame_idx: int) -> bool:
         return False
 
 
+def _capture_can_seek(capture: Any) -> bool:
+    return callable(getattr(capture, "set", None))
+
+
 def _extract_span_clips(
     input_path: Path,
     plans: Sequence[tuple[DogSpan, str, Path]],
@@ -599,7 +606,13 @@ def _extract_span_clips(
                 writer.write(frame)
 
     try:
-        seekable = bool(segments) and _seek_capture(capture, segments[0][0])
+        seekable = False
+        if segments and _capture_can_seek(capture):
+            seekable = _seek_capture(capture, segments[0][0])
+            if not seekable:
+                raise RuntimeError(
+                    f"seek to frame {segments[0][0]} failed before extraction"
+                )
         if seekable:
             for seg_index, (seg_start, seg_end) in enumerate(segments):
                 if seg_index > 0 and not _seek_capture(capture, seg_start):
@@ -610,7 +623,10 @@ def _extract_span_clips(
                 while decoded_idx <= seg_end:
                     ok, frame = capture.read()
                     if not ok or frame is None:
-                        break
+                        raise RuntimeError(
+                            "decode ended before expected frame "
+                            f"{seg_end} in segment starting at {seg_start}"
+                        )
                     _emit(frame, decoded_idx)
                     decoded_idx += 1
         else:

@@ -130,6 +130,17 @@ def test_sparse_source_frame_gaps_age_by_tracker_update() -> None:
     assert {track.track_id for track in two_misses} == {"2"}
 
 
+def test_inactive_histories_are_bounded() -> None:
+    tracker = Tracker(max_age_frames=0, max_history_tracks=2)
+
+    for idx, x in enumerate((0, 50, 100)):
+        tracker.update([make_detection(idx * 2, BBox(x, 0, x + 10, 10))])
+        tracker.update([])
+
+    assert [track.track_id for track in tracker.histories] == ["2", "3"]
+    assert tracker.get_track("1") is None
+
+
 def test_overlapping_dogs_have_no_reidentification_guarantee() -> None:
     tracker = Tracker(iou_threshold=0.1, max_age_frames=2)
     first = tracker.update(

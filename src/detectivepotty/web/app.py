@@ -1673,8 +1673,12 @@ def create_app(
         frames_in: list[tuple[int, list[list[float]]]] = []
         crops = 0
         for frame in req.frames[:frame_cap]:
-            frames_in.append((frame.index, frame.boxes))
-            crops += len(frame.boxes)
+            if crops >= TUNE_POSE_MAX_CROPS:
+                break
+            remaining = TUNE_POSE_MAX_CROPS - crops
+            boxes = frame.boxes[:remaining]
+            frames_in.append((frame.index, boxes))
+            crops += len(boxes)
             if crops >= TUNE_POSE_MAX_CROPS:
                 break
 

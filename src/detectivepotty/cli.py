@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
@@ -17,6 +18,8 @@ from detectivepotty.detect.yolo import DogDetector
 from detectivepotty.geometry import crop_from_frame
 
 app = typer.Typer(help="DetectivePotty offline and live utilities.")
+
+_PROTECT_DOWNLOAD_TIMEOUT_S = 30 * 60.0
 
 
 def _resolve_dog_aliases(
@@ -51,6 +54,17 @@ DogAliasOption = Annotated[
         ),
     ),
 ]
+
+
+def _protect_download_result(future):
+    try:
+        return future.result(timeout=_PROTECT_DOWNLOAD_TIMEOUT_S)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(
+            "Protect recording export timed out "
+            f"after {_PROTECT_DOWNLOAD_TIMEOUT_S:.0f}s"
+        ) from exc
 
 
 @app.callback()
@@ -1077,7 +1091,7 @@ async def _harvest_via_uiprotect(
             future = asyncio.run_coroutine_threadsafe(
                 client.download_recording(cam_id, c_start, c_end, dest), loop
             )
-            return future.result()
+            return _protect_download_result(future)
 
         return await asyncio.to_thread(
             harvest_camera_window,
@@ -1536,7 +1550,7 @@ async def _acquire_via_uiprotect(
             future = asyncio.run_coroutine_threadsafe(
                 client.download_recording(cam_id, c_start, c_end, dest), loop
             )
-            return future.result()
+            return _protect_download_result(future)
 
         chunks = plan_chunks(start_utc, end_utc, chunk_s=chunk_s, overlap_s=0.0)
         return await asyncio.to_thread(

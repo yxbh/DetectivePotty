@@ -17,6 +17,7 @@ from detectivepotty.harvest import (
     _extract_span_clips,
     _merge_frame_ranges,
     _scan_for_dogs,
+    _write_spans,
     compute_spans,
     harvest_clips,
     make_span_id,
@@ -401,6 +402,45 @@ def test_extract_decodes_only_union(tmp_path: Path) -> None:
     assert FakeClipWriter.written["s1"] == 11  # frames 50..60 inclusive
 
 
+def test_extract_raises_when_initial_seek_fails(tmp_path: Path) -> None:
+    class FailingSeekCapture(FakeSeekCapture):
+        def set(self, prop: int, value: float) -> bool:  # noqa: N802 - mirror cv2
+            super().set(prop, value)
+            return False
+
+    spans = [_span("1", 10, 20)]
+    plans = _plans(tmp_path, spans)
+
+    with pytest.raises(RuntimeError, match="seek to frame 10 failed"):
+        _extract_span_clips(
+            tmp_path / "fake.mp4",
+            plans,
+            fps=10.0,
+            capture_factory=lambda _p: FailingSeekCapture(100),
+            clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+        )
+
+
+def test_extract_raises_when_seekable_decode_ends_mid_segment(tmp_path: Path) -> None:
+    class EarlyEofSeekCapture(FakeSeekCapture):
+        def read(self):
+            if self.read_count >= 2:
+                return False, None
+            return super().read()
+
+    spans = [_span("1", 10, 20)]
+    plans = _plans(tmp_path, spans)
+
+    with pytest.raises(RuntimeError, match="decode ended before expected frame 20"):
+        _extract_span_clips(
+            tmp_path / "fake.mp4",
+            plans,
+            fps=10.0,
+            capture_factory=lambda _p: EarlyEofSeekCapture(100),
+            clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+        )
+
+
 def test_extract_overlapping_spans_share_one_segment(tmp_path: Path) -> None:
     FakeClipWriter.written = {}
     spans = [_span("1", 10, 30), _span("2", 20, 40)]  # overlap -> one segment
@@ -441,6 +481,26 @@ def test_extract_sequential_fallback_without_seek(tmp_path: Path) -> None:
 
     assert cap.read_count == 100  # full sequential pass
     assert FakeClipWriter.written["s0"] == 11
+
+
+def test_write_spans_rejects_missing_clip_metadata(tmp_path: Path) -> None:
+    out_dir = tmp_path / "harvest"
+    out_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="failed to extract clip for span"):
+        _write_spans(
+            [_span("1", 10, 20)],
+            input_path=tmp_path / "fake.mp4",
+            out_dir=out_dir,
+            fps=10.0,
+            source_id="fake.mp4",
+            source_start_utc=datetime(2026, 6, 6, tzinfo=timezone.utc),
+            sample_every=5,
+            capture_factory=lambda _p: _CountingCapture(0),
+            clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+        )
+
+    assert not list(out_dir.glob("*/metadata.json"))
 
 
 def test_harvest_clips_seek_matches_sequential(tmp_path: Path) -> None:

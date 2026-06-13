@@ -135,6 +135,50 @@ def test_candidate_stats_stay_with_primary_track() -> None:
     assert candidate.posture_summary["dwell_duration_s"] == 2.0
 
 
+def test_last_frame_does_not_retain_full_image() -> None:
+    detector = PottyEventDetector(camera_config())
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    the_frame = Frame(
+        bgr=image,
+        frame_idx=0,
+        mono_ts=0.0,
+        wall_ts=BASE_TS,
+        source_id="camera://cam-1",
+    )
+
+    detector.process(the_frame, [detection(0, standing())])
+
+    assert detector._last_frame is not None
+    assert detector._last_frame.bgr.size == 0
+    assert detector._last_frame.bgr.base is None
+
+
+def test_suppressed_only_track_does_not_grow_window() -> None:
+    detector = PottyEventDetector(
+        camera_config(dwell_trigger_s=5.0, event_duration_s=1.0),
+    )
+
+    emitted = []
+    for frame_idx in range(7):
+        emitted.extend(detector.process(frame(frame_idx), [detection(frame_idx, standing())]))
+    assert len(emitted) == 1
+
+    for frame_idx in range(7, 11):
+        assert detector.process(frame(frame_idx), [detection(frame_idx, standing())]) == []
+        assert detector._window_detections == []
+
+
+def test_continuous_track_can_emit_again_after_suppression_cooldown() -> None:
+    detector = PottyEventDetector(
+        camera_config(dwell_trigger_s=2.0, event_duration_s=1.0),
+    )
+
+    emitted = run_sequence(detector, [[standing()] for _ in range(8)])
+
+    assert len(emitted) == 2
+    assert [candidate.primary_track_id for candidate in emitted] == ["1", "1"]
+
+
 def test_roi_and_ignore_zone_filtering() -> None:
     # Zones are normalized [0.0, 1.0] image coordinates; the test frame is 160x120,
     # so a detection's pixel center is normalized before the polygon test. ROI keeps
@@ -244,7 +288,7 @@ def test_stationary_emits_when_window_span_stays_below_threshold() -> None:
         stationary_threshold_s=threshold_s,
         dwell_trigger_s=1.0,
         sample_rate_fps=10.0,
-        event_duration_s=2.0,
+        event_duration_s=10.0,
     )
     detector = PottyEventDetector(config)
 

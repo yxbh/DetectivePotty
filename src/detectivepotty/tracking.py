@@ -115,6 +115,7 @@ class Tracker:
         max_age_frames: int = 5,
         min_confidence: float = 0.0,
         center_dist_gate: float = 0.0,
+        max_history_tracks: int | None = 1024,
     ) -> None:
         if not 0.0 <= iou_threshold <= 1.0:
             raise ValueError("iou_threshold must be between 0 and 1")
@@ -124,10 +125,13 @@ class Tracker:
             raise ValueError("min_confidence must be non-negative")
         if center_dist_gate < 0.0:
             raise ValueError("center_dist_gate must be non-negative")
+        if max_history_tracks is not None and max_history_tracks < 1:
+            raise ValueError("max_history_tracks must be positive or None")
         self.iou_threshold = iou_threshold
         self.max_age_frames = max_age_frames
         self.min_confidence = min_confidence
         self.center_dist_gate = center_dist_gate
+        self.max_history_tracks = max_history_tracks
         self._next_id = 1
         self._states: dict[str, _TrackState] = {}
         self._histories: dict[str, Track] = {}
@@ -192,6 +196,7 @@ class Tracker:
                 self._birth(detection)
 
         self._drop_expired()
+        self._prune_histories()
         return self.active_tracks
 
     @property
@@ -227,6 +232,7 @@ class Tracker:
             last_detection=detection,
             last_frame_idx=detection.frame_idx,
         )
+        self._prune_histories()
 
     def _age_unmatched(
         self,
@@ -240,11 +246,24 @@ class Tracker:
                 continue
             state.missed_frames += 1
         self._drop_expired()
+        self._prune_histories()
 
     def _drop_expired(self) -> None:
         for track_id, state in list(self._states.items()):
             if state.missed_frames > self.max_age_frames:
                 del self._states[track_id]
+
+    def _prune_histories(self) -> None:
+        if self.max_history_tracks is None:
+            return
+        if len(self._histories) <= self.max_history_tracks:
+            return
+        active_ids = set(self._states)
+        for track_id in sorted(self._histories, key=_track_sort_key):
+            if len(self._histories) <= self.max_history_tracks:
+                break
+            if track_id not in active_ids:
+                del self._histories[track_id]
 
 
 def _track_sort_key(track_id: str) -> tuple[int, str]:

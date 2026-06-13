@@ -39,6 +39,10 @@ ENV_VAR = "DETECTIVEPOTTY_DECODE_BACKEND"
 _THREAD_TYPE = "AUTO"
 
 
+class PyAvDecodeError(RuntimeError):
+    """Raised when PyAV opens a video but fails while decoding frames."""
+
+
 class PyAvCapture:
     """A ``cv2.VideoCapture``-compatible reader backed by PyAV.
 
@@ -106,13 +110,13 @@ class PyAvCapture:
         except StopIteration:
             return False, None
         except Exception as exc:  # pragma: no cover - corrupt/truncated stream
-            logger.debug("PyAvCapture decode error on %s: %s", self._path, exc)
-            return False, None
+            raise PyAvDecodeError(f"PyAV decode error on {self._path}") from exc
         try:
             array = frame.to_ndarray(format="bgr24")
         except Exception as exc:  # pragma: no cover - unexpected pixel format
-            logger.debug("PyAvCapture frame conversion error on %s: %s", self._path, exc)
-            return False, None
+            raise PyAvDecodeError(
+                f"PyAV frame conversion error on {self._path}"
+            ) from exc
         return True, array
 
     def set(self, prop: int, value: float) -> bool:  # noqa: N802 - mirror cv2

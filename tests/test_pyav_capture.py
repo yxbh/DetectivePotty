@@ -17,6 +17,7 @@ import pytest
 from detectivepotty.sources.pyav_capture import (
     ENV_VAR,
     PyAvCapture,
+    PyAvDecodeError,
     default_backend,
     make_capture_factory,
     open_capture,
@@ -111,6 +112,21 @@ def test_open_failure_reports_not_opened(tmp_path: Path) -> None:
     capture = PyAvCapture(str(tmp_path / "does_not_exist.mp4"))
     assert capture.isOpened() is False
     assert capture.read() == (False, None)
+
+
+def test_decode_error_is_not_reported_as_eof() -> None:
+    def broken_frames():
+        raise RuntimeError("bad packet")
+        yield  # pragma: no cover - makes this a generator
+
+    capture = object.__new__(PyAvCapture)
+    capture._path = "broken.mp4"
+    capture._opened = True
+    capture._frames = broken_frames()
+    capture._pending = None
+
+    with pytest.raises(PyAvDecodeError, match="PyAV decode error"):
+        capture.read()
 
 
 def test_make_capture_factory_opencv_is_cv2() -> None:

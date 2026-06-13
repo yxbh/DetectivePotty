@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,22 +10,28 @@ import json
 import logging
 import os
 from pathlib import Path
-import threading
 import time
 from typing import Annotated
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 import uvicorn
 import yaml
 
 from detectivepotty.config import Config, load_config
-from detectivepotty.events import Label, LabelStatus
+from detectivepotty.events import LabelStatus
 from detectivepotty.web.dataset_index import DatasetIndex, fixed_media_path, media_path
-from starlette.datastructures import MutableHeaders
+from detectivepotty.web.label_routes import register_label_routes
+from detectivepotty.web.middleware import ApiNoStoreMiddleware
+from detectivepotty.web.schemas import (
+    ExportCoremlRequest,
+    LabelUpdate,
+    TunePoseRangeRequest,
+    TunePoseRequest,
+)
+from detectivepotty.web.state import init_app_state
 
 
 logger = logging.getLogger(__name__)
@@ -265,80 +270,6 @@ def _ultralytics_boxes(result: object) -> list[dict]:
     return out
 
 
-class LabelUpdate(BaseModel):
-    label: Label
-    label_status: LabelStatus
-    note: str | None = Field(default=None, max_length=2000)
-    dog: str | None = Field(default=None, max_length=200)
-
-
-class ExportCoremlRequest(BaseModel):
-    model: str = Field(max_length=500)
-
-
-class TunePoseRequest(BaseModel):
-    """Body for ``POST /api/tune/pose`` — the decoupled pose pass.
-
-    ``boxes`` are the ``[x1, y1, x2, y2]`` detections the tuner already buffered,
-    so pose runs without re-running YOLO. Bounded to keep a hostile/buggy client
-    from scheduling unbounded inference work.
-    """
-
-    path: str = Field(max_length=4096)
-    index: int = Field(ge=0)
-    boxes: list[list[float]] = Field(default_factory=list, max_length=64)
-
-
-class TunePoseRangeFrame(BaseModel):
-    """One frame's buffered boxes within a batched pose request."""
-
-    index: int = Field(ge=0)
-    boxes: list[list[float]] = Field(default_factory=list, max_length=64)
-
-
-class TunePoseRangeRequest(BaseModel):
-    """Body for ``POST /api/tune/pose_range`` — the batched pose pass.
-
-    Carries the buffered boxes for a run of frames so pose runs as **one batched
-    GPU forward across the whole window** instead of one request per frame (the
-    SuperAnimal backend measured ~9-14x faster batched than the batch-1 floor).
-    Bounded (frame count + per-frame boxes) so a hostile/buggy client can't
-    schedule unbounded work; the server further caps total crops
-    (``TUNE_POSE_MAX_CROPS``).
-    """
-
-    path: str = Field(max_length=4096)
-    frames: list[TunePoseRangeFrame] = Field(default_factory=list, max_length=64)
-
-
-class _ApiNoStoreMiddleware:
-    """Default ``Cache-Control: no-store`` for /api/ responses.
-
-    Implemented as pure ASGI (not ``BaseHTTPMiddleware``) because the latter
-    buffers the whole response body, which breaks the streaming
-    ``GET /api/stream`` SSE endpoint. This only rewrites the response *start*
-    headers, so streamed bodies flush incrementally. Endpoints that set their
-    own Cache-Control (e.g. the SSE stream's ``no-cache``) are left untouched.
-    """
-
-    def __init__(self, app) -> None:
-        self.app = app
-
-    async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http" or not scope.get("path", "").startswith("/api/"):
-            await self.app(scope, receive, send)
-            return
-
-        async def send_wrapper(message) -> None:
-            if message["type"] == "http.response.start":
-                headers = MutableHeaders(raw=message["headers"])
-                if "cache-control" not in headers:
-                    headers["cache-control"] = "no-store"
-            await send(message)
-
-        await self.app(scope, receive, send_wrapper)
-
-
 async def _event_stream(dataset_index, is_disconnected, *, sleep=asyncio.sleep, poll_seconds=None):
     """Async generator yielding SSE frames for newly-recorded events.
 
@@ -409,45 +340,15 @@ def create_app(
     dataset_index = DatasetIndex(config.global_settings.dataset_dir)
     dogs = list(config.global_settings.dogs)
     app = FastAPI(title="DetectivePotty", version="0.1.0")
-    app.state.dataset_index = dataset_index
-    app.state.dogs = dogs
-    # Tuner state. Detector/pose are built lazily on first /api/tune/frame so app
-    # creation stays cheap and offline (tests inject fakes here instead). All
-    # inference is serialized by ``tune_infer_lock`` — torch/MPS isn't reliably
-    # safe for concurrent model execution, matching the pipeline's invariant.
-    from detectivepotty.web.tune import collect_tune_models, collect_tune_roots
-
-    app.state.config = config
-    app.state.tune_roots = collect_tune_roots(config)
-    # Root the range-labeling API discovers harvested clips under. Kept separate
-    # from the tuner's browse roots (which include it) so /api/label only ever
-    # exposes harvested clip dirs, never the wider dataset/data tree.
-    app.state.harvest_root = config.global_settings.harvest_dir
-    app.state.tune_default_model = config.global_settings.model_name
-    # Per-model detector cache (model string -> DogDetector), built lazily under
-    # ``tune_detector_lock``. An injected detector (tests) seeds the cache for the
-    # default model and pins the allow-list to just that model, so no scanning or
-    # real model build happens offline.
-    if tune_detector is not None:
-        app.state.tune_detectors = OrderedDict(
-            [(app.state.tune_default_model, tune_detector)]
-        )
-        app.state.tune_models = [app.state.tune_default_model]
-    else:
-        app.state.tune_detectors = OrderedDict()
-        app.state.tune_models = collect_tune_models(config)
-    app.state.tune_detector_cache_size = 2
-    app.state.tune_detector_lock = threading.Lock()
-    app.state.tune_infer_lock = threading.Lock()
-    app.state.tune_pose_lock = threading.Lock()
-    # Serializes CoreML exports (heavy, macOS-only) triggered from the tuner UI so
-    # only one runs at a time.
-    app.state.tune_export_lock = threading.Lock()
-    # Resolved as (estimator | None, available). Seeded when a fake is injected.
-    app.state.tune_pose_resolved = (
-        (tune_pose_estimator, True) if tune_pose_estimator is not None else None
+    init_app_state(
+        app,
+        config,
+        dataset_index=dataset_index,
+        dogs=dogs,
+        tune_detector=tune_detector,
+        tune_pose_estimator=tune_pose_estimator,
     )
-    app.add_middleware(_ApiNoStoreMiddleware)
+    app.add_middleware(ApiNoStoreMiddleware)
 
     # The built Svelte app references hashed files under /assets. Mount it only
     # when the build exists so app creation still succeeds in CI / fresh
@@ -1691,61 +1592,7 @@ def create_app(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/label/clips")
-    def label_clips() -> dict:
-        """List harvested clips with their labeling progress (unlabeled first)."""
-
-        from detectivepotty.web import labeling
-
-        return {
-            "clips": labeling.list_clips(app.state.harvest_root),
-            "vocabulary": labeling.label_vocabulary(),
-        }
-
-    @app.get("/api/label/clips/{span_id}")
-    def label_clip_detail(span_id: str) -> dict:
-        """Geometry + detection tracks + existing labels for one harvested clip."""
-
-        from detectivepotty.web import labeling
-
-        try:
-            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="clip not found") from exc
-        return labeling.clip_detail(clip_dir, app.state.harvest_root)
-
-    @app.put("/api/label/clips/{span_id}/labels")
-    def label_clip_save(span_id: str, payload: dict = Body(...)) -> dict:
-        """Validate + persist ``labels.json`` for one clip, return fresh detail."""
-
-        from detectivepotty.web import labeling
-
-        try:
-            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="clip not found") from exc
-        try:
-            return labeling.save_clip_labels(clip_dir, payload, app.state.harvest_root)
-        except (ValueError, KeyError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.get("/api/label/clips/{span_id}/video")
-    def label_clip_video(span_id: str) -> FileResponse:
-        """Stream a harvested ``clip.mp4`` (Range-seekable) for the labeler's video."""
-
-        from detectivepotty.harvest import CLIP_NAME
-        from detectivepotty.web import labeling
-
-        try:
-            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="clip not found") from exc
-        clip_path = clip_dir / CLIP_NAME
-        return FileResponse(
-            clip_path,
-            media_type=_VIDEO_MIME.get(clip_path.suffix.lower(), "video/mp4"),
-            headers={"Cache-Control": "no-store"},
-        )
+    register_label_routes(app, video_mime=_VIDEO_MIME)
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str) -> Response:

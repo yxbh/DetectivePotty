@@ -12,6 +12,8 @@
     streamTuneTrackRange,
     tuneClipUrl,
   } from "./api";
+  import { errMsg } from "./errors";
+  import { isTypingTarget } from "./keys";
   import type {
     TuneDetection,
     TuneEntry,
@@ -337,7 +339,7 @@
       // the tab resumes here. "" = root list, which clears the saved pref.
       saveTuneLastDir(listing.path);
     } catch (err) {
-      listingError = err instanceof Error ? err.message : String(err);
+      listingError = errMsg(err);
     } finally {
       listingLoading = false;
     }
@@ -394,6 +396,9 @@
   // --- clip selection / lifecycle ------------------------------------------
 
   async function selectVideo(path: string, name: string): Promise<void> {
+    if (path === selectedPath && meta) {
+      return;
+    }
     teardownClip();
     const seq = ++selectSeq;
     selectedName = name;
@@ -404,7 +409,7 @@
       m = await fetchTuneMeta(path);
     } catch (err) {
       if (seq !== selectSeq) return;
-      metaError = err instanceof Error ? err.message : String(err);
+      metaError = errMsg(err);
       selectedPath = path;
       return;
     }
@@ -511,7 +516,7 @@
       sceneLoading = false;
     } catch (err) {
       if (controller.signal.aborted) return;
-      sceneError = err instanceof Error ? err.message : String(err);
+      sceneError = errMsg(err);
       sceneLoading = false;
     }
   }
@@ -861,7 +866,7 @@
       coremlBatch = result.coreml_batch ?? coremlBatch;
       setModel(result.model);
     } catch (err) {
-      exportError = err instanceof Error ? err.message : "CoreML export failed";
+      exportError = errMsg(err, "CoreML export failed");
     } finally {
       exporting = false;
     }
@@ -1016,7 +1021,7 @@
       );
     } catch (err) {
       if (seq !== selectSeq || controller.signal.aborted) return;
-      trackError = err instanceof Error ? err.message : "Track pass failed";
+      trackError = errMsg(err, "Track pass failed");
     } finally {
       if (trackController === controller) {
         trackController = null;
@@ -1875,15 +1880,7 @@
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
       return;
     }
-    const target = event.target as HTMLElement | null;
-    const typing =
-      target &&
-      (target.tagName === "INPUT" ||
-        target.tagName === "TEXTAREA" ||
-        target.tagName === "SELECT" ||
-        target.isContentEditable) &&
-      (target as HTMLInputElement).type !== "range";
-    if (typing) {
+    if (isTypingTarget(event.target, { allowRange: true })) {
       return;
     }
     switch (event.key) {

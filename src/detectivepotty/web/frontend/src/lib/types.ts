@@ -107,20 +107,6 @@ export interface TunePose {
   keypoints: TuneKeypoint[];
 }
 
-export interface TuneFrame {
-  path: string;
-  index: number;
-  total_frames: number | null;
-  fps: number;
-  width: number;
-  height: number;
-  detection_floor: number;
-  image: string;
-  detections: TuneDetection[];
-  pose: TunePose[];
-  pose_available: boolean;
-}
-
 /** Allow-list of selectable YOLO weights for the model picker. */
 export interface TuneModelList {
   models: string[];
@@ -161,8 +147,7 @@ export interface TuneMeta {
   duration: number;
 }
 
-/** Detections (+optional pose) for one frame — the async overlay buffer's
- *  payload. Shaped like {@link TuneFrame} but with no `image` field. */
+/** Detections (+optional pose) for one frame — the async overlay buffer's payload. */
 export interface TuneDetectResult {
   path: string;
   index: number;
@@ -247,18 +232,6 @@ export interface TuneTrackStats {
   ultralytics: TuneUltralyticsTrackerParams | null;
 }
 
-/** Result of tracking a `[start, start+count)` range with a chosen tracker. */
-export interface TuneTrackRangeResult {
-  model: string;
-  start: number;
-  count: number;
-  fps: number;
-  total_frames: number | null;
-  detection_floor: number;
-  frames: TuneTrackedFrame[];
-  stats: TuneTrackStats;
-}
-
 /** Terminal record of the NDJSON Track-range stream (everything but the frames,
  *  which arrive incrementally as `frames` records during the forward pass). */
 export interface TuneTrackStreamDone {
@@ -275,14 +248,6 @@ export interface TuneTrackStreamDone {
  *  tracking); `ours` = the harvest IoU `Tracker` replay (every model incl. CoreML);
  *  the `bytetrack`/`botsort*` options are Ultralytics native tracking (`.pt`-only). */
 export type TuneTracker = "off" | "ours" | "bytetrack" | "botsort" | "botsort_reid";
-
-/** Harvest-tracker knobs surfaced for the `ours` backend. */
-export interface TuneTrackerParams {
-  sample_every: number;
-  iou_threshold: number;
-  max_age_frames: number;
-  center_dist_gate: number;
-}
 
 /** Per-run Ultralytics tracking knobs. `null` threshold fields keep YAML defaults. */
 export interface TuneUltralyticsTrackerParams {

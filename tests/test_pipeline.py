@@ -378,3 +378,54 @@ def test_rtsp_camera_invalid_url_warns_and_skips(tmp_path, monkeypatch, caplog) 
 
     assert result == []
     assert "invalid URL" in caplog.text
+
+
+class _StopAfterFirstFrameSource(VideoSource):
+    def __init__(self, on_first_read):
+        self._on_first_read = on_first_read
+        self.read_count = 0
+
+    def open(self):
+        return self
+
+    def read(self):
+        if self.read_count > 0:
+            raise AssertionError("file source read again after stop was requested")
+        self.read_count += 1
+        frame = Frame(
+            bgr=np.zeros((120, 160, 3), dtype=np.uint8),
+            frame_idx=0,
+            mono_ts=0.0,
+            wall_ts=datetime.now(timezone.utc),
+            source_id="file://stop-test",
+        )
+        self._on_first_read()
+        return frame
+
+    def close(self) -> None:
+        return None
+
+    @property
+    def fps(self):
+        return 10.0
+
+    @property
+    def resolution(self):
+        return (160, 120)
+
+    @property
+    def is_live(self):
+        return False
+
+
+def test_file_camera_honors_stop_event_between_reads(tmp_path) -> None:
+    from detectivepotty.pipeline import PottyPipeline
+
+    video_path = tmp_path / "placeholder.mp4"
+    config = make_config(tmp_path / "dataset", video_path)
+    pipeline = PottyPipeline(config, detector_factory=_no_detector_factory)
+    source = _StopAfterFirstFrameSource(lambda: pipeline._stop_event.set())
+    pipeline.file_source_factory = lambda _camera: source
+
+    assert pipeline.process_file_camera(config.cameras[0]) == []
+    assert source.read_count == 1

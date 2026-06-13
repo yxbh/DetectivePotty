@@ -21,6 +21,8 @@
   import LabelReview from "./LabelReview.svelte";
   import HelpOverlay from "./HelpOverlay.svelte";
   import { navigate, route, routeToView } from "./router";
+  import { errMsg } from "./errors";
+  import { isTypingTarget } from "./keys";
 
   const STATUS_FILTERS: Array<[string, string]> = [
     ["", "All"],
@@ -169,7 +171,7 @@
       if (token !== listToken) {
         return;
       }
-      listError = err instanceof Error ? err.message : String(err);
+      listError = errMsg(err);
       events = [];
       unfilteredTotal = null;
     } finally {
@@ -204,7 +206,7 @@
         return;
       }
       detail = null;
-      detailError = err instanceof Error ? err.message : String(err);
+      detailError = errMsg(err);
     } finally {
       if (token === detailToken) {
         detailLoading = false;
@@ -269,7 +271,7 @@
       }
     } catch (err) {
       if (detail && detail.summary.event_id === targetId && detailToken === saveToken) {
-        saveStatus = `Save failed: ${err instanceof Error ? err.message : String(err)}`;
+        saveStatus = `Save failed: ${errMsg(err)}`;
       }
     } finally {
       saving = false;
@@ -354,19 +356,6 @@
     }
   }
 
-  function isTyping(target: EventTarget | null): boolean {
-    const el = target as HTMLElement | null;
-    if (!el) {
-      return false;
-    }
-    return (
-      el.tagName === "INPUT" ||
-      el.tagName === "TEXTAREA" ||
-      el.tagName === "SELECT" ||
-      el.isContentEditable
-    );
-  }
-
   function applyFilter(value: string): void {
     statusFilter = value;
     void loadEvents();
@@ -397,7 +386,7 @@
     if (event.metaKey || event.ctrlKey || event.altKey) {
       return;
     }
-    if (isTyping(event.target)) {
+    if (isTypingTarget(event.target)) {
       if (event.key === "Escape") {
         (event.target as HTMLElement).blur();
       }

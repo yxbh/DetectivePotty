@@ -136,6 +136,7 @@ class FakeCurlRunner:
         self.export_code = 200
         self.expire_session_once = False  # first authed GET returns 401, then ok
         self.proc_returncode = 0
+        self.export_returncode = 0
         self.login_count = 0
         self._expired = False
 
@@ -183,6 +184,13 @@ class FakeCurlRunner:
         if "video/export" in url:
             if self.export_code == 200 and out and out != "/dev/null":
                 Path(out).write_bytes(self.export_body)
+            if self.export_returncode != 0:
+                return subprocess.CompletedProcess(
+                    args,
+                    self.export_returncode,
+                    str(self.export_code).encode(),
+                    b"curl boom",
+                )
             return self._done(args, self.export_code)
 
         return self._done(args, 404)
@@ -260,6 +268,9 @@ def test_download_writes_dest(tmp_path: Path) -> None:
         out = dl.download("cam-1", start, end, dest)
     assert out == dest
     assert dest.read_bytes() == runner.export_body
+    export_args = [args for args, _input in runner.calls if "video/export" in args[-1]][0]
+    assert export_args[export_args.index("-o") + 1] == str(dest.with_name("clip.mp4.part"))
+    assert not dest.with_name("clip.mp4.part").exists()
 
 
 def test_download_reauths_on_401(tmp_path: Path) -> None:
@@ -296,6 +307,21 @@ def test_download_empty_body_returns_none(tmp_path: Path) -> None:
         out = dl.download("cam-1", start, end, dest)
     assert out is None
     assert not dest.exists()
+
+
+def test_download_truncated_export_raises_and_removes_part(tmp_path: Path) -> None:
+    runner = FakeCurlRunner()
+    runner.export_returncode = 18
+    dest = tmp_path / "clip.mp4"
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    end = datetime(2026, 6, 6, 0, 2, tzinfo=UTC)
+
+    with _downloader(runner) as dl:
+        with pytest.raises(CurlProtectError, match=r"curl failed \(exit 18\).*HTTP 200"):
+            dl.download("cam-1", start, end, dest)
+
+    assert not dest.exists()
+    assert not dest.with_name("clip.mp4.part").exists()
 
 
 def test_as_download_fn_matches_orchestrator_seam(tmp_path: Path) -> None:

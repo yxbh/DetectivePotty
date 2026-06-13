@@ -6,6 +6,7 @@ dataset.pre-reset-*/
 outputs/
 
 # Local, secret-bearing config (NVR creds, API keys, RTSP tokens)
+config.yaml
 *.local.yaml
 *.local.yml
 .env

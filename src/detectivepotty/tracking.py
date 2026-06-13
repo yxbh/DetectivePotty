@@ -233,14 +233,12 @@ class Tracker:
         current_frame_idx: int | None,
         excluding: set[str] | None = None,
     ) -> None:
+        del current_frame_idx
         excluding = excluding or set()
         for track_id, state in list(self._states.items()):
             if track_id in excluding:
                 continue
-            gap = 1
-            if current_frame_idx is not None and current_frame_idx > state.last_frame_idx:
-                gap = max(1, current_frame_idx - state.last_frame_idx)
-            state.missed_frames += gap
+            state.missed_frames += 1
         self._drop_expired()
 
     def _drop_expired(self) -> None:

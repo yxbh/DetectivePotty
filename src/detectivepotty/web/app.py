@@ -981,10 +981,10 @@ def create_app(
         ...stats}`` via :func:`tune.summarize_tracked_frames`. ``botsort_reid`` is
         BoT-SORT with ``with_reid: True`` (appearance ReID from the detector's own
         features). A **fresh** ``YOLO`` is built per call so ``persist`` tracker state
-        never leaks across requests; the lock is held for the whole pass because the
-        online tracker's per-frame state must be updated atomically. Draining this
-        reproduces ``_track_range_ultralytics_payload``. ``count`` is pre-clamped by the
-        caller.
+        never leaks across requests; the request still feeds sampled frames in-order,
+        but ``tune_infer_lock`` is released before yielding each chunk so a slow
+        client cannot block unrelated inference. Draining this reproduces
+        ``_track_range_ultralytics_payload``. ``count`` is pre-clamped by the caller.
         """
 
         from detectivepotty.device import resolve_device
@@ -1026,16 +1026,16 @@ def create_app(
             )
             cursor = start
             end = start + count
-            with app.state.tune_infer_lock:
-                while cursor < end:
-                    chunk_count = min(decode_cap, end - cursor)
-                    try:
-                        frames, total, fps, _w, _h = tune_mod.read_frames(
-                            file_path, cursor, chunk_count
-                        )
-                    except IndexError:
-                        break  # past EOF: track what we have
-                    chunk_out: list[dict] = []
+            while cursor < end:
+                chunk_count = min(decode_cap, end - cursor)
+                try:
+                    frames, total, fps, _w, _h = tune_mod.read_frames(
+                        file_path, cursor, chunk_count
+                    )
+                except IndexError:
+                    break  # past EOF: track what we have
+                chunk_out: list[dict] = []
+                with app.state.tune_infer_lock:
                     for idx, frame in frames:
                         if idx % stride != 0:
                             continue
@@ -1055,12 +1055,12 @@ def create_app(
                         }
                         out_frames.append(record)
                         chunk_out.append(record)
-                    if chunk_out:
-                        yield {"type": "frames", "frames": chunk_out}
-                    last_decoded = frames[-1][0]
-                    if last_decoded < cursor:  # pragma: no cover - defensive
-                        break
-                    cursor = last_decoded + 1
+                if chunk_out:
+                    yield {"type": "frames", "frames": chunk_out}
+                last_decoded = frames[-1][0]
+                if last_decoded < cursor:  # pragma: no cover - defensive
+                    break
+                cursor = last_decoded + 1
         finally:
             if tmp_dir is not None:
                 import shutil
@@ -1619,6 +1619,10 @@ def create_app(
             except Exception as exc:  # pragma: no cover - defensive
                 logging.getLogger(__name__).exception("track_range_stream failed")
                 yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
+            finally:
+                close = getattr(gen, "close", None)
+                if close is not None:
+                    close()
 
         return StreamingResponse(_ndjson(), media_type="application/x-ndjson")
 

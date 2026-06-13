@@ -344,14 +344,18 @@ class PottyPipeline:
             batch_size = max(1, self.config.global_settings.file_detection_batch_size)
             max_lookahead = max(1, self.config.global_settings.max_lookahead_frames)
 
-            while True:
+            while not self._stop_event.is_set():
                 # Read a bounded segment ahead WITHOUT touching buffer/history/state
                 # so its sampled frames can be detected in one batched forward. The
                 # segment ends once it holds ``batch_size`` sampled frames, hits the
                 # lookahead cap, or reaches EOF.
                 segment: list[Frame] = []
                 sampled_in_segment = 0
-                while sampled_in_segment < batch_size and len(segment) < max_lookahead:
+                while (
+                    not self._stop_event.is_set()
+                    and sampled_in_segment < batch_size
+                    and len(segment) < max_lookahead
+                ):
                     raw_frame = source.read()
                     if raw_frame is None:
                         break

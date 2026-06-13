@@ -10,7 +10,6 @@ import type {
   TuneDetectRangeResult,
   TuneDetectResult,
   TuneExportResult,
-  TuneFrame,
   TuneListing,
   TuneMeta,
   TuneModelList,
@@ -18,7 +17,6 @@ import type {
   TuneSceneResult,
   TuneTracker,
   TuneTrackRequestParams,
-  TuneTrackRangeResult,
   TuneTrackStreamDone,
   TuneTrackedFrame,
 } from "./types";
@@ -126,21 +124,6 @@ export async function fetchTuneFiles(path: string): Promise<TuneListing> {
   return jsonOrThrow<TuneListing>(response);
 }
 
-export async function fetchTuneFrame(
-  path: string,
-  index: number,
-  pose: boolean,
-  signal?: AbortSignal,
-): Promise<TuneFrame> {
-  const params = new URLSearchParams({
-    path,
-    index: String(index),
-    pose: pose ? "1" : "0",
-  });
-  const response = await fetch(`/api/tune/frame?${params.toString()}`, { signal });
-  return jsonOrThrow<TuneFrame>(response);
-}
-
 export async function fetchTuneModels(): Promise<TuneModelList> {
   const response = await fetch("/api/tune/models");
   return jsonOrThrow<TuneModelList>(response);
@@ -235,32 +218,6 @@ function addTrackParams(query: URLSearchParams, params: TuneTrackRequestParams):
     if (key === "conf" || key === "with_reid" || value === null) continue;
     query.set(key, String(value));
   }
-}
-
-/** Track a `[start, start+count)` range with the chosen tracker (the "Track range"
- *  action). The request always decodes in frame order; `ours` replays YOLO boxes
- *  through the harvest IoU tracker, while Ultralytics backends call `YOLO.track`
- *  with per-run detector/tracker knobs. The backend caps `count` at
- *  `TUNE_TRACK_MAX_FRAMES`. */
-export async function fetchTuneTrackRange(
-  path: string,
-  start: number,
-  count: number,
-  model: string,
-  tracker: TuneTracker,
-  params: TuneTrackRequestParams,
-  signal?: AbortSignal,
-): Promise<TuneTrackRangeResult> {
-  const query = new URLSearchParams({
-    path,
-    start: String(start),
-    count: String(count),
-    model,
-    tracker,
-  });
-  addTrackParams(query, params);
-  const response = await fetch(`/api/tune/track_range?${query.toString()}`, { signal });
-  return jsonOrThrow<TuneTrackRangeResult>(response);
 }
 
 /** Stream a Track-range pass as newline-delimited JSON so the timeline fills and a

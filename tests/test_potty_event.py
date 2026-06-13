@@ -116,6 +116,25 @@ def test_two_dogs_sets_multi_dog_and_ambiguous_flags() -> None:
     assert {track.track_id for track in emitted[0].tracks} == {"1", "2"}
 
 
+def test_candidate_stats_stay_with_primary_track() -> None:
+    detector = PottyEventDetector(
+        camera_config(dwell_trigger_s=2.0, event_duration_s=4.0),
+    )
+
+    emitted = run_sequence(
+        detector,
+        [[standing(20)] for _ in range(3)]
+        + [[standing(95)] for _ in range(4)],
+    )
+
+    assert len(emitted) == 1
+    candidate = emitted[0]
+    assert candidate.primary_track_id == "1"
+    assert candidate.posture_summary["posture_window_start_mono"] == 1.0
+    assert candidate.posture_summary["posture_window_end_mono"] == 2.0
+    assert candidate.posture_summary["dwell_duration_s"] == 2.0
+
+
 def test_roi_and_ignore_zone_filtering() -> None:
     # Zones are normalized [0.0, 1.0] image coordinates; the test frame is 160x120,
     # so a detection's pixel center is normalized before the polygon test. ROI keeps

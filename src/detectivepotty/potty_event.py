@@ -319,13 +319,13 @@ class PottyEventDetector:
             key=lambda item: (dwell_by_id[item.track_id], item.stationary_duration_s),
         )
         best_dwell = dwell_by_id.get(best.track_id, 0.0)
-        self._best_stats = best
-        self._best_dwell_s = best_dwell
         if self._state != _DetectorState.CANDIDATE:
             self._state = _DetectorState.CANDIDATE
             self._primary_track_id = best.track_id
             self._candidate_start_mono = best.window_start_mono
             self._event_due_mono = frame.mono_ts + self.camera_config.event_duration_s
+            self._best_stats = best
+            self._best_dwell_s = best_dwell
         elif self._primary_track_id == best.track_id:
             self._best_stats = best
             self._best_dwell_s = best_dwell

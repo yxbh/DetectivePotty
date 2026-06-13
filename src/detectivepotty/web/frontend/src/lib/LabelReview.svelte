@@ -15,6 +15,8 @@
     LabelVocabulary,
   } from "./types";
   import { boxAtFrame } from "./labelBox";
+  import { errMsg } from "./errors";
+  import { isTypingTarget } from "./keys";
   import { formatClock } from "./format";
   import { BOX_DOG, BOX_SIBLING, boxLabelFontPx, formatDetLabel, formatTrackLabel, isAliasClass } from "./overlayStyle";
   import Transport from "./Transport.svelte";
@@ -62,6 +64,7 @@
   // Per-detection crop thumbnails for the active (own) track.
   let crops = $state<{ frame: number; url: string | null }[]>([]);
   let filmstripToken = 0;
+  let detailToken = 0;
 
   const fps = $derived(detail && detail.fps > 0 ? detail.fps : 30);
   const totalFrames = $derived(detail ? Math.max(1, detail.frame_count) : 1);
@@ -159,7 +162,7 @@
       if (vocabulary.behaviors.length) pendingBehavior = vocabulary.behaviors[0];
       if (!selectedId && clips.length) void selectClip(clips[0].span_id);
     } catch (err) {
-      listError = err instanceof Error ? err.message : String(err);
+      listError = errMsg(err);
     } finally {
       listLoading = false;
     }
@@ -170,6 +173,7 @@
       const ok = confirm("Discard unsaved label changes for this clip?");
       if (!ok) return;
     }
+    const token = ++detailToken;
     selectedId = spanId;
     detailLoading = true;
     detailError = null;
@@ -177,6 +181,7 @@
     crops = [];
     try {
       const data = await fetchLabelClipDetail(spanId);
+      if (token !== detailToken || spanId !== selectedId) return;
       detail = data;
       ranges = data.labels.ranges.map((r) => ({ ...r }));
       dirty = false;
@@ -185,9 +190,12 @@
       markIn = null;
       markOut = null;
     } catch (err) {
-      detailError = err instanceof Error ? err.message : String(err);
+      if (token !== detailToken) return;
+      detailError = errMsg(err);
     } finally {
-      detailLoading = false;
+      if (token === detailToken) {
+        detailLoading = false;
+      }
     }
   }
 
@@ -460,7 +468,7 @@
       saveStatus = "saved";
       clips = clips.map((c) => (c.span_id === updated.span_id ? updated : c));
     } catch (err) {
-      saveStatus = err instanceof Error ? err.message : String(err);
+      saveStatus = errMsg(err);
     } finally {
       saving = false;
     }
@@ -484,9 +492,11 @@
   // --- keyboard -----------------------------------------------------------
 
   function onKey(event: KeyboardEvent): void {
-    const target = event.target as HTMLElement | null;
-    if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) {
-      if (event.key === "Escape") target.blur();
+    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
+      return;
+    }
+    if (isTypingTarget(event.target, { allowRange: true })) {
+      if (event.key === "Escape") (event.target as HTMLElement).blur();
       return;
     }
     // Dog hotkeys: Shift+1..9 map to the vocabulary's dogs (use physical key).

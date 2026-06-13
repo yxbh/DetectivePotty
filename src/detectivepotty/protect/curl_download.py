@@ -247,16 +247,26 @@ class CurlProtectDownloader:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         url = build_export_url(self.base_url, camera_id, start, end, channel_index)
-        result = self._authed_get(url, dest)
-        if result.http_code == 401:
-            self.login()
-            result = self._authed_get(url, dest)
-        if result.http_code != 200:
-            dest.unlink(missing_ok=True)
-            return None
-        if not dest.exists() or dest.stat().st_size == 0:
-            dest.unlink(missing_ok=True)
-            return None
+        part = dest.with_name(f"{dest.name}.part")
+        part.unlink(missing_ok=True)
+        try:
+            result = self._authed_get(url, part)
+            if result.http_code == 401:
+                part.unlink(missing_ok=True)
+                self.login()
+                result = self._authed_get(url, part)
+            if result.http_code != 200:
+                part.unlink(missing_ok=True)
+                dest.unlink(missing_ok=True)
+                return None
+            if not part.exists() or part.stat().st_size == 0:
+                part.unlink(missing_ok=True)
+                dest.unlink(missing_ok=True)
+                return None
+            part.replace(dest)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
         return dest
 
     def as_download_fn(self) -> Callable[[str, datetime, datetime, Path], Path | None]:
@@ -302,10 +312,11 @@ class CurlProtectDownloader:
         completed = self._runner(args, input_bytes)
         stdout = completed.stdout or b""
         http_code = _trailing_http_code(stdout)
-        if completed.returncode != 0 and http_code == 0:
+        if completed.returncode != 0:
             stderr = _decode(getattr(completed, "stderr", b""))
+            suffix = f" (HTTP {http_code})" if http_code else ""
             raise CurlProtectError(
-                f"curl failed (exit {completed.returncode}): {stderr.strip()}"
+                f"curl failed (exit {completed.returncode}){suffix}: {stderr.strip()}"
             )
         return _CurlResult(
             returncode=completed.returncode,

@@ -4,10 +4,6 @@ export function notificationsSupported(): boolean {
   return typeof Notification !== "undefined";
 }
 
-export function notificationPermission(): NotificationPermission {
-  return notificationsSupported() ? Notification.permission : "denied";
-}
-
 /**
  * Request browser-notification permission. Must be called from a user gesture
  * (a toggle click), per browser policy. Returns the resulting permission.

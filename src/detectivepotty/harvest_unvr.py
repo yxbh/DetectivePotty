@@ -197,10 +197,20 @@ def harvest_camera_window(
                 _unlink(Path(path))
 
         base = chunk_start.timestamp()
+        overlap_window = (base, base + max(0.0, overlap_s))
+        dedup_intervals = [
+            interval
+            for interval in kept_intervals
+            if _intervals_overlap(interval, overlap_window)
+        ]
         for result in results:
             span = result.span
             interval = (base + span.start_s, base + span.end_s)
-            if _is_duplicate(interval, kept_intervals, dedup_time_iou):
+            if _intervals_overlap(interval, overlap_window) and _is_duplicate(
+                interval,
+                dedup_intervals,
+                dedup_time_iou,
+            ):
                 logger.debug(
                     "harvest-unvr: dropping cross-chunk duplicate span %s", result.span_id
                 )
@@ -220,6 +230,10 @@ def _is_duplicate(
     min_iou: float,
 ) -> bool:
     return any(_time_iou(interval, other) >= min_iou for other in kept)
+
+
+def _intervals_overlap(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return min(a[1], b[1]) > max(a[0], b[0])
 
 
 def _time_iou(a: tuple[float, float], b: tuple[float, float]) -> float:

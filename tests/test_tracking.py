@@ -117,6 +117,19 @@ def test_track_birth_and_death_after_max_age() -> None:
     assert [track.track_id for track in tracker.histories] == ["1", "2"]
 
 
+def test_sparse_source_frame_gaps_age_by_tracker_update() -> None:
+    tracker = Tracker(max_age_frames=1)
+
+    tracker.update([make_detection(0, BBox(0, 0, 10, 10))])
+    one_miss = tracker.update([make_detection(6, BBox(50, 50, 60, 60))])
+
+    assert {track.track_id for track in one_miss} == {"1", "2"}
+
+    two_misses = tracker.update([make_detection(12, BBox(50, 50, 60, 60))])
+
+    assert {track.track_id for track in two_misses} == {"2"}
+
+
 def test_overlapping_dogs_have_no_reidentification_guarantee() -> None:
     tracker = Tracker(iou_threshold=0.1, max_age_frames=2)
     first = tracker.update(
@@ -188,4 +201,3 @@ def test_center_dist_gate_respects_threshold() -> None:
 def test_center_dist_gate_rejects_negative() -> None:
     with pytest.raises(ValueError):
         Tracker(center_dist_gate=-0.1)
-

@@ -17,6 +17,7 @@ import numpy as np
 
 from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox
+from detectivepotty.harvest import DogSpan, HarvestResult
 from detectivepotty.harvest_unvr import (
     harvest_camera_window,
     plan_chunks,
@@ -153,6 +154,28 @@ def _kwargs(n_frames: int):
     )
 
 
+def _harvest_result(root: Path, span_id: str, start_s: float, end_s: float) -> HarvestResult:
+    clip_dir = root / span_id
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    clip_path = clip_dir / "clip.mp4"
+    metadata_path = clip_dir / "metadata.json"
+    clip_path.write_bytes(b"fake")
+    metadata_path.write_text("{}", encoding="utf-8")
+    return HarvestResult(
+        span=DogSpan(
+            track_id=span_id,
+            start_frame=int(start_s * 10),
+            end_frame=int(end_s * 10),
+            start_s=start_s,
+            end_s=end_s,
+        ),
+        span_id=span_id,
+        clip_dir=clip_dir,
+        clip_path=clip_path,
+        metadata_path=metadata_path,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # harvest_camera_window orchestration
 # --------------------------------------------------------------------------- #
@@ -225,6 +248,82 @@ def test_harvest_camera_window_dedups_identical_absolute_interval(tmp_path: Path
     assert len(first) == 1
     assert len(second) == 1
     assert first[0].span_id == second[0].span_id  # deterministic / idempotent
+
+
+def test_harvest_camera_window_keeps_same_chunk_overlapping_spans(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import detectivepotty.harvest_unvr as harvest_unvr
+
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    out = tmp_path / "harvest"
+
+    def fake_harvest(*_args, **_kwargs):
+        return [
+            _harvest_result(out, "track-a", 10.0, 20.0),
+            _harvest_result(out, "track-b", 10.0, 20.0),
+        ]
+
+    monkeypatch.setattr(harvest_unvr, "harvest_clips", fake_harvest)
+
+    results = harvest_camera_window(
+        "cam",
+        start,
+        start + timedelta(hours=1),
+        out,
+        download_fn=_make_download_fn(1, []),
+        chunk_s=3600.0,
+        overlap_s=5.0,
+        **_kwargs(1),
+    )
+
+    assert [result.span_id for result in results] == ["track-a", "track-b"]
+    assert all(result.clip_dir.exists() for result in results)
+
+
+def test_harvest_camera_window_dedups_only_overlap_region(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import detectivepotty.harvest_unvr as harvest_unvr
+
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    out = tmp_path / "harvest"
+
+    def fake_harvest(*_args, **kwargs):
+        source_start = kwargs["source_start_utc"]
+        if source_start == start:
+            return [
+                _harvest_result(out, "prev-overlap", 3600.0, 3604.0),
+                _harvest_result(out, "prev-earlier", 30.0, 34.0),
+            ]
+        return [
+            _harvest_result(out, "current-overlap", 0.0, 4.0),
+            _harvest_result(out, "current-later", 30.0, 34.0),
+        ]
+
+    monkeypatch.setattr(harvest_unvr, "harvest_clips", fake_harvest)
+
+    results = harvest_camera_window(
+        "cam",
+        start,
+        start + timedelta(hours=2),
+        out,
+        download_fn=_make_download_fn(1, []),
+        chunk_s=3600.0,
+        overlap_s=5.0,
+        dedup_time_iou=0.5,
+        **_kwargs(1),
+    )
+
+    assert [result.span_id for result in results] == [
+        "prev-overlap",
+        "prev-earlier",
+        "current-later",
+    ]
+    assert not (out / "current-overlap").exists()
+    assert (out / "current-later").exists()
 
 
 def test_harvest_camera_window_tolerates_failed_and_empty_chunks(tmp_path: Path) -> None:

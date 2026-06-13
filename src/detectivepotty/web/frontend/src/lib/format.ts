@@ -1,5 +1,3 @@
-import type { EventSummary } from "./types";
-
 function parseDate(value: string | null | undefined): Date | null {
   if (!value) {
     return null;
@@ -101,19 +99,4 @@ export function labelText(label: string | null | undefined): string {
     return "Unknown";
   }
   return LABEL_TEXT[label] ?? label;
-}
-
-export function flagsText(multiDog: boolean, ambiguous: boolean): string {
-  const flags: string[] = [];
-  if (multiDog) {
-    flags.push("multi-dog");
-  }
-  if (ambiguous) {
-    flags.push("ambiguous");
-  }
-  return flags.length ? flags.join(", ") : "none";
-}
-
-export function summaryFlags(event: EventSummary): string {
-  return flagsText(event.multi_dog, event.ambiguous);
 }

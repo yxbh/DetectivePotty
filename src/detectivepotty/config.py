@@ -10,8 +10,7 @@ import re
 from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
 
 Device = Literal["auto", "cuda", "mps", "cpu"]
@@ -35,14 +34,6 @@ DEFAULT_DOG_ALIAS_CLASSES: tuple[str, ...] = (
     "giraffe",
     "elephant",
 )
-
-
-class RuntimeSecrets(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DETECTIVEPOTTY_", extra="ignore")
-
-    nvr_api_key: SecretStr | None = None
-    nvr_username: SecretStr | None = None
-    nvr_password: SecretStr | None = None
 
 
 class GlobalSettings(BaseModel):
@@ -279,11 +270,6 @@ class Config(BaseModel):
     protect: ProtectConfig = Field(default_factory=ProtectConfig)
     pose: PoseConfig = Field(default_factory=PoseConfig)
     cameras: list[CameraConfig] = Field(default_factory=list)
-    runtime_secrets: RuntimeSecrets = Field(
-        default_factory=RuntimeSecrets,
-        exclude=True,
-        repr=False,
-    )
 
     def config_hash(self) -> str:
         return config_hash(self)
@@ -305,7 +291,6 @@ def config_hash(config: Config) -> str:
     payload: dict[str, Any] = config.model_dump(
         mode="json",
         by_alias=True,
-        exclude={"runtime_secrets"},
     )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

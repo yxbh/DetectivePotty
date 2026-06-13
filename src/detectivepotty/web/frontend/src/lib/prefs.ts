@@ -41,6 +41,8 @@ export const liveNotifications = boolStore("liveNotifications", false);
 export const liveSound = boolStore("liveSound", false);
 
 const TUNE_LAST_DIR_KEY = "tuneLastDir";
+const REVIEW_FILTERS_KEY = "reviewFilters.v1";
+const REVIEW_STATUS_VALUES = new Set(["", "unlabeled", "labeled", "rejected", "uncertain"]);
 
 /**
  * Last directory the Tune file browser was viewing, so reopening the tab resumes
@@ -64,6 +66,42 @@ export function saveTuneLastDir(path: string): void {
     } else {
       localStorage.removeItem(TUNE_LAST_DIR_KEY);
     }
+  } catch {
+    /* ignore storage failures (private mode, etc.) */
+  }
+}
+
+export interface ReviewFiltersPref {
+  status: string;
+  camera: string;
+}
+
+export function loadReviewFilters(): ReviewFiltersPref {
+  try {
+    const raw = localStorage.getItem(REVIEW_FILTERS_KEY);
+    if (!raw) {
+      return { status: "", camera: "" };
+    }
+    const parsed = JSON.parse(raw) as { status?: unknown; camera?: unknown };
+    const status = typeof parsed.status === "string" && REVIEW_STATUS_VALUES.has(parsed.status)
+      ? parsed.status
+      : "";
+    const camera = typeof parsed.camera === "string" ? parsed.camera : "";
+    return { status, camera };
+  } catch {
+    return { status: "", camera: "" };
+  }
+}
+
+export function saveReviewFilters(filters: ReviewFiltersPref): void {
+  try {
+    const status = REVIEW_STATUS_VALUES.has(filters.status) ? filters.status : "";
+    const camera = filters.camera.trim();
+    if (!status && !camera) {
+      localStorage.removeItem(REVIEW_FILTERS_KEY);
+      return;
+    }
+    localStorage.setItem(REVIEW_FILTERS_KEY, JSON.stringify({ status, camera }));
   } catch {
     /* ignore storage failures (private mode, etc.) */
   }

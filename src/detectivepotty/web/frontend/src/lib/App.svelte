@@ -3,7 +3,13 @@
   import { onMount } from "svelte";
   import { get } from "svelte/store";
   import { fetchDogs, fetchEventDetail, fetchEvents, saveLabel } from "./api";
-  import { autoAdvance, liveNotifications, liveSound } from "./prefs";
+  import {
+    autoAdvance,
+    liveNotifications,
+    liveSound,
+    loadReviewFilters,
+    saveReviewFilters,
+  } from "./prefs";
   import {
     acknowledgeEvents,
     liveConnected,
@@ -38,8 +44,9 @@
   let unfilteredTotal = $state<number | null>(null);
   let selectedId = $state<string | null>(null);
 
-  let statusFilter = $state("");
-  let cameraFilter = $state("");
+  const initialFilters = loadReviewFilters();
+  let statusFilter = $state(initialFilters.status);
+  let cameraFilter = $state(initialFilters.camera);
   let cameraInput = $state<HTMLInputElement | null>(null);
 
   let listLoading = $state(true);
@@ -375,17 +382,21 @@
 
   function applyFilter(value: string): void {
     statusFilter = value;
+    saveReviewFilters({ status: statusFilter, camera: cameraFilter });
     void loadEvents();
   }
 
   function onCameraKeydown(event: KeyboardEvent): void {
     if (event.key === "Enter") {
+      cameraFilter = cameraFilter.trim();
+      saveReviewFilters({ status: statusFilter, camera: cameraFilter });
       void loadEvents();
     }
   }
 
   function clearCamera(): void {
     cameraFilter = "";
+    saveReviewFilters({ status: statusFilter, camera: cameraFilter });
     void loadEvents();
   }
 

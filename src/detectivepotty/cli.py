@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 import time
 from typing import Annotated, Optional
@@ -13,13 +14,38 @@ import cv2
 import numpy as np
 import typer
 
-from detectivepotty.config import Config, DEFAULT_DOG_ALIAS_CLASSES, load_config
+from detectivepotty.config import (
+    CONFIG_ENV_VAR,
+    DEFAULT_CONFIG_PATH,
+    Config,
+    DEFAULT_DOG_ALIAS_CLASSES,
+    load_config,
+    resolve_config_path,
+)
 from detectivepotty.detect.yolo import DogDetector
 from detectivepotty.geometry import crop_from_frame
 
 app = typer.Typer(help="DetectivePotty offline and live utilities.")
 
 _PROTECT_DOWNLOAD_TIMEOUT_S = 30 * 60.0
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+_CLI_LOG_LEVEL_OVERRIDE: str | None = None
+_CONFIG_HELP = (
+    "Path to DetectivePotty YAML config. Defaults to "
+    f"${CONFIG_ENV_VAR}, then {DEFAULT_CONFIG_PATH}."
+)
+
+ConfigPathOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--config",
+        "-c",
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help=_CONFIG_HELP,
+    ),
+]
 
 
 def _resolve_dog_aliases(
@@ -67,24 +93,46 @@ def _protect_download_result(future):
         ) from exc
 
 
+def _configure_cli_logging(level_name: str) -> None:
+    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=level, format=_LOG_FORMAT)
+    else:
+        root.setLevel(level)
+    logging.getLogger("detectivepotty").setLevel(level)
+
+
+def _load_cli_config(config_path: Path | None) -> Config:
+    resolved = resolve_config_path(config_path)
+    try:
+        config = load_config(resolved)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(f"Config file not found: {resolved}") from exc
+    _configure_cli_logging(_CLI_LOG_LEVEL_OVERRIDE or config.global_settings.log_level)
+    return config
+
+
 @app.callback()
-def main() -> None:
+def main(
+    log_level: Annotated[
+        str | None,
+        typer.Option(
+            "--log-level",
+            help="CLI log level override. Defaults to config global.log_level when a config is loaded.",
+        ),
+    ] = None,
+) -> None:
     """DetectivePotty offline and live utilities."""
+
+    global _CLI_LOG_LEVEL_OVERRIDE
+    _CLI_LOG_LEVEL_OVERRIDE = log_level
+    _configure_cli_logging(log_level or "INFO")
 
 
 @app.command("run")
 def run_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config.",
-        ),
-    ],
+    config_path: ConfigPathOption = None,
     camera_ids: Annotated[
         list[str] | None,
         typer.Option("--camera", "-C", help="Camera id to run; repeat for multiple."),
@@ -110,7 +158,7 @@ def run_command(
 
     from detectivepotty.pipeline import run_pipeline
 
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     event_dirs = run_pipeline(config, camera_ids=camera_ids, max_workers=max_workers)
     if not event_dirs:
         typer.echo("No events recorded.")
@@ -123,17 +171,7 @@ def run_command(
 
 @app.command("dedupe-events")
 def dedupe_events_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config.",
-        ),
-    ],
+    config_path: ConfigPathOption = None,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Report the plan without deleting anything."),
@@ -148,7 +186,7 @@ def dedupe_events_command(
 
     from detectivepotty.recording.reconcile import dedupe_dataset
 
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     actions = dedupe_dataset(
         config.global_settings.dataset_dir,
         tolerance_s=config.global_settings.rerun_match_tolerance_s,
@@ -180,17 +218,7 @@ def dedupe_events_command(
 
 @app.command("cleanup-legacy")
 def cleanup_legacy_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config.",
-        ),
-    ],
+    config_path: ConfigPathOption = None,
     apply: Annotated[
         bool,
         typer.Option(
@@ -210,7 +238,7 @@ def cleanup_legacy_command(
 
     from detectivepotty.recording.cleanup import cleanup_legacy_events
 
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     report = cleanup_legacy_events(
         config.global_settings.dataset_dir,
         dry_run=not apply,
@@ -240,17 +268,7 @@ def cleanup_legacy_command(
 
 @app.command("serve")
 def serve_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config.",
-        ),
-    ],
+    config_path: ConfigPathOption = None,
     host: Annotated[str, typer.Option("--host", help="Bind host.")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", min=1, max=65535, help="Bind port.")] = 8000,
     reload: Annotated[
@@ -263,7 +281,7 @@ def serve_command(
 ) -> None:
     """Launch the local review web app."""
 
-    config = load_config(config_path)
+    config = _load_cli_config(config_path)
     try:
         from detectivepotty.web import run_server
     except Exception as exc:
@@ -274,24 +292,14 @@ def serve_command(
 
 @app.command("list-cameras")
 def list_cameras_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config.",
-        ),
-    ],
+    config_path: ConfigPathOption = None,
 ) -> None:
     """Best-effort UniFi Protect camera discovery."""
 
-    config = load_config(config_path)
-    if not _protect_configured(config):
+    config = _load_cli_config(config_path)
+    if not config.protect_configured():
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
-        return
+        raise typer.Exit(1)
 
     async def _list() -> list:
         from detectivepotty.protect.client import ProtectClient
@@ -496,17 +504,7 @@ def tune_detect(
             help="Local video file to tune against. Mutually exclusive with --config/--camera.",
         ),
     ] = None,
-    config_path: Annotated[
-        Path | None,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Config supplying a camera to stream (use with --camera).",
-        ),
-    ] = None,
+    config_path: ConfigPathOption = None,
     camera_id: Annotated[
         str | None,
         typer.Option("--camera", "-C", help="Camera id within --config (file, rtsp, or protect)."),
@@ -576,12 +574,14 @@ def tune_detect(
         model_name = model or "models/yolo11m.pt"
         initial_conf = conf if conf is not None else 0.25
     else:
-        if config_path is None or camera_id is None:
-            raise typer.BadParameter("Provide --input, or both --config and --camera.")
-        config = load_config(config_path)
+        if camera_id is None:
+            raise typer.BadParameter("Provide --input, or --camera.")
+        config = _load_cli_config(config_path)
         camera = next((cam for cam in config.cameras if cam.id == camera_id), None)
         if camera is None:
-            raise typer.BadParameter(f"Camera '{camera_id}' not found in {config_path}.")
+            raise typer.BadParameter(
+                f"Camera '{camera_id}' not found in {resolve_config_path(config_path)}."
+            )
         model_name = model or config.global_settings.model_name
         initial_conf = conf if conf is not None else camera.detection_conf_threshold
         provider = _build_camera_provider(config, camera, FileFrameProvider, LiveFrameProvider)
@@ -803,21 +803,11 @@ def harvest_command(
 
 @app.command("harvest-camera")
 def harvest_camera_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config (for Protect host/creds).",
-        ),
-    ],
     camera: Annotated[
         str,
         typer.Option("--camera", help="Protect camera id or name (see list-cameras)."),
     ],
+    config_path: ConfigPathOption = None,
     date: Annotated[
         str | None,
         typer.Option(
@@ -920,8 +910,8 @@ def harvest_camera_command(
     ``export-dataset``. Failed/empty chunks are skipped; re-runs are idempotent.
     """
 
-    config = load_config(config_path)
-    if not _protect_configured(config):
+    config = _load_cli_config(config_path)
+    if not config.protect_configured():
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
         raise typer.Exit(1)
 
@@ -1390,21 +1380,11 @@ def experiment_bakeoff_command(
 
 @app.command("experiment-acquire")
 def experiment_acquire_command(
-    config_path: Annotated[
-        Path,
-        typer.Option(
-            "--config",
-            "-c",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Path to DetectivePotty YAML config (for Protect host/creds).",
-        ),
-    ],
     camera: Annotated[
         str,
         typer.Option("--camera", help="Protect camera id or name (see list-cameras)."),
     ],
+    config_path: ConfigPathOption = None,
     date: Annotated[
         Optional[str],
         typer.Option("--date", help="Day to acquire as YYYY-MM-DD (24h at --utc-offset)."),
@@ -1447,8 +1427,8 @@ def experiment_acquire_command(
     can skip. Acquisition is bandwidth/disk-heavy — start with a 2–4h window.
     """
 
-    config = load_config(config_path)
-    if not _protect_configured(config):
+    config = _load_cli_config(config_path)
+    if not config.protect_configured():
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
         raise typer.Exit(1)
 
@@ -1605,13 +1585,6 @@ def _resolve_protect_url(config: Config, camera) -> str:
             f"No RTSPS URL for protect camera '{camera.id}' substream {camera.substream_choice}."
         )
     return url
-
-
-def _protect_configured(config: Config) -> bool:
-    has_host = bool(config.protect.nvr_host)
-    has_api_key = bool(config.resolve_secret("api_key"))
-    has_userpass = bool(config.resolve_secret("username") and config.resolve_secret("password"))
-    return has_host and (has_api_key or has_userpass)
 
 
 

@@ -18,6 +18,8 @@ SubstreamChoice = Literal["low", "medium", "high"]
 SourceKind = Literal["protect", "file", "rtsp"]
 PoseBackend = Literal["superanimal", "mock"]
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CONFIG_ENV_VAR = "DETECTIVEPOTTY_CONFIG"
+DEFAULT_CONFIG_PATH = Path("config.yaml")
 
 # Curated set of YOLO/COCO classes a dog is plausibly *confused with* but that have
 # ~0% chance of really being present in a suburban backyard. Accepting these recovers
@@ -280,9 +282,24 @@ class Config(BaseModel):
             return None
         return os.environ.get(env_name)
 
+    def protect_configured(self) -> bool:
+        has_host = bool(self.protect.nvr_host)
+        has_api_key = bool(self.resolve_secret("api_key"))
+        has_userpass = bool(
+            self.resolve_secret("username") and self.resolve_secret("password")
+        )
+        return has_host and (has_api_key or has_userpass)
 
-def load_config(path: str | Path) -> Config:
-    with Path(path).open("r", encoding="utf-8") as fh:
+
+def resolve_config_path(path: str | Path | None = None) -> Path:
+    if path is not None:
+        return Path(path)
+    env_path = os.environ.get(CONFIG_ENV_VAR)
+    return Path(env_path) if env_path else DEFAULT_CONFIG_PATH
+
+
+def load_config(path: str | Path | None = None) -> Config:
+    with resolve_config_path(path).open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
     return Config.model_validate(raw)
 

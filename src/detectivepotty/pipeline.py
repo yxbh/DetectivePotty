@@ -177,7 +177,6 @@ class PottyPipeline:
         self._pose_estimator: PoseEstimator | None = build_pose_estimator(config.pose)
         # Cooperative stop flag so live camera loops can be interrupted (Ctrl-C).
         self._stop_event = threading.Event()
-        self._configure_logging(config.global_settings.log_level)
 
     def run(self, camera_ids: Sequence[str] | None = None) -> list[Path]:
         """Run selected cameras and return recorded event directories.
@@ -429,7 +428,7 @@ class PottyPipeline:
         return event_dirs
 
     def process_protect_camera(self, camera_config: CameraConfig) -> list[Path]:
-        if not _protect_configured(self.config):
+        if not self.config.protect_configured():
             LOGGER.warning(
                 "Protect is not configured; skipping camera %s",
                 sanitize_source_id(camera_config.id),
@@ -838,16 +837,6 @@ class PottyPipeline:
     def _default_recorder_factory(config: Config, protect_client: Any | None) -> EventRecorder:
         return EventRecorder(config, protect_client=protect_client)
 
-    @staticmethod
-    def _configure_logging(level_name: str) -> None:
-        level = getattr(logging, str(level_name).upper(), logging.INFO)
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        )
-        LOGGER.setLevel(level)
-
-
 def run_pipeline(
     config: Config,
     camera_ids: Sequence[str] | None = None,
@@ -974,10 +963,3 @@ def _dedupe_frames(frames: Sequence[Frame]) -> list[Frame]:
         seen.add(key)
         unique.append(frame)
     return unique
-
-
-def _protect_configured(config: Config) -> bool:
-    has_host = bool(config.protect.nvr_host)
-    has_api_key = bool(config.resolve_secret("api_key"))
-    has_userpass = bool(config.resolve_secret("username") and config.resolve_secret("password"))
-    return has_host and (has_api_key or has_userpass)

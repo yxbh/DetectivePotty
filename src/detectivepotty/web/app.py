@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-from detectivepotty.config import Config, load_config
+from detectivepotty.config import CONFIG_ENV_VAR, Config, load_config
 from detectivepotty.web.dataset_index import DatasetIndex
 from detectivepotty.web.event_routes import (
     _event_stream as _event_stream,
@@ -29,11 +29,6 @@ from detectivepotty.web.tune_tracking import (
 
 
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
-
-# Env var the reload factory reads to locate the config. uvicorn's --reload
-# re-imports the app in a worker subprocess that never re-runs the CLI, so the
-# config path has to travel via the environment rather than a call argument.
-CONFIG_ENV_VAR = "DETECTIVEPOTTY_CONFIG"
 
 _BUILD_MISSING_HTML = """<!doctype html>
 <html lang="en">
@@ -143,8 +138,7 @@ def create_app_from_env() -> FastAPI:
     process working directory.
     """
 
-    config_path = os.environ.get(CONFIG_ENV_VAR, "config.yaml")
-    return create_app(load_config(config_path))
+    return create_app(load_config())
 
 
 def run_server(

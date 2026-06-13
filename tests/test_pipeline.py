@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 import time
 
@@ -248,6 +249,27 @@ def test_default_classifier_factory_uses_pose_when_enabled() -> None:
     pipeline_disabled = PottyPipeline(disabled, detector_factory=fake_detector_factory)
     assert pipeline_disabled._pose_estimator is None
     assert isinstance(pipeline_disabled._new_classifier(camera), HeuristicPottyClassifier)
+
+
+def test_pipeline_constructor_does_not_configure_root_logging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from detectivepotty.pipeline import PottyPipeline
+
+    def fail_basic_config(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("pipeline constructor must not configure root logging")
+
+    monkeypatch.setattr(logging, "basicConfig", fail_basic_config)
+    config = Config(
+        global_settings=GlobalSettings(
+            model_name="fake.pt",
+            device="cpu",
+            log_level="DEBUG",
+        ),
+        cameras=[],
+    )
+
+    PottyPipeline(config, detector_factory=fake_detector_factory)
 
 
 

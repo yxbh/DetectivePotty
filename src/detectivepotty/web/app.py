@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Iterable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -13,25 +10,36 @@ from pathlib import Path
 import time
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-import yaml
 
 from detectivepotty.config import Config, load_config
-from detectivepotty.events import LabelStatus
-from detectivepotty.web.dataset_index import DatasetIndex, fixed_media_path, media_path
+from detectivepotty.web.dataset_index import DatasetIndex
+from detectivepotty.web.event_routes import (
+    _event_stream as _event_stream,
+    register_event_routes,
+)
 from detectivepotty.web.label_routes import register_label_routes
 from detectivepotty.web.middleware import ApiNoStoreMiddleware
 from detectivepotty.web.schemas import (
     ExportCoremlRequest,
-    LabelUpdate,
     TunePoseRangeRequest,
     TunePoseRequest,
 )
 from detectivepotty.web.state import init_app_state
+from detectivepotty.web.tune_tracking import (
+    TUNE_DETECTION_FLOOR,
+    TUNE_TRACKERS,
+    ULTRALYTICS_TRACKERS as _ULTRALYTICS_TRACKERS,
+    TuneUltralyticsTrackerParams,
+    ultralytics_boxes as _ultralytics_boxes,
+    ultralytics_dog_class_indices as _ultralytics_dog_class_indices,
+    ultralytics_tracker_yaml as _ultralytics_tracker_yaml,
+    ultralytics_tracking_available as _ultralytics_tracking_available,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -42,19 +50,6 @@ FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 # re-imports the app in a worker subprocess that never re-runs the CLI, so the
 # config path has to travel via the environment rather than a call argument.
 CONFIG_ENV_VAR = "DETECTIVEPOTTY_CONFIG"
-
-# How often the live-stream endpoint re-scans the dataset directory for new
-# events. The `serve` process observes the filesystem because the `run`
-# pipeline writes events from a separate process; 2s keeps perceived latency
-# low without hammering the disk.
-STREAM_POLL_SECONDS = 2.0
-
-# Event media (clips, frames, crops) is content-stable per event_id, so let the
-# browser cache it instead of re-downloading on every navigation. Starlette's
-# FileResponse has no conditional-304 support, so a real max-age is required.
-# Reruns can replace media under a reused event_id; the frontend appends the
-# event's media_version (?v=) so a fresh token bypasses this cache.
-MEDIA_CACHE_CONTROL = "private, max-age=3600"
 
 _BUILD_MISSING_HTML = """<!doctype html>
 <html lang="en">
@@ -74,13 +69,6 @@ npm run build</pre>
 </html>
 """
 
-
-# Detection floor for the in-browser tuner. The detector runs at this low
-# confidence so borderline boxes are still returned; the client-side slider
-# (whose minimum is this floor) decides green-kept vs red-dropped without any
-# re-inference. Anything under the floor was never produced and cannot be
-# recovered by lowering the slider — hence the slider can't go below it.
-TUNE_DETECTION_FLOOR = 0.05
 
 # Upper bound on total pose crops the batched pose pass (`POST /api/tune/pose_range`)
 # will run for one request, regardless of how many frames/boxes the client sends.
@@ -111,207 +99,7 @@ _VIDEO_MIME = {
     ".avi": "video/x-msvideo",
 }
 
-# Tune "Track range" tracker backends. ``off``/``ours`` use the harvest IoU
-# ``Tracker`` replay (every model incl. CoreML); the three native values map to
-# Ultralytics built-in trackers (``.pt``-only — Ultralytics tracking won't run on
-# a CoreML package). ``botsort_reid`` is BoT-SORT with appearance ReID enabled.
-TUNE_TRACKERS = ("off", "ours", "bytetrack", "botsort", "botsort_reid")
-_ULTRALYTICS_TRACKERS = ("bytetrack", "botsort", "botsort_reid")
 
-
-@dataclass(frozen=True, slots=True)
-class TuneUltralyticsTrackerParams:
-    """Per-run Ultralytics tracking knobs exposed by the Tune UI.
-
-    ``conf`` is passed to ``YOLO.track``. The other fields are optional overrides
-    for the bundled ByteTrack/BoT-SORT YAML; ``None`` means keep the YAML default.
-    """
-
-    conf: float = TUNE_DETECTION_FLOOR
-    track_high_thresh: float | None = None
-    track_low_thresh: float | None = None
-    new_track_thresh: float | None = None
-    track_buffer: int | None = None
-    match_thresh: float | None = None
-    proximity_thresh: float | None = None
-    appearance_thresh: float | None = None
-
-    def yaml_overrides(self, tracker: str) -> dict[str, float | int | bool]:
-        overrides: dict[str, float | int | bool] = {}
-        for key in (
-            "track_high_thresh",
-            "track_low_thresh",
-            "new_track_thresh",
-            "track_buffer",
-            "match_thresh",
-        ):
-            value = getattr(self, key)
-            if value is not None:
-                overrides[key] = value
-        if tracker in ("botsort", "botsort_reid"):
-            for key in ("proximity_thresh", "appearance_thresh"):
-                value = getattr(self, key)
-                if value is not None:
-                    overrides[key] = value
-        if tracker == "botsort_reid":
-            overrides["with_reid"] = True
-        return overrides
-
-    def payload(self, tracker: str) -> dict[str, float | int | bool | None]:
-        return {
-            "conf": self.conf,
-            "track_high_thresh": self.track_high_thresh,
-            "track_low_thresh": self.track_low_thresh,
-            "new_track_thresh": self.new_track_thresh,
-            "track_buffer": self.track_buffer,
-            "match_thresh": self.match_thresh,
-            "proximity_thresh": (
-                self.proximity_thresh if tracker in ("botsort", "botsort_reid") else None
-            ),
-            "appearance_thresh": (
-                self.appearance_thresh if tracker in ("botsort", "botsort_reid") else None
-            ),
-            "with_reid": tracker == "botsort_reid",
-        }
-
-
-def _ultralytics_tracking_available() -> bool:
-    """True when Ultralytics native tracking can run (its ``lap`` dep imports).
-
-    Ultralytics' association step needs ``lap`` (linear assignment); it is a core
-    dependency, but the endpoint feature-detects it so a stripped env degrades to a
-    clear 400 instead of an opaque import error mid-request.
-    """
-
-    import importlib.util
-
-    return importlib.util.find_spec("lap") is not None
-
-
-def _ultralytics_dog_class_indices(
-    model: object, alias_classes: Iterable[str] = ()
-) -> list[int]:
-    """Class indices accepted as dogs for ``model`` (``dog`` + any ``alias_classes``).
-
-    Alias classes (e.g. ``sheep``/``cow`` — dog-confusable but yard-implausible) are
-    folded in so the native Ultralytics tracker recovers the same boxes the detector
-    does. Falls back to COCO ``16`` (``dog``) when no class names match.
-    """
-
-    accepted = {"dog", *(str(c).lower() for c in alias_classes)}
-    names = getattr(model, "names", None) or {}
-    if isinstance(names, dict):
-        idxs = [int(i) for i, n in names.items() if str(n).lower() in accepted]
-    else:  # pragma: no cover - list-style names are rare
-        idxs = [i for i, n in enumerate(names) if str(n).lower() in accepted]
-    return idxs or [16]
-
-
-def _ultralytics_tracker_yaml(
-    trackers_dir: Path,
-    tracker: str,
-    params: TuneUltralyticsTrackerParams,
-) -> tuple[str, Path | None]:
-    """Return ``(tracker_yaml, temp_dir)`` for one Ultralytics tracking request."""
-
-    if tracker == "bytetrack":
-        base_yaml = trackers_dir / "bytetrack.yaml"
-    elif tracker in ("botsort", "botsort_reid"):
-        base_yaml = trackers_dir / "botsort.yaml"
-    else:  # pragma: no cover - guarded by endpoints
-        raise ValueError(f"unknown ultralytics tracker: {tracker}")
-
-    overrides = params.yaml_overrides(tracker)
-    if not overrides:
-        return str(base_yaml), None
-
-    with base_yaml.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"invalid tracker yaml: {base_yaml}")
-    data.update(overrides)
-
-    import tempfile
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="dp_tracker_"))
-    out = tmp_dir / f"{tracker}.yaml"
-    out.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    return str(out), tmp_dir
-
-
-def _ultralytics_boxes(result: object) -> list[dict]:
-    """Map one Ultralytics tracking ``Results`` to Tune track-box dicts.
-
-    Returns ``[{x1,y1,x2,y2,confidence,class_name,track_id}...]`` in original-image
-    coordinates (Ultralytics already maps boxes back from the letterboxed input).
-    Boxes the tracker hasn't assigned an ID yet (``boxes.id is None``) are skipped —
-    only persistent tracks contribute to the overlay + de-fragmentation stats.
-    """
-
-    boxes = getattr(result, "boxes", None)
-    if boxes is None or getattr(boxes, "id", None) is None:
-        return []
-    xyxy = boxes.xyxy.tolist()
-    confs = boxes.conf.tolist()
-    ids = boxes.id.tolist()
-    out: list[dict] = []
-    for (x1, y1, x2, y2), conf, tid in zip(xyxy, confs, ids):
-        out.append(
-            {
-                "x1": float(x1),
-                "y1": float(y1),
-                "x2": float(x2),
-                "y2": float(y2),
-                "confidence": float(conf),
-                "class_name": "dog",
-                "track_id": str(int(tid)),
-            }
-        )
-    return out
-
-
-async def _event_stream(dataset_index, is_disconnected, *, sleep=asyncio.sleep, poll_seconds=None):
-    """Async generator yielding SSE frames for newly-recorded events.
-
-    Pulled out of the route handler so the diff/seed/heartbeat logic is unit
-    testable without spinning up an HTTP server (``TestClient`` cannot cleanly
-    consume an infinite stream). ``is_disconnected`` is an async predicate
-    (``request.is_disconnected`` in production) and ``sleep`` is injectable so
-    tests can drive it without real delays.
-    """
-    if poll_seconds is None:
-        poll_seconds = STREAM_POLL_SECONDS
-    try:
-        records = await run_in_threadpool(dataset_index.scan)
-    except Exception:  # pragma: no cover - defensive
-        records = []
-    known: set[str] = {record.event_id for record in records}
-    yield f"event: ready\ndata: {json.dumps({'count': len(known)})}\n\n"
-
-    while True:
-        if await is_disconnected():
-            break
-        await sleep(poll_seconds)
-        fresh: list = []
-        try:
-            records = await run_in_threadpool(dataset_index.scan)
-            fresh = [r for r in records if r.event_id not in known]
-        except Exception:  # pragma: no cover - defensive
-            fresh = []
-        # Oldest-first so the client prepends newest last.
-        for record in reversed(fresh):
-            try:
-                summary = await run_in_threadpool(dataset_index.summary, record)
-            except Exception:  # pragma: no cover - defensive
-                # Leave it unknown so it is retried on the next scan rather than
-                # permanently dropped.
-                continue
-            known.add(record.event_id)
-            payload = json.dumps(summary)
-            yield f"id: {record.event_id}\nevent: new\ndata: {payload}\n\n"
-        # Always heartbeat (even after a failed scan) so proxies and the browser
-        # don't idle the connection shut.
-        yield ": ping\n\n"
 
 
 def _coreml_batch_map(models: list[str]) -> dict[str, int]:
@@ -364,124 +152,7 @@ def create_app(
             return FileResponse(built, headers={"Cache-Control": "no-store"})
         return HTMLResponse(_BUILD_MISSING_HTML)
 
-    @app.get("/api/dogs")
-    def list_dogs() -> dict:
-        return {"dogs": dogs}
-
-    @app.get("/api/events")
-    def list_events(
-        response: Response,
-        camera: str | None = None,
-        label_status: LabelStatus | None = None,
-        date: str | None = None,
-        limit: Annotated[int, Query(ge=1, le=500)] = 100,
-        offset: Annotated[int, Query(ge=0)] = 0,
-    ) -> list[dict]:
-        records = dataset_index.scan()
-        unfiltered_total = len(records)
-        summaries = dataset_index.list_summaries(
-            camera=camera,
-            label_status=label_status,
-            date=date,
-            records=records,
-        )
-        total = len(summaries)
-        page = summaries[offset : offset + limit]
-        response.headers["X-Total-Count"] = str(total)
-        response.headers["X-Unfiltered-Count"] = str(unfiltered_total)
-        response.headers["X-Limit"] = str(limit)
-        response.headers["X-Offset"] = str(offset)
-        logger.info(
-            "served events page=%d filtered=%d total=%d (camera=%s status=%s date=%s)",
-            len(page),
-            total,
-            unfiltered_total,
-            camera,
-            label_status.value if label_status else None,
-            date,
-        )
-        return page
-
-    @app.get("/api/stream")
-    async def stream_events(request: Request) -> StreamingResponse:
-        """Server-Sent Events feed of newly-recorded potty events.
-
-        The `run` pipeline writes events to disk from a separate process and
-        always renames ``metadata.json`` into place last (after clip/frames/
-        crops/overlays), so any event a scan observes is already complete. The
-        generator seeds the set of known event_ids on connect (no backfill
-        spam), then diffs each scan and pushes only genuinely-new event_ids.
-        Reconnect gaps are reconciled client-side via a one-shot ``/api/events``
-        poll on (re)connect, so re-seeding here cannot silently drop events.
-        """
-        headers = {
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        }
-        return StreamingResponse(
-            _event_stream(dataset_index, request.is_disconnected),
-            media_type="text/event-stream",
-            headers=headers,
-        )
-
-    @app.get("/api/events/{event_id}")
-    def get_event(event_id: str) -> dict:
-        record = _event_or_404(dataset_index, event_id)
-        return dataset_index.detail(record)
-
-    @app.get("/api/events/{event_id}/media/clip")
-    def get_clip(event_id: str) -> FileResponse:
-        record = _event_or_404(dataset_index, event_id)
-        path = fixed_media_path(record, "clip.mp4", missing_ok=True)
-        if path is None:
-            raise HTTPException(status_code=404, detail="clip not found")
-        return FileResponse(
-            path, media_type="video/mp4", headers={"Cache-Control": MEDIA_CACHE_CONTROL}
-        )
-
-    @app.get("/api/events/{event_id}/media/protect")
-    def get_protect_recording(event_id: str) -> FileResponse:
-        record = _event_or_404(dataset_index, event_id)
-        path = fixed_media_path(record, "protect_recording.mp4", missing_ok=True)
-        if path is None:
-            raise HTTPException(status_code=404, detail="protect recording not found")
-        return FileResponse(
-            path, media_type="video/mp4", headers={"Cache-Control": MEDIA_CACHE_CONTROL}
-        )
-
-    @app.get("/api/events/{event_id}/frames/{name:path}")
-    def get_frame(event_id: str, name: str) -> FileResponse:
-        return _serve_image(dataset_index, event_id, "frames", name)
-
-    @app.get("/api/events/{event_id}/crops/{name:path}")
-    def get_crop(event_id: str, name: str) -> FileResponse:
-        return _serve_image(dataset_index, event_id, "crops", name)
-
-    @app.get("/api/events/{event_id}/crops_overlay/{name:path}")
-    def get_crop_overlay(event_id: str, name: str) -> FileResponse:
-        return _serve_image(dataset_index, event_id, "crops_overlay", name)
-
-    @app.post("/api/events/{event_id}/label")
-    def label_event(event_id: str, update: LabelUpdate) -> dict:
-        record = _event_or_404(dataset_index, event_id)
-        dog_kwargs: dict = {}
-        if "dog" in update.model_fields_set:
-            dog = update.dog.strip() if update.dog is not None else None
-            dog = dog or None
-            if dog is not None and dogs and dog not in dogs:
-                raise HTTPException(status_code=422, detail="unknown dog")
-            dog_kwargs["dog"] = dog
-        try:
-            return dataset_index.update_label(
-                record,
-                label=update.label,
-                label_status=update.label_status,
-                note=update.note,
-                **dog_kwargs,
-            )
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=500, detail="label update failed") from exc
+    register_event_routes(app, dataset_index=dataset_index, dogs=dogs)
 
     def _get_tune_detector(model_name: str | None = None):
         """Lazily build (and cache) a tuner YOLO detector for ``model_name``.
@@ -1661,26 +1332,3 @@ def run_server(
         )
         return
     uvicorn.run(create_app(config), host=host, port=port)
-
-
-def _event_or_404(dataset_index: DatasetIndex, event_id: str):
-    record = dataset_index.get_event(event_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="event not found")
-    return record
-
-
-def _serve_image(
-    dataset_index: DatasetIndex,
-    event_id: str,
-    kind: str,
-    name: str,
-) -> FileResponse:
-    record = _event_or_404(dataset_index, event_id)
-    try:
-        path = media_path(record, kind, name)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="invalid media filename") from exc
-    if path is None:
-        raise HTTPException(status_code=404, detail="media not found")
-    return FileResponse(path, headers={"Cache-Control": MEDIA_CACHE_CONTROL})

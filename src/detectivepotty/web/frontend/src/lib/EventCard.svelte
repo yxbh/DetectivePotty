@@ -23,6 +23,7 @@
   let thumbnailUrl = $derived(versioned(event.thumbnail_url, event.media_version));
   let hint = $derived(basisHint(event.time_basis));
   let status = $derived(event.label_status || "unlabeled");
+  let animationIndex = $derived(Math.min(index, 12));
   let hasLabel = $derived(
     event.label && event.label !== "unknown" && status !== "unlabeled",
   );
@@ -40,7 +41,7 @@
   class="event-card"
   class:active
   type="button"
-  style="--i: {index}"
+  style="--i: {animationIndex}"
   onclick={() => onselect(event.event_id)}
 >
   <span class="thumb-wrap">

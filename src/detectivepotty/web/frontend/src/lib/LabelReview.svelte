@@ -18,10 +18,11 @@
   import { errMsg } from "./errors";
   import { isTypingTarget } from "./keys";
   import { formatClock } from "./format";
-  import { BOX_DOG, BOX_SIBLING, boxLabelFontPx, formatDetLabel, formatTrackLabel, isAliasClass } from "./overlayStyle";
+  import { BOX_DOG, BOX_SIBLING, boxLabelFontPx } from "./overlayStyle";
   import { observeResize } from "./resize";
   import LabelClipList from "./LabelClipList.svelte";
   import LabelFilmstrip from "./LabelFilmstrip.svelte";
+  import LabelOverlay from "./LabelOverlay.svelte";
   import LabelRangeEditor from "./LabelRangeEditor.svelte";
   import Transport from "./Transport.svelte";
 
@@ -117,7 +118,6 @@
   // Box-label font sized off the larger image edge so it reads consistently
   // on screen regardless of source resolution (overlay scales uniformly).
   const labelFont = $derived(detail ? boxLabelFontPx(Math.max(detail.width, detail.height)) : 14);
-  const isAlias = isAliasClass;
 
   onMount(loadClips);
 
@@ -633,51 +633,14 @@
             onplay={() => (playing = true)}
             onpause={() => (playing = false)}
           ></video>
-          <svg
-            class="overlay"
-            viewBox="0 0 {detail.width} {detail.height}"
-            preserveAspectRatio="xMidYMid meet"
-          >
-            {#each siblingBoxes as sb (sb.track.span_id + ':' + sb.track.track_id)}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <rect
-                x={sb.bbox.x1}
-                y={sb.bbox.y1}
-                width={sb.bbox.x2 - sb.bbox.x1}
-                height={sb.bbox.y2 - sb.bbox.y1}
-                class="box sibling"
-                role="button"
-                tabindex="-1"
-                onclick={() => void selectClip(sb.track.span_id)}
-              ><title>Other segment (Track {sb.track.track_id}) — may be the same dog; click to open its clip</title></rect>
-              <text
-                x={sb.bbox.x1 + labelFont * 0.2}
-                y={sb.bbox.y1 - labelFont * 0.3 < labelFont ? sb.bbox.y1 + labelFont : sb.bbox.y1 - labelFont * 0.3}
-                class="box-label sibling"
-                class:alias={isAlias(sb.class_name)}
-                font-size={labelFont}
-              >{formatTrackLabel(sb.track.track_id, sb.confidence, sb.class_name)}</text>
-            {/each}
-            {#if activeBox && !activeBox.extrapolated}
-              <rect
-                x={activeBox.bbox.x1}
-                y={activeBox.bbox.y1}
-                width={activeBox.bbox.x2 - activeBox.bbox.x1}
-                height={activeBox.bbox.y2 - activeBox.bbox.y1}
-                class="box active"
-              />
-              <text
-                x={activeBox.bbox.x1 + labelFont * 0.2}
-                y={activeBox.bbox.y1 - labelFont * 0.3 < labelFont ? activeBox.bbox.y1 + labelFont : activeBox.bbox.y1 - labelFont * 0.3}
-                class="box-label active"
-                class:alias={isAlias(activeBox.class_name)}
-                font-size={labelFont}
-              >{formatDetLabel(activeBox.class_name, activeBox.confidence)}</text>
-            {/if}
-          </svg>
-          {#if activeBox && activeBox.extrapolated}
-            <div class="no-detect" title="This frame is in the clip's padding, before/after this track's first/last detection. No box is drawn rather than freeze a stale one.">no detection at this frame</div>
-          {/if}
+          <LabelOverlay
+            width={detail.width}
+            height={detail.height}
+            {siblingBoxes}
+            {activeBox}
+            {labelFont}
+            onselectclip={(spanId) => void selectClip(spanId)}
+          />
         </div>
 
         <div class="box-legend mono" aria-label="Box legend">
@@ -840,41 +803,6 @@
     object-fit: contain;
     display: block;
   }
-  .overlay {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-  }
-  .overlay .box { fill: none; vector-effect: non-scaling-stroke; }
-  .overlay .box.active { stroke: var(--green); stroke-width: 3; }
-  .overlay .box-label {
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-weight: 600;
-    paint-order: stroke;
-    stroke: rgba(0, 0, 0, 0.82);
-    stroke-width: 4px;
-    vector-effect: non-scaling-stroke;
-    pointer-events: none;
-    dominant-baseline: alphabetic;
-  }
-  .overlay .box-label.active { fill: var(--green); }
-  .overlay .box-label.sibling { fill: var(--amber); opacity: 0.85; }
-  .overlay .box-label.alias { fill: var(--teal); }
-  .no-detect {
-    position: absolute;
-    left: 50%;
-    bottom: 8px;
-    transform: translateX(-50%);
-    padding: 0.15rem 0.5rem;
-    border-radius: 6px;
-    background: rgba(20, 26, 36, 0.72);
-    color: #9fb0c4;
-    font-size: 0.7rem;
-    letter-spacing: 0.02em;
-    pointer-events: none;
-  }
   .box-legend {
     display: flex;
     flex-wrap: wrap;
@@ -887,15 +815,6 @@
   .box-legend .sw { width: 16px; height: 0; border-top-width: 3px; border-top-style: solid; }
   .box-legend .sw.own { border-top-color: var(--green); }
   .box-legend .sw.sib { border-top-color: var(--amber); border-top-style: dashed; }
-  .overlay .box.sibling {
-    stroke: var(--amber);
-    stroke-width: 2;
-    stroke-dasharray: 5 4;
-    opacity: 0.8;
-    pointer-events: auto;
-    cursor: pointer;
-    fill: rgba(240, 169, 58, 0.06);
-  }
   .scrub { width: 100%; }
   .lane {
     width: 100%;

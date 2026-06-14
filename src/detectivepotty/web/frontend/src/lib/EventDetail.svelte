@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { EventDetail, LabelDraft } from "./types";
   import { versioned } from "./api";
+  import MediaLightbox from "./MediaLightbox.svelte";
   import {
     basisHint,
     formatClock,
@@ -44,7 +45,17 @@
     ["unknown", "Unknown", "0"],
   ];
 
-  let hero = $state<{ src: string; alt: string } | null>(null);
+  interface DetailLightboxItem {
+    key: string;
+    src: string;
+    alt: string;
+    caption: string;
+    eyebrow: string;
+  }
+
+  let heroKey = $state<string | null>(null);
+  let lightboxOpen = $state(false);
+  let lightboxIndex = $state(0);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let meta = $derived((detail?.metadata ?? {}) as Record<string, any>);
@@ -145,7 +156,8 @@
   // Reset the in-detail hero whenever a different event loads.
   $effect(() => {
     void detail?.summary.event_id;
-    hero = null;
+    heroKey = null;
+    lightboxOpen = false;
   });
 
   function posturePhrase(ps: unknown): string {
@@ -295,8 +307,56 @@
     return versioned(base, mediaVersion) ?? base;
   }
 
-  function showHero(src: string, alt: string): void {
-    hero = { src, alt };
+  let lightboxItems = $derived.by<DetailLightboxItem[]>(() => {
+    if (!detail) {
+      return [];
+    }
+    const cropItems = detail.media.crops.map((crop, i) => {
+      const posed = overlayByName.has(crop.name);
+      return {
+        key: `crop:${crop.name}`,
+        src: cropUrl(crop.name, crop.url),
+        alt: `Crop ${crop.name}`,
+        caption: `Crop ${i + 1} · ${crop.name}`,
+        eyebrow: posed && showOverlay ? "Posed crop" : "Dog crop",
+      };
+    });
+    const frameItems = detail.media.frames.map((frame, i) => ({
+      key: `frame:${frame.name}`,
+      src: versioned(frame.url, mediaVersion) ?? frame.url,
+      alt: `Frame ${frame.name}`,
+      caption: `Frame ${i + 1} · ${frame.name}`,
+      eyebrow: "Context frame",
+    }));
+    return [...cropItems, ...frameItems];
+  });
+
+  let heroItem = $derived(
+    heroKey ? lightboxItems.find((item) => item.key === heroKey) ?? null : null,
+  );
+
+  function openLightbox(key: string): void {
+    const index = lightboxItems.findIndex((item) => item.key === key);
+    if (index < 0) {
+      return;
+    }
+    lightboxIndex = index;
+    lightboxOpen = true;
+  }
+
+  function selectMedia(key: string, open = true): void {
+    const item = lightboxItems.find((candidate) => candidate.key === key);
+    if (!item) {
+      return;
+    }
+    heroKey = key;
+    if (open) {
+      openLightbox(key);
+    }
+  }
+
+  function closeLightbox(): void {
+    lightboxOpen = false;
   }
 </script>
 
@@ -348,9 +408,17 @@
           {/if}
         </div>
 
-        {#if hero}
+        {#if heroItem}
           <div class="hero-slot">
-            <img class="hero-image" src={hero.src} alt={hero.alt} />
+            <button
+              type="button"
+              class="hero-button"
+              onclick={() => openLightbox(heroItem.key)}
+              aria-label={`Open ${heroItem.caption} full-size`}
+            >
+              <img class="hero-image" src={heroItem.src} alt={heroItem.alt} />
+              <span class="hero-action">Open full-size ↗</span>
+            </button>
           </div>
         {/if}
       </div>
@@ -459,8 +527,10 @@
                   class="strip-item"
                   class:posed
                   class:no-pose={showOverlay && !posed}
+                  class:active={heroKey === `crop:${crop.name}`}
                   title={posed ? "Pose estimated for this frame" : "No pose for this frame (not sampled, or low-quality crop)"}
-                  onclick={() => showHero(cropUrl(crop.name, crop.url), crop.name)}
+                  aria-label={`Inspect crop ${crop.name}`}
+                  onclick={() => selectMedia(`crop:${crop.name}`)}
                 >
                   <img src={cropUrl(crop.name, crop.url)} alt={crop.name} loading="lazy" />
                   {#if cl}<span class="crop-label" class:alias={cl.alias} title="The detected object class + confidence of the box this crop came from. Cyan = an accepted non-dog alias (sheep/zebra/…) recovered via class-agnostic NMS.">{formatDetLabel(cl.cls, cl.conf)}</span>{/if}
@@ -479,7 +549,9 @@
                 <button
                   type="button"
                   class="strip-item"
-                  onclick={() => showHero(versioned(frame.url, mediaVersion) ?? frame.url, frame.name)}
+                  class:active={heroKey === `frame:${frame.name}`}
+                  aria-label={`Inspect frame ${frame.name}`}
+                  onclick={() => selectMedia(`frame:${frame.name}`)}
                 >
                   <img src={versioned(frame.url, mediaVersion)} alt={frame.name} loading="lazy" />
                 </button>
@@ -513,6 +585,14 @@
           <pre>{JSON.stringify(meta, null, 2)}</pre>
         </details>
       </div>
+
+      <MediaLightbox
+        open={lightboxOpen}
+        items={lightboxItems}
+        index={lightboxIndex}
+        onclose={closeLightbox}
+        onindexchange={(index: number) => (lightboxIndex = index)}
+      />
     </div>
   {/if}
 </div>
@@ -606,6 +686,49 @@
     border: 1px solid var(--line);
     border-radius: var(--radius);
     overflow: hidden;
+  }
+
+  .hero-button {
+    position: relative;
+    display: block;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: var(--bg-inset);
+    cursor: zoom-in;
+    line-height: 0;
+  }
+
+  .hero-button:hover .hero-action,
+  .hero-button:focus-visible .hero-action {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .hero-button:focus-visible {
+    outline: 2px solid var(--teal);
+    outline-offset: -2px;
+    box-shadow: none;
+  }
+
+  .hero-action {
+    position: absolute;
+    right: 0.65rem;
+    bottom: 0.65rem;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.14s ease, transform 0.14s ease;
+    border: 1px solid color-mix(in srgb, var(--teal) 45%, transparent);
+    border-radius: 999px;
+    padding: 0.24rem 0.5rem;
+    background: rgba(0, 0, 0, 0.76);
+    color: var(--teal);
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    line-height: 1;
+    letter-spacing: 0.04em;
+    pointer-events: none;
   }
 
   .summary-grid {
@@ -901,12 +1024,21 @@
     border-color: var(--teal);
   }
 
+  .strip-item.active {
+    border-color: var(--amber);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--amber) 55%, transparent);
+  }
+
   .strip-item.posed {
     border-color: color-mix(in srgb, var(--teal) 45%, transparent);
   }
 
   .strip-item.posed:hover {
     border-color: var(--teal);
+  }
+
+  .strip-item.posed.active {
+    border-color: var(--amber);
   }
 
   /* When the overlay is ON, fade frames that have no pose so the posed ones read first. */

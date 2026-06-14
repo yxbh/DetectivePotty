@@ -13,6 +13,7 @@
     dirty: boolean;
     saving: boolean;
     saveStatus: string | null;
+    currentFrame: number;
     onselectclip: (spanId: string) => void;
     onsetmarkin: () => void;
     onsetmarkout: () => void;
@@ -22,6 +23,7 @@
     onsave: () => void | Promise<void>;
     onseekrange: (range: LabelRangeItem) => void;
     onupdaterange: (idx: number, patch: Partial<LabelRangeItem>) => void;
+    onretimerange: (idx: number, edge: "start" | "end") => void;
     ondeleterange: (idx: number) => void;
   }
 
@@ -37,6 +39,7 @@
     dirty,
     saving,
     saveStatus,
+    currentFrame,
     onselectclip,
     onsetmarkin,
     onsetmarkout,
@@ -46,6 +49,7 @@
     onsave,
     onseekrange,
     onupdaterange,
+    onretimerange,
     ondeleterange,
   }: Props = $props();
 
@@ -168,6 +172,22 @@
                 >{fmtFrame(range.start_frame)} → {fmtFrame(range.end_frame)}</span
               >
             </button>
+            <div class="retime" aria-label="Retime range">
+              <button
+                type="button"
+                onclick={() => onretimerange(idx, "start")}
+                title={`Set range start to current frame ${currentFrame}`}
+              >
+                start now
+              </button>
+              <button
+                type="button"
+                onclick={() => onretimerange(idx, "end")}
+                title={`Set range end to current frame ${currentFrame}`}
+              >
+                end now
+              </button>
+            </div>
             <select
               class="r-sel"
               value={range.behavior}
@@ -357,10 +377,11 @@
   .ranges li {
     display: flex;
     align-items: stretch;
+    flex-wrap: wrap;
     gap: 0.25rem;
   }
   .ranges .seek {
-    flex: 1;
+    flex: 1 1 100%;
     display: flex;
     align-items: center;
     background: var(--hover, #131c28);
@@ -371,6 +392,22 @@
     color: inherit;
     min-width: 0;
   }
+  .retime {
+    flex: 1 1 7rem;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.15rem;
+  }
+  .retime button {
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line-strong));
+    color: var(--accent);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.62rem;
+    padding: 0.15rem 0.2rem;
+    white-space: nowrap;
+  }
   .r-frames {
     font-size: 0.7rem;
     white-space: nowrap;
@@ -378,13 +415,14 @@
     text-overflow: ellipsis;
   }
   .r-sel {
+    flex: 1 1 5rem;
     background: var(--bg-3);
     color: inherit;
     border: 1px solid var(--line-strong);
     border-radius: 6px;
     font-size: 0.7rem;
     padding: 0.15rem 0.2rem;
-    max-width: 5.5rem;
+    min-width: 0;
   }
   .ranges .del {
     background: transparent;

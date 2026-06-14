@@ -384,6 +384,36 @@
       ctx.fillRect(x0, 0, Math.max(2, x1 - x0), h);
     }
 
+    // Pending In/Out band, using current frame as the floating edge until both
+    // marks are set.
+    if (markIn != null || markOut != null) {
+      const a = markIn ?? currentFrame;
+      const b = markOut ?? currentFrame;
+      const start = Math.min(a, b);
+      const end = Math.max(a, b);
+      const x0 = (start / total) * w;
+      const x1 = (end / total) * w;
+      ctx.fillStyle = cssToken("--accent-soft", "rgba(84, 210, 196, 0.12)");
+      ctx.fillRect(x0, 0, Math.max(2, x1 - x0), h);
+      ctx.strokeStyle = cssToken("--accent", "#54d2c4");
+      ctx.lineWidth = 2;
+      for (const frame of [markIn, markOut]) {
+        if (frame == null) continue;
+        const x = (frame / total) * w;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x - 5, 6);
+        ctx.lineTo(x + 5, 6);
+        ctx.closePath();
+        ctx.fillStyle = cssToken("--accent", "#54d2c4");
+        ctx.fill();
+      }
+    }
+
     // Confidence gate line.
     const gate = detail.detect_conf;
     if (gate != null && gate > 0) {
@@ -421,6 +451,8 @@
     void currentFrame;
     void ownBoxes;
     void ranges;
+    void markIn;
+    void markOut;
     void detail;
     drawLane();
   });
@@ -484,6 +516,27 @@
     ranges = ranges.map((r, i) => (i === idx ? { ...r, ...patch } : r));
     dirty = true;
     saveStatus = null;
+  }
+
+  function retimeRange(idx: number, edge: "start" | "end"): void {
+    const range = ranges[idx];
+    if (!range) return;
+    const frame = clampFrame(currentFrame);
+    let start = range.start_frame;
+    let end = range.end_frame;
+    if (edge === "start") {
+      start = frame;
+      if (start > end) end = start;
+    } else {
+      end = frame;
+      if (end < start) start = end;
+    }
+    updateRange(idx, {
+      start_frame: start,
+      end_frame: end,
+      start_s: start / fps,
+      end_s: end / fps,
+    });
   }
 
   function seekToRange(r: LabelRangeItem): void {
@@ -768,7 +821,7 @@
         <canvas
           bind:this={laneEl}
           class="lane"
-          title="Detection confidence over the clip. Bars = sampled detections (height/colour = confidence); dashed line = harvest detect gate; tinted bands = your labeled ranges. Click to seek."
+          title="Detection confidence over the clip. Bars = sampled detections (height/colour = confidence); dashed line = harvest detect gate; tinted bands = saved ranges; teal band/carets = pending In/Out. Click to seek."
           onclick={laneSeek}
           role="slider"
           tabindex="-1"
@@ -791,6 +844,7 @@
         {dirty}
         {saving}
         {saveStatus}
+        {currentFrame}
         onselectclip={(spanId) => void selectClip(spanId)}
         onsetmarkin={setMarkIn}
         onsetmarkout={setMarkOut}
@@ -800,6 +854,7 @@
         onsave={save}
         onseekrange={seekToRange}
         onupdaterange={updateRange}
+        onretimerange={retimeRange}
         ondeleterange={deleteRange}
       />
     {/if}

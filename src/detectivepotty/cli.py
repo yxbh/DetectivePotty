@@ -24,7 +24,6 @@ from detectivepotty.config import (
     Config,
     resolve_config_path,
 )
-from detectivepotty.detect.yolo import DogDetector
 
 app = typer.Typer(help="DetectivePotty offline and live utilities.")
 
@@ -357,6 +356,7 @@ def tune_detect(
         LiveFrameProvider,
         run_interactive_preview,
     )
+    from detectivepotty.detect.yolo import DogDetector
 
     provider: FrameProvider
     config: Config | None = None

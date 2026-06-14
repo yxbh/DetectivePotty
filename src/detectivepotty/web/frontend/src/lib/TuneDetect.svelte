@@ -187,6 +187,8 @@
   let sceneController: AbortController | null = null;
   let sceneTimer: ReturnType<typeof setTimeout> | null = null;
   const SCENE_TOP_N = 8;
+  let copyStatus = $state("");
+  let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
   const trackingActive = $derived(tracker !== "off" && tracked);
   // Ultralytics native trackers are .pt-only; CoreML packages use `ours`.
@@ -246,6 +248,9 @@
 
   onDestroy(() => {
     teardownClip();
+    if (copyTimer !== null) {
+      clearTimeout(copyTimer);
+    }
   });
 
   function effectiveFps(m: TuneMeta | null): number {
@@ -673,6 +678,83 @@
 
   function step(delta: number): void {
     seekToIndex(intendedIndex + delta);
+  }
+
+  function frameHasKeptDetection(index: number): boolean {
+    const entry = buffer.get(index);
+    if (entry?.scopeKey === currentScopeKey()) {
+      return entry.detections.some((det) => det.confidence >= threshold);
+    }
+    if (trackingActive) {
+      const stride = Math.max(1, trackedStride);
+      const snapped = Math.round(index / stride) * stride;
+      return (trackByIndex.get(snapped) ?? []).some((det) => det.confidence >= threshold);
+    }
+    return false;
+  }
+
+  function jumpDetection(dir: 1 | -1): void {
+    if (totalFrames <= 0) {
+      return;
+    }
+    const start = displayIndex;
+    for (let offset = 1; offset <= totalFrames; offset += 1) {
+      const idx = (start + dir * offset + totalFrames) % totalFrames;
+      if (frameHasKeptDetection(idx)) {
+        seekToIndex(idx);
+        return;
+      }
+    }
+  }
+
+  function tuneConfigText(): string {
+    const lines = [
+      `model: ${selectedModel || "(default)"}`,
+      `detection_conf_threshold: ${threshold.toFixed(2)}`,
+      `tracker: ${tracker}`,
+    ];
+    if (tracker !== "off") {
+      lines.push(`track_sample_every: ${trackSampleEvery}`);
+    }
+    if (tracker === "ours") {
+      lines.push(
+        `track_iou_threshold: ${trackIou}`,
+        `track_max_age_frames: ${trackMaxAge}`,
+        `track_center_dist_gate: ${trackCenterGate}`,
+      );
+    } else if (isUltralyticsTracker()) {
+      lines.push(
+        `ultra_conf: ${ultraConf.toFixed(2)}`,
+        `track_high_thresh: ${ultraTrackHigh.toFixed(2)}`,
+        `track_low_thresh: ${ultraTrackLow.toFixed(2)}`,
+        `new_track_thresh: ${ultraNewTrack.toFixed(2)}`,
+        `track_buffer: ${ultraTrackBuffer}`,
+        `match_thresh: ${ultraMatch.toFixed(2)}`,
+      );
+      if (isBotsortTracker()) {
+        lines.push(
+          `proximity_thresh: ${ultraProximity.toFixed(2)}`,
+          `appearance_thresh: ${ultraAppearance.toFixed(2)}`,
+        );
+      }
+    }
+    return lines.join("\n");
+  }
+
+  async function copyTuneConfig(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(tuneConfigText());
+      copyStatus = "copied";
+    } catch (err) {
+      copyStatus = `copy failed: ${errMsg(err)}`;
+    }
+    if (copyTimer !== null) {
+      clearTimeout(copyTimer);
+    }
+    copyTimer = setTimeout(() => {
+      copyStatus = "";
+      copyTimer = null;
+    }, 2500);
   }
 
   function togglePlay(): void {
@@ -1752,6 +1834,14 @@
         event.preventDefault();
         step(event.shiftKey ? -SKIP_N : -1);
         break;
+      case "]":
+        event.preventDefault();
+        jumpDetection(1);
+        break;
+      case "[":
+        event.preventDefault();
+        jumpDetection(-1);
+        break;
       default:
         break;
     }
@@ -1781,7 +1871,8 @@
           into <code>detection_conf_threshold</code>.
         </p>
         <p class="muted small">
-          Space play/pause · ← / → step one frame · Shift + ← / → skip {SKIP_N}
+          Space play/pause · ← / → step one frame · Shift + ← / → skip {SKIP_N} · [ / ]
+          jump detections
         </p>
       </div>
     {:else}
@@ -1893,6 +1984,37 @@
             />
             <span class="mono muted small">floor {floor.toFixed(2)}</span>
           </label>
+
+          <div class="jump-controls" role="group" aria-label="Detection jumps">
+            <button
+              type="button"
+              class="zoom-toggle"
+              onclick={() => jumpDetection(-1)}
+              title="Jump to the previous buffered frame with a kept detection ([)"
+            >
+              ← det
+            </button>
+            <button
+              type="button"
+              class="zoom-toggle"
+              onclick={() => jumpDetection(1)}
+              title="Jump to the next buffered frame with a kept detection (])"
+            >
+              det →
+            </button>
+          </div>
+
+          <button
+            type="button"
+            class="zoom-toggle"
+            onclick={() => void copyTuneConfig()}
+            title="Copy the current model, confidence, and tracker tuning values"
+          >
+            ⧉ copy config
+          </button>
+          {#if copyStatus}
+            <span class="copy-status mono small" role="status">{copyStatus}</span>
+          {/if}
 
           <div class="overlay-toggle" role="group" aria-label="Overlay">
             {#each ["boxes", "pose", "both"] as const as mode (mode)}
@@ -2198,6 +2320,12 @@
     min-width: 140px;
   }
 
+  .jump-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
   .overlay-toggle {
     display: inline-flex;
     border: 1px solid var(--line-strong, #324056);
@@ -2237,6 +2365,11 @@
   .zoom-toggle.active {
     background: var(--accent-dim, #1d3346);
     color: #fff;
+  }
+
+  .copy-status {
+    color: var(--teal, #54d2c4);
+    max-width: 24ch;
   }
 
   .muted {

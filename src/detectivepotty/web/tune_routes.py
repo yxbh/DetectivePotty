@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -20,6 +21,7 @@ from detectivepotty.web.schemas import (
     TunePoseRangeRequest,
     TunePoseRequest,
 )
+from detectivepotty.web.payloads import scene_object_payload
 from detectivepotty.web.tune_tracking import (
     TUNE_DETECTION_FLOOR,
     TUNE_TRACKERS,
@@ -39,6 +41,14 @@ TUNE_POSE_MAX_CROPS = 64
 
 # Upper bound on the number of source frames one "Track range" request will decode.
 TUNE_TRACK_MAX_FRAMES = 6000
+
+
+@dataclass(frozen=True, slots=True)
+class _TrackRangeRequest:
+    file_path: Path
+    model_name: str
+    bounded_count: int
+    ultra_params: TuneUltralyticsTrackerParams
 
 
 def _coreml_batch_map(models: list[str]) -> dict[str, int]:
@@ -127,6 +137,58 @@ def register_tune_routes(
         if name not in app.state.tune_models:
             raise HTTPException(status_code=400, detail="unknown model")
         return name
+
+    def _track_range_request(
+        path: str,
+        count: int,
+        model: str | None,
+        tracker: str,
+        ultra_conf: float,
+        track_high_thresh: float | None,
+        track_low_thresh: float | None,
+        new_track_thresh: float | None,
+        track_buffer: int | None,
+        match_thresh: float | None,
+        proximity_thresh: float | None,
+        appearance_thresh: float | None,
+    ) -> _TrackRangeRequest:
+        if tracker not in TUNE_TRACKERS:
+            raise HTTPException(status_code=400, detail=f"unknown tracker: {tracker}")
+
+        from detectivepotty.web import tune as tune_mod
+
+        try:
+            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid path") from exc
+
+        return _TrackRangeRequest(
+            file_path=file_path,
+            model_name=_resolve_tune_model(model),
+            bounded_count=min(count, TUNE_TRACK_MAX_FRAMES),
+            ultra_params=TuneUltralyticsTrackerParams(
+                conf=ultra_conf,
+                track_high_thresh=track_high_thresh,
+                track_low_thresh=track_low_thresh,
+                new_track_thresh=new_track_thresh,
+                track_buffer=track_buffer,
+                match_thresh=match_thresh,
+                proximity_thresh=proximity_thresh,
+                appearance_thresh=appearance_thresh,
+            ),
+        )
+
+    def _ensure_ultralytics_tracking(model_name: str) -> None:
+        if not model_name.endswith(".pt"):
+            raise HTTPException(
+                status_code=400,
+                detail="Ultralytics tracking requires a .pt model",
+            )
+        if not ultralytics_tracking_available():
+            raise HTTPException(
+                status_code=400,
+                detail="Ultralytics tracking unavailable (install `lap`)",
+            )
 
     def _detect_payload(
         file_path: Path,
@@ -222,14 +284,7 @@ def register_tune_routes(
             "model": model_used,
             "detection_floor": TUNE_DETECTION_FLOOR,
             "objects": [
-                {
-                    "class_name": class_name,
-                    "confidence": confidence,
-                    "x1": float(bbox.x1),
-                    "y1": float(bbox.y1),
-                    "x2": float(bbox.x2),
-                    "y2": float(bbox.y2),
-                }
+                scene_object_payload(class_name, confidence, bbox)
                 for class_name, confidence, bbox in objects
             ],
         }
@@ -941,48 +996,33 @@ def register_tune_routes(
         capped by ``TUNE_TRACK_MAX_FRAMES``.
         """
 
-        from detectivepotty.web import tune as tune_mod
-
-        if tracker not in TUNE_TRACKERS:
-            raise HTTPException(status_code=400, detail=f"unknown tracker: {tracker}")
-        try:
-            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="invalid path") from exc
-        model_name = _resolve_tune_model(model)
-        bounded = min(count, TUNE_TRACK_MAX_FRAMES)
-        ultra_params = TuneUltralyticsTrackerParams(
-            conf=ultra_conf,
-            track_high_thresh=track_high_thresh,
-            track_low_thresh=track_low_thresh,
-            new_track_thresh=new_track_thresh,
-            track_buffer=track_buffer,
-            match_thresh=match_thresh,
-            proximity_thresh=proximity_thresh,
-            appearance_thresh=appearance_thresh,
+        request = _track_range_request(
+            path,
+            count,
+            model,
+            tracker,
+            ultra_conf,
+            track_high_thresh,
+            track_low_thresh,
+            new_track_thresh,
+            track_buffer,
+            match_thresh,
+            proximity_thresh,
+            appearance_thresh,
         )
 
         if tracker in _ULTRALYTICS_TRACKERS:
-            if not model_name.endswith(".pt"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Ultralytics tracking requires a .pt model",
-                )
-            if not ultralytics_tracking_available():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Ultralytics tracking unavailable (install `lap`)",
-                )
+            _ensure_ultralytics_tracking(request.model_name)
             try:
                 return await run_in_threadpool(
                     _track_range_ultralytics_payload,
-                    file_path,
+                    request.file_path,
                     start,
-                    bounded,
-                    model_name,
+                    request.bounded_count,
+                    request.model_name,
                     tracker=tracker,
                     sample_every=sample_every,
-                    ultra_params=ultra_params,
+                    ultra_params=request.ultra_params,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -994,10 +1034,10 @@ def register_tune_routes(
         try:
             return await run_in_threadpool(
                 _track_range_payload,
-                file_path,
+                request.file_path,
                 start,
-                bounded,
-                model_name,
+                request.bounded_count,
+                request.model_name,
                 sample_every=sample_every,
                 iou_threshold=iou_threshold,
                 max_age_frames=max_age_frames,
@@ -1041,53 +1081,38 @@ def register_tune_routes(
         blocking decode/inference never blocks the event loop.
         """
 
-        from detectivepotty.web import tune as tune_mod
-
-        if tracker not in TUNE_TRACKERS:
-            raise HTTPException(status_code=400, detail=f"unknown tracker: {tracker}")
-        try:
-            file_path = tune_mod.resolve_tune_file(path, app.state.tune_roots)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="invalid path") from exc
-        model_name = _resolve_tune_model(model)
-        bounded = min(count, TUNE_TRACK_MAX_FRAMES)
-        ultra_params = TuneUltralyticsTrackerParams(
-            conf=ultra_conf,
-            track_high_thresh=track_high_thresh,
-            track_low_thresh=track_low_thresh,
-            new_track_thresh=new_track_thresh,
-            track_buffer=track_buffer,
-            match_thresh=match_thresh,
-            proximity_thresh=proximity_thresh,
-            appearance_thresh=appearance_thresh,
+        request = _track_range_request(
+            path,
+            count,
+            model,
+            tracker,
+            ultra_conf,
+            track_high_thresh,
+            track_low_thresh,
+            new_track_thresh,
+            track_buffer,
+            match_thresh,
+            proximity_thresh,
+            appearance_thresh,
         )
 
         if tracker in _ULTRALYTICS_TRACKERS:
-            if not model_name.endswith(".pt"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Ultralytics tracking requires a .pt model",
-                )
-            if not ultralytics_tracking_available():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Ultralytics tracking unavailable (install `lap`)",
-                )
+            _ensure_ultralytics_tracking(request.model_name)
             gen = _iter_track_range_ultralytics(
-                file_path,
+                request.file_path,
                 start,
-                bounded,
-                model_name,
+                request.bounded_count,
+                request.model_name,
                 tracker=tracker,
                 sample_every=sample_every,
-                ultra_params=ultra_params,
+                ultra_params=request.ultra_params,
             )
         else:
             gen = _iter_track_range(
-                file_path,
+                request.file_path,
                 start,
-                bounded,
-                model_name,
+                request.bounded_count,
+                request.model_name,
                 sample_every=sample_every,
                 iou_threshold=iou_threshold,
                 max_age_frames=max_age_frames,

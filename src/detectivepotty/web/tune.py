@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
+from detectivepotty.web.payloads import detection_payload
+
 if TYPE_CHECKING:
     from detectivepotty.config import Config
     from detectivepotty.events import Detection
@@ -491,17 +493,7 @@ def encode_jpeg_dataurl(frame_bgr: np.ndarray) -> str:
 def detections_payload(detections: Sequence[Detection]) -> list[dict[str, Any]]:
     """Shape detector output for the client (original-resolution pixel boxes)."""
 
-    return [
-        {
-            "x1": float(det.bbox.x1),
-            "y1": float(det.bbox.y1),
-            "x2": float(det.bbox.x2),
-            "y2": float(det.bbox.y2),
-            "confidence": float(det.confidence),
-            "class_name": det.class_name,
-        }
-        for det in detections
-    ]
+    return [detection_payload(det) for det in detections]
 
 
 def track_step(
@@ -528,17 +520,7 @@ def track_step(
         latest = latest_detection_at(track, frame_idx)
         if latest is None:
             continue
-        boxes.append(
-            {
-                "x1": float(latest.bbox.x1),
-                "y1": float(latest.bbox.y1),
-                "x2": float(latest.bbox.x2),
-                "y2": float(latest.bbox.y2),
-                "confidence": float(latest.confidence),
-                "class_name": latest.class_name,
-                "track_id": track.track_id,
-            }
-        )
+        boxes.append(detection_payload(latest, track_id=track.track_id))
     return {"index": frame_idx, "detections": boxes}
 
 

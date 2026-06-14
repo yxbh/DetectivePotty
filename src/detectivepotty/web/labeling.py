@@ -30,6 +30,7 @@ from detectivepotty.labels import (
     load_labels,
     save_labels,
 )
+from detectivepotty.web.payloads import recorded_track_box_payload
 
 UNKNOWN_DATE = "unknown-date"
 
@@ -323,19 +324,11 @@ def clip_detail(clip_dir: Path, root: str | Path | None = None) -> dict[str, Any
     tracks: dict[str, list[dict[str, Any]]] = {}
     for det in meta.get("detections", []):
         track_id = str(det.get("track_id"))
-        box = det.get("bbox") or {}
         tracks.setdefault(track_id, []).append(
-            {
-                "clip_frame_idx": int(det.get("clip_frame_idx", 0)),
-                "bbox": {
-                    "x1": float(box.get("x1", 0.0)),
-                    "y1": float(box.get("y1", 0.0)),
-                    "x2": float(box.get("x2", 0.0)),
-                    "y2": float(box.get("y2", 0.0)),
-                },
-                "confidence": float(det.get("confidence", 0.0)),
-                "class_name": str(det.get("class_name") or "dog"),
-            }
+            recorded_track_box_payload(
+                det,
+                clip_frame_idx=int(det.get("clip_frame_idx", 0)),
+            )
         )
     for entries in tracks.values():
         entries.sort(key=lambda item: item["clip_frame_idx"])
@@ -405,19 +398,8 @@ def _present_tracks(
             cf = round((abs_t - span_start).total_seconds() * fps)
             if cf < 0 or cf > last_frame:
                 continue
-            box = det.get("bbox") or {}
             grouped.setdefault(str(det.get("track_id")), []).append(
-                {
-                    "clip_frame_idx": cf,
-                    "bbox": {
-                        "x1": float(box.get("x1", 0.0)),
-                        "y1": float(box.get("y1", 0.0)),
-                        "x2": float(box.get("x2", 0.0)),
-                        "y2": float(box.get("y2", 0.0)),
-                    },
-                    "confidence": float(det.get("confidence", 0.0)),
-                    "class_name": str(det.get("class_name") or "dog"),
-                }
+                recorded_track_box_payload(det, clip_frame_idx=cf)
             )
         for track_id, boxes in grouped.items():
             boxes.sort(key=lambda item: item["clip_frame_idx"])

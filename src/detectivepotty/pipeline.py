@@ -6,7 +6,6 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import logging
-import math
 from pathlib import Path
 import threading
 from typing import Any
@@ -18,25 +17,20 @@ from detectivepotty.config import CameraConfig, Config
 from detectivepotty.detect.yolo import DogDetector
 from detectivepotty.events import Detection
 from detectivepotty.pipeline_file import process_file_camera as run_file_camera
+from detectivepotty.pipeline_live import run_live_camera_async
 from detectivepotty.pipeline_runtime import (
     ClassifierFactory,
     Detector,
     DetectorFactory,
     FileSourceFactory,
-    FrameHistory as _FrameHistory,
-    PendingCandidate as _PendingCandidate,
     RecorderFactory,
     RTSPSourceFactory,
     StateMachineFactory,
-    buffer_window_s as _buffer_window_s,
     call_camera_factory as _call_camera_factory,
     is_live_kind as _is_live_kind,
     is_valid_rtsp_url as _is_valid_rtsp_url,
-    live_buffer_max_frames as _live_buffer_max_frames,
     redact_url as _redact_url,
-    detect_frames_batched as _detect_frames_batched,
 )
-from detectivepotty.pipeline_recording import record_all_pending, record_ready_pending
 from detectivepotty.pose.base import PoseEstimator
 from detectivepotty.pose.factory import build_pose_estimator
 from detectivepotty.pose.gate import PoseGate
@@ -44,10 +38,8 @@ from detectivepotty.pose.keypoints import PoseKeypoints
 from detectivepotty.potty_event import PottyEventDetector
 from detectivepotty.recording.dataset import camera_dataset_dir
 from detectivepotty.recording.recorder import EventRecorder
-from detectivepotty.recording.retention import enforce_retention
 from detectivepotty.sources.base import Frame, VideoSource, sanitize_source_id
 from detectivepotty.sources.file import FileSource
-from detectivepotty.sources.rolling_buffer import BufferedSourceWorker, RollingBuffer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -327,122 +319,20 @@ class PottyPipeline:
         url: str,
         recorder_client: Any | None,
     ) -> list[Path]:
-        source = self._make_live_source(url)
-        buffer_window_s = _buffer_window_s(camera_config)
-        buffer_max_frames = _live_buffer_max_frames(buffer_window_s)
-        buffer = RollingBuffer(buffer_window_s, max_frames=buffer_max_frames)
-        worker = BufferedSourceWorker(
-            source,
-            buffer,
-            name=f"buffer-{sanitize_source_id(camera_config.id)}",
+        return await run_live_camera_async(
+            camera_config,
+            url,
+            recorder_client,
+            config=self.config,
+            new_detector=self._new_detector,
+            new_classifier=self._new_classifier,
+            new_state_machine=self._new_state_machine,
+            recorder_factory=self.recorder_factory,
+            make_live_source=self._make_live_source,
+            inference_lock=self._inference_lock,
+            stop_event=self._stop_event,
+            max_live_frames=self.max_live_frames,
         )
-        worker.start()
-        try:
-            return await self._run_live_detection_loop(
-                camera_config,
-                buffer,
-                recorder_client,
-                buffer_window_s,
-            )
-        finally:
-            worker.stop()
-
-    async def _run_live_detection_loop(
-        self,
-        camera_config: CameraConfig,
-        buffer: RollingBuffer,
-        recorder_client: Any,
-        buffer_window_s: float,
-    ) -> list[Path]:
-        detector = self._new_detector(camera_config)
-        classifier = self._new_classifier(camera_config)
-        state_machine = self._new_state_machine(camera_config)
-        recorder = self.recorder_factory(self.config, recorder_client)
-        history = _FrameHistory(buffer_window_s, max_frames=_live_buffer_max_frames(buffer_window_s))
-        pending: list[_PendingCandidate] = []
-        event_dirs: list[Path] = []
-        last_key: tuple[str, int] | None = None
-        last_detection_mono = -math.inf
-        processed = 0
-        sample_interval_s = 1.0 / camera_config.sample_rate_fps
-        live_batch_size = max(1, self.config.global_settings.live_detection_batch_size)
-        max_batch_wait_s = self.config.global_settings.max_batch_wait_s
-
-        # Sampled frames accumulate here until the batch is full or has waited
-        # ``max_batch_wait_s``; then they are detected in one forward and replayed
-        # through the state machine in order. ``live_batch_size == 1`` (default)
-        # flushes immediately, i.e. exactly the original per-frame behavior.
-        batch: list[Frame] = []
-        batch_started_mono: float | None = None
-
-        def flush_live_batch() -> None:
-            nonlocal batch_started_mono
-            if not batch:
-                return
-            results = _detect_frames_batched(
-                detector, batch, lock=self._inference_lock
-            )
-            for batched_frame, detections in zip(batch, results):
-                emitted = state_machine.process(batched_frame, detections)
-                pending.extend(_PendingCandidate(candidate) for candidate in emitted)
-            batch.clear()
-            batch_started_mono = None
-
-        while not self._stop_event.is_set() and (
-            self.max_live_frames is None or processed < self.max_live_frames
-        ):
-            snapshot = buffer.snapshot()
-            if not snapshot:
-                await asyncio.sleep(0.05)
-                continue
-            frame = snapshot[-1]
-            key = (frame.source_id, frame.frame_idx)
-            if key == last_key:
-                await asyncio.sleep(0.02)
-                continue
-            last_key = key
-            processed += 1
-            history.append(frame)
-
-            if frame.mono_ts - last_detection_mono >= sample_interval_s:
-                last_detection_mono = frame.mono_ts
-                batch.append(frame)
-                if batch_started_mono is None:
-                    batch_started_mono = frame.mono_ts
-                if (
-                    len(batch) >= live_batch_size
-                    or frame.mono_ts - batch_started_mono >= max_batch_wait_s
-                ):
-                    flush_live_batch()
-
-            event_dirs.extend(
-                record_ready_pending(
-                    pending,
-                    current_wall_ts=frame.wall_ts,
-                    buffer=buffer,
-                    history=history,
-                    camera_config=camera_config,
-                    classifier=classifier,
-                    recorder=recorder,
-                ),
-            )
-
-        # Drain any partial batch accumulated before the loop exited so its frames
-        # still reach the state machine before the final flush.
-        flush_live_batch()
-        pending.extend(_PendingCandidate(candidate) for candidate in state_machine.flush())
-        event_dirs.extend(
-            record_all_pending(
-                pending,
-                buffer=buffer,
-                history=history,
-                camera_config=camera_config,
-                classifier=classifier,
-                recorder=recorder,
-            ),
-        )
-        enforce_retention(self.config.global_settings.dataset_dir, camera_config)
-        return event_dirs
 
     def _new_detector(self, camera_config: CameraConfig) -> Detector:
         return _call_camera_factory(self.detector_factory, camera_config, self.config)

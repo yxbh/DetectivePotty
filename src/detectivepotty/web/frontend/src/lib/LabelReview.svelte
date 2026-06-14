@@ -28,8 +28,8 @@
     timelineFrameToSeconds,
     timelineFrameToVideoTime,
     timelineRatioToFrame,
-    timelineVideoTimeToFrameFloor,
   } from "./video/frameTime";
+  import { VideoFrameSync } from "./video/frameSync";
   import LabelClipList from "./LabelClipList.svelte";
   import LabelFilmstrip from "./LabelFilmstrip.svelte";
   import LabelOverlay from "./LabelOverlay.svelte";
@@ -88,7 +88,6 @@
   let crops = $state<{ frame: number; url: string | null }[]>([]);
   let filmstripToken = 0;
   let detailToken = 0;
-  let rvfcHandle: number | null = null;
   let stopLaneResize: (() => void) | null = null;
   let cleanupThumbWait: (() => void) | null = null;
 
@@ -102,9 +101,15 @@
   // Detector provenance + detected-object-class mix surfaced in the clip header.
   const modelLabel = $derived(detail?.model_name || "unknown");
   const classCounts = $derived(detail?.class_distribution ?? []);
-  const hasRvfc =
-    typeof window !== "undefined" &&
-    "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+  const frameSync = new VideoFrameSync({
+    timeline: () => timeline,
+    onFrame: (frame) => {
+      currentFrame = frame;
+    },
+    onPlayingChange: (value) => {
+      playing = value;
+    },
+  });
 
   // The own track's sampled detection boxes (what a new range binds to).
   const ownBoxes = $derived.by(() => {
@@ -149,11 +154,15 @@
   onMount(loadClips);
 
   onDestroy(() => {
-    cancelFrameLoop();
+    frameSync.destroy();
     stopLaneResize?.();
     cleanupThumbWait?.();
     filmstripToken++;
     detailToken++;
+  });
+
+  $effect(() => {
+    frameSync.setVideo(videoEl);
   });
 
   async function loadClips(): Promise<void> {
@@ -184,7 +193,7 @@
     selectedId = spanId;
     detailLoading = true;
     detailError = null;
-    cancelFrameLoop();
+    frameSync.cancelFrameLoop();
     cleanupThumbWait?.();
     cleanupThumbWait = null;
     detail = null;
@@ -212,54 +221,23 @@
   // --- video / frame sync -------------------------------------------------
 
   function syncFrame(): void {
-    if (!videoEl || fps <= 0) return;
-    currentFrame = timelineVideoTimeToFrameFloor(timeline, videoEl.currentTime);
+    frameSync.syncFromCurrentTime();
   }
 
   function seekToFrame(frame: number): void {
-    const target = clampFrame(frame, totalFrames);
-    currentFrame = target;
-    if (videoEl) videoEl.currentTime = timelineFrameToVideoTime(timeline, target);
+    frameSync.seekToFrame(frame);
   }
 
   function stepFrame(delta: number): void {
-    if (videoEl && !videoEl.paused) videoEl.pause();
-    seekToFrame(currentFrame + delta);
+    frameSync.stepFrame(currentFrame, delta);
   }
 
   function togglePlay(): void {
-    if (!videoEl) return;
-    if (videoEl.paused) void videoEl.play().catch(() => undefined);
-    else videoEl.pause();
+    frameSync.togglePlay();
   }
 
   function onLoadedMeta(): void {
-    if (videoEl) videoEl.currentTime = timelineFrameToVideoTime(timeline, 0);
-    registerFrameLoop();
-  }
-
-  function cancelFrameLoop(): void {
-    if (hasRvfc && videoEl && rvfcHandle !== null) {
-      try {
-        videoEl.cancelVideoFrameCallback(rvfcHandle);
-      } catch {
-        /* element may be detaching */
-      }
-    }
-    rvfcHandle = null;
-  }
-
-  function registerFrameLoop(): void {
-    if (!hasRvfc || !videoEl) return;
-    cancelFrameLoop();
-    const cb = (): void => {
-      rvfcHandle = null;
-      syncFrame();
-      if (videoEl) {
-        rvfcHandle = videoEl.requestVideoFrameCallback(cb);
-      }
-    };
-    rvfcHandle = videoEl.requestVideoFrameCallback(cb);
+    frameSync.loadedMetadata(0);
   }
 
   // --- detection filmstrip (per-detection crop thumbnails) ----------------
@@ -787,8 +765,8 @@
             onloadedmetadata={onLoadedMeta}
             onseeked={syncFrame}
             ontimeupdate={syncFrame}
-            onplay={() => (playing = true)}
-            onpause={() => (playing = false)}
+            onplay={() => frameSync.handlePlay()}
+            onpause={() => frameSync.handlePause()}
           ></video>
           <LabelOverlay
             width={detail.width}

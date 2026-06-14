@@ -206,7 +206,7 @@
 
   <p class="legend mono">
     Space play · ←/→ step (⇧×10) · I/O mark · 1-4 behavior · ⇧1-4 dog · Enter add · S save ·
-    j/k clip
+    j/k clip · n/N unlabeled
   </p>
 </div>
 

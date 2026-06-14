@@ -7,8 +7,15 @@
     selectedId: string | null;
     loading: boolean;
     error: string | null;
+    filter: "all" | "unlabeled" | "labeled";
+    totalCount: number;
+    labeledCount: number;
+    unlabeledCount: number;
+    selectedPosition: number | null;
     onreload: () => void | Promise<void>;
     onselect: (spanId: string) => void;
+    onfilter: (filter: "all" | "unlabeled" | "labeled") => void;
+    onnextunlabeled: () => void;
   }
 
   interface ClipGroup {
@@ -19,7 +26,23 @@
     items: LabelClipSummary[];
   }
 
-  let { clips, selectedId, loading, error, onreload, onselect }: Props = $props();
+  let {
+    clips,
+    selectedId,
+    loading,
+    error,
+    filter,
+    totalCount,
+    labeledCount,
+    unlabeledCount,
+    selectedPosition,
+    onreload,
+    onselect,
+    onfilter,
+    onnextunlabeled,
+  }: Props = $props();
+
+  const progressPct = $derived(totalCount ? Math.round((labeledCount / totalCount) * 100) : 0);
 
   // Group siblings by scene so overlapping track segments stay visually linked.
   const clipGroups = $derived.by<ClipGroup[]>(() => {
@@ -46,18 +69,57 @@
 </script>
 
 <aside class="clip-list">
-  <div class="list-head">
-    <h2>Harvested clips</h2>
-    <button type="button" class="ghost" onclick={() => void onreload()} title="Reload clip list">↻</button>
+  <div class="list-chrome">
+    <div class="list-head">
+      <h2>Harvested clips</h2>
+      <button type="button" class="ghost" onclick={() => void onreload()} title="Reload clip list">↻</button>
+    </div>
+    <div class="list-tools">
+      <div class="filter-tabs" role="tablist" aria-label="Filter harvested clips">
+        <button type="button" role="tab" class:active={filter === "all"} aria-selected={filter === "all"} onclick={() => onfilter("all")}>
+          All <span>{totalCount}</span>
+        </button>
+        <button type="button" role="tab" class:active={filter === "unlabeled"} aria-selected={filter === "unlabeled"} onclick={() => onfilter("unlabeled")}>
+          Todo <span>{unlabeledCount}</span>
+        </button>
+        <button type="button" role="tab" class:active={filter === "labeled"} aria-selected={filter === "labeled"} onclick={() => onfilter("labeled")}>
+          Done <span>{labeledCount}</span>
+        </button>
+      </div>
+      <button
+        type="button"
+        class="next-unlabeled"
+        disabled={unlabeledCount === 0}
+        onclick={onnextunlabeled}
+        title="Open the next unlabeled clip (N)"
+      >
+        next unlabeled <kbd>N</kbd>
+      </button>
+      <div class="list-progress mono" title={`${labeledCount} of ${totalCount} clips have at least one label range`}>
+        <span>{labeledCount}/{totalCount} labeled</span>
+        <span>
+          {#if selectedPosition != null}
+            {selectedPosition + 1}/{clips.length} shown
+          {:else}
+            {clips.length} shown
+          {/if}
+        </span>
+        <div class="progress-track" aria-hidden="true">
+          <div class="progress-fill" style="width: {progressPct}%"></div>
+        </div>
+      </div>
+    </div>
   </div>
   {#if loading}
     <p class="muted pad">Loading clips…</p>
   {:else if error}
     <p class="error pad">{error}</p>
-  {:else if clips.length === 0}
+  {:else if clips.length === 0 && totalCount === 0}
     <p class="muted pad">
       No harvested clips found. Run <code>detectivepotty harvest</code> to populate the harvest dir.
     </p>
+  {:else if clips.length === 0}
+    <p class="muted pad">No clips match this label filter.</p>
   {:else}
     {#each clipGroups as group (group.key)}
       {#if group.scene}
@@ -126,16 +188,18 @@
     overflow-y: auto;
     min-height: 0;
   }
-  .list-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.4rem 0.6rem;
+  .list-chrome {
     position: sticky;
     top: 0;
     background: var(--bg, #0c1018);
     border-bottom: 1px solid var(--line-strong);
     z-index: 1;
+  }
+  .list-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.4rem 0.6rem 0.25rem;
   }
   .list-head h2 {
     font-size: 0.78rem;
@@ -143,6 +207,76 @@
     letter-spacing: 0.05em;
     margin: 0;
     color: var(--text-dim);
+  }
+  .list-tools {
+    display: grid;
+    gap: 0.45rem;
+    padding: 0 0.6rem 0.55rem;
+  }
+  .filter-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.2rem;
+    padding: 0.16rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-pill);
+    background: var(--bg-inset);
+  }
+  .filter-tabs button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+    min-width: 0;
+    padding: 0.28rem 0.3rem;
+    border: 0;
+    border-radius: var(--radius-pill);
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 0.68rem;
+  }
+  .filter-tabs button.active {
+    background: var(--amber);
+    color: #1a1204;
+  }
+  .filter-tabs span {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+  }
+  .next-unlabeled {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    padding: 0.34rem 0.5rem;
+    border-color: color-mix(in srgb, var(--teal) 40%, var(--line-strong));
+    background: var(--teal-soft);
+    color: var(--teal);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .next-unlabeled kbd {
+    background: rgba(0, 0, 0, 0.18);
+    color: inherit;
+  }
+  .list-progress {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.25rem 0.5rem;
+    color: var(--text-faint);
+    font-size: 0.64rem;
+  }
+  .progress-track {
+    grid-column: 1 / -1;
+    height: 3px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-3);
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--beh-pee), var(--teal));
   }
   ul {
     list-style: none;

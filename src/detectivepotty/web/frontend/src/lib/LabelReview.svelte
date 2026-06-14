@@ -32,6 +32,7 @@
     "3": "not_potty",
     "4": "excluded",
   };
+  type LabelListFilter = "all" | "unlabeled" | "labeled";
   const BEH_COLOR_TOKEN: Record<string, string> = {
     pee: "--beh-pee",
     poop: "--beh-poop",
@@ -47,6 +48,7 @@
   const MAX_FILMSTRIP = 24;
 
   let clips = $state<LabelClipSummary[]>([]);
+  let listFilter = $state<LabelListFilter>("all");
   let vocabulary = $state<LabelVocabulary>({ behaviors: [], dogs: [] });
   let listLoading = $state(true);
   let listError = $state<string | null>(null);
@@ -124,6 +126,11 @@
   // Box-label font sized off the larger image edge so it reads consistently
   // on screen regardless of source resolution (overlay scales uniformly).
   const labelFont = $derived(detail ? boxLabelFontPx(Math.max(detail.width, detail.height)) : 14);
+  const labeledClipCount = $derived(clips.filter((clip) => clip.labeled).length);
+  const unlabeledClipCount = $derived(clips.length - labeledClipCount);
+  const filteredClips = $derived.by(() => clipsForFilter(listFilter));
+  const selectedFilteredIndex = $derived(filteredClips.findIndex((clip) => clip.span_id === selectedId));
+  const selectedPosition = $derived(selectedFilteredIndex < 0 ? null : selectedFilteredIndex);
 
   onMount(loadClips);
 
@@ -151,8 +158,11 @@
     }
   }
 
-  async function selectClip(spanId: string): Promise<void> {
-    if (dirty && spanId !== selectedId) {
+  async function selectClip(
+    spanId: string,
+    options: { skipDirtyConfirm?: boolean } = {},
+  ): Promise<void> {
+    if (!options.skipDirtyConfirm && dirty && spanId !== selectedId) {
       const ok = confirm("Discard unsaved label changes for this clip?");
       if (!ok) return;
     }
@@ -496,6 +506,14 @@
       dirty = false;
       saveStatus = "saved";
       clips = clips.map((c) => (c.span_id === updated.span_id ? updated : c));
+      if (listFilter === "unlabeled" && updated.labeled) {
+        const next = nextUnlabeledTarget(1, updated.span_id);
+        if (next && next.span_id !== updated.span_id) {
+          void selectClip(next.span_id);
+        } else {
+          saveStatus = "saved · no unlabeled clips left";
+        }
+      }
     } catch (err) {
       saveStatus = errMsg(err);
     } finally {
@@ -504,14 +522,59 @@
   }
 
   function moveClip(delta: number): void {
-    if (!clips.length) return;
-    const idx = clips.findIndex((c) => c.span_id === selectedId);
-    const next = clampIndex(idx + delta, clips.length);
-    void selectClip(clips[next].span_id);
+    const visible = filteredClips;
+    if (!visible.length) return;
+    const idx = visible.findIndex((c) => c.span_id === selectedId);
+    const next = clampIndex(idx + delta, visible.length);
+    void selectClip(visible[next].span_id);
   }
 
   function clampIndex(i: number, len: number): number {
     return Math.max(0, Math.min(len - 1, i));
+  }
+
+  function clipsForFilter(filter: LabelListFilter): LabelClipSummary[] {
+    if (filter === "unlabeled") return clips.filter((clip) => !clip.labeled);
+    if (filter === "labeled") return clips.filter((clip) => clip.labeled);
+    return clips;
+  }
+
+  function setListFilter(filter: LabelListFilter): void {
+    const nextVisible = clipsForFilter(filter);
+    const selectedVisible = nextVisible.some((clip) => clip.span_id === selectedId);
+    const shouldMoveSelection = nextVisible.length > 0 && !selectedVisible;
+    if (shouldMoveSelection && dirty && !confirm("Discard unsaved label changes for this clip?")) {
+      return;
+    }
+    listFilter = filter;
+    if (shouldMoveSelection) {
+      void selectClip(nextVisible[0].span_id, { skipDirtyConfirm: true });
+    }
+  }
+
+  function nextUnlabeledTarget(dir: 1 | -1, fromId: string | null = selectedId): LabelClipSummary | null {
+    const unlabeled = clips.filter((clip) => !clip.labeled);
+    if (!unlabeled.length) return null;
+    const current = unlabeled.findIndex((clip) => clip.span_id === fromId);
+    const base = current < 0 ? (dir === 1 ? -1 : unlabeled.length) : current;
+    for (let step = 1; step <= unlabeled.length; step += 1) {
+      const next =
+        unlabeled[((base + dir * step) % unlabeled.length + unlabeled.length) % unlabeled.length];
+      if (next.span_id !== fromId || unlabeled.length === 1) {
+        return next;
+      }
+    }
+    return null;
+  }
+
+  function jumpUnlabeled(dir: 1 | -1): void {
+    const next = nextUnlabeledTarget(dir);
+    if (!next) {
+      saveStatus = "No unlabeled clips left";
+      return;
+    }
+    listFilter = "unlabeled";
+    void selectClip(next.span_id);
   }
 
   // --- keyboard -----------------------------------------------------------
@@ -573,6 +636,14 @@
         event.preventDefault();
         moveClip(-1);
         break;
+      case "n":
+        event.preventDefault();
+        jumpUnlabeled(1);
+        break;
+      case "N":
+        event.preventDefault();
+        jumpUnlabeled(-1);
+        break;
       default:
         if (event.key in BEHAVIOR_KEYS) {
           pendingBehavior = BEHAVIOR_KEYS[event.key];
@@ -586,12 +657,19 @@
 
 <div class="label-root">
   <LabelClipList
-    {clips}
+    clips={filteredClips}
     {selectedId}
     loading={listLoading}
     error={listError}
+    filter={listFilter}
+    totalCount={clips.length}
+    labeledCount={labeledClipCount}
+    unlabeledCount={unlabeledClipCount}
+    {selectedPosition}
     onreload={loadClips}
     onselect={(spanId) => void selectClip(spanId)}
+    onfilter={setListFilter}
+    onnextunlabeled={() => jumpUnlabeled(1)}
   />
 
   <section class="stage">

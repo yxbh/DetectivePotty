@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 import asyncio
 import logging
 import math
@@ -12,7 +11,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from detectivepotty.classify.base import ClassifierResult, PottyClassifier
+from detectivepotty.classify.base import PottyClassifier
 from detectivepotty.classify.heuristic import HeuristicPottyClassifier
 from detectivepotty.classify.pose import PosePottyClassifier
 from detectivepotty.config import CameraConfig, Config
@@ -30,24 +29,22 @@ from detectivepotty.pipeline_runtime import (
     StateMachineFactory,
     buffer_window_s as _buffer_window_s,
     call_camera_factory as _call_camera_factory,
-    candidate_mono_bounds as _candidate_mono_bounds,
-    dedupe_frames as _dedupe_frames,
     detect_frames_batched as _detect_frames_batched,
     history_max_frames as _history_max_frames,
     is_live_kind as _is_live_kind,
     is_valid_rtsp_url as _is_valid_rtsp_url,
     live_buffer_max_frames as _live_buffer_max_frames,
-    primary_track as _primary_track,
     redact_url as _redact_url,
     retimestamp_file_frame as _retimestamp_file_frame,
     sample_every as _sample_every,
     source_fps as _source_fps,
 )
+from detectivepotty.pipeline_recording import record_all_pending, record_ready_pending
 from detectivepotty.pose.base import PoseEstimator
 from detectivepotty.pose.factory import build_pose_estimator
 from detectivepotty.pose.gate import PoseGate
 from detectivepotty.pose.keypoints import PoseKeypoints
-from detectivepotty.potty_event import PottyCandidate, PottyEventDetector
+from detectivepotty.potty_event import PottyEventDetector
 from detectivepotty.recording.dataset import camera_dataset_dir
 from detectivepotty.recording.recorder import EventRecorder
 from detectivepotty.recording.retention import enforce_retention
@@ -312,7 +309,7 @@ class PottyPipeline:
                         )
 
                     event_dirs.extend(
-                        self._record_ready_pending(
+                        record_ready_pending(
                             pending,
                             current_wall_ts=frame.wall_ts,
                             buffer=buffer,
@@ -325,7 +322,7 @@ class PottyPipeline:
 
             pending.extend(_PendingCandidate(candidate) for candidate in state_machine.flush())
             event_dirs.extend(
-                self._record_all_pending(
+                record_all_pending(
                     pending,
                     buffer=buffer,
                     history=history,
@@ -516,7 +513,7 @@ class PottyPipeline:
                     flush_live_batch()
 
             event_dirs.extend(
-                self._record_ready_pending(
+                record_ready_pending(
                     pending,
                     current_wall_ts=frame.wall_ts,
                     buffer=buffer,
@@ -532,7 +529,7 @@ class PottyPipeline:
         flush_live_batch()
         pending.extend(_PendingCandidate(candidate) for candidate in state_machine.flush())
         event_dirs.extend(
-            self._record_all_pending(
+            record_all_pending(
                 pending,
                 buffer=buffer,
                 history=history,
@@ -543,126 +540,6 @@ class PottyPipeline:
         )
         enforce_retention(self.config.global_settings.dataset_dir, camera_config)
         return event_dirs
-
-    def _record_ready_pending(
-        self,
-        pending: list[_PendingCandidate],
-        *,
-        current_wall_ts: datetime,
-        buffer: RollingBuffer,
-        history: _FrameHistory,
-        camera_config: CameraConfig,
-        classifier: PottyClassifier,
-        recorder: EventRecorder,
-    ) -> list[Path]:
-        ready: list[_PendingCandidate] = []
-        waiting: list[_PendingCandidate] = []
-        for item in pending:
-            ready_at = item.candidate.end_ts + timedelta(seconds=camera_config.post_roll_s)
-            if current_wall_ts >= ready_at:
-                ready.append(item)
-            else:
-                waiting.append(item)
-        pending[:] = waiting
-        return [
-            path
-            for item in ready
-            if (
-                path := self._record_candidate(
-                    item,
-                    buffer=buffer,
-                    history=history,
-                    camera_config=camera_config,
-                    classifier=classifier,
-                    recorder=recorder,
-                )
-            )
-            is not None
-        ]
-
-    def _record_all_pending(
-        self,
-        pending: list[_PendingCandidate],
-        *,
-        buffer: RollingBuffer,
-        history: _FrameHistory,
-        camera_config: CameraConfig,
-        classifier: PottyClassifier,
-        recorder: EventRecorder,
-    ) -> list[Path]:
-        ready = list(pending)
-        pending.clear()
-        return [
-            path
-            for item in ready
-            if (
-                path := self._record_candidate(
-                    item,
-                    buffer=buffer,
-                    history=history,
-                    camera_config=camera_config,
-                    classifier=classifier,
-                    recorder=recorder,
-                )
-            )
-            is not None
-        ]
-
-    def _record_candidate(
-        self,
-        pending: _PendingCandidate,
-        *,
-        buffer: RollingBuffer,
-        history: _FrameHistory,
-        camera_config: CameraConfig,
-        classifier: PottyClassifier,
-        recorder: EventRecorder,
-    ) -> Path | None:
-        candidate = pending.candidate
-        frames = self._assemble_window(buffer, history, candidate, camera_config)
-        if not frames:
-            LOGGER.warning(
-                "Skipping empty event window for camera %s at %s",
-                sanitize_source_id(camera_config.id),
-                candidate.start_ts.isoformat(),
-            )
-            return None
-
-        classifier_result: ClassifierResult | None = None
-        primary_track = _primary_track(candidate)
-        if primary_track is not None:
-            classifier_result = classifier.classify(primary_track, frames)
-
-        event_dir = recorder.record(
-            candidate,
-            frames,
-            camera_config,
-            classifier_result=classifier_result,
-            protect_meta=pending.protect_meta,
-        )
-        LOGGER.info("Recorded event %s", event_dir)
-        return event_dir
-
-    def _assemble_window(
-        self,
-        buffer: RollingBuffer,
-        history: _FrameHistory,
-        candidate: PottyCandidate,
-        camera_config: CameraConfig,
-    ) -> list[Frame]:
-        frames = EventRecorder.assemble_window(buffer, candidate, camera_config)
-        start_wall = candidate.start_ts - timedelta(seconds=camera_config.pre_roll_s)
-        end_wall = candidate.end_ts + timedelta(seconds=camera_config.post_roll_s)
-        fallback = history.by_wall(start_wall, end_wall)
-        if len(fallback) > len(frames):
-            frames = fallback
-
-        mono_bounds = _candidate_mono_bounds(candidate, camera_config)
-        if mono_bounds is not None:
-            mono_fallback = history.by_mono(*mono_bounds)
-            if len(mono_fallback) > len(frames):
-                frames = mono_fallback
-        return _dedupe_frames(frames)
 
     def _new_detector(self, camera_config: CameraConfig) -> Detector:
         return _call_camera_factory(self.detector_factory, camera_config, self.config)

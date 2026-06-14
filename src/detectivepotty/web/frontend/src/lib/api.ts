@@ -29,7 +29,13 @@ const EVENTS_LIMIT = 200;
 // API backend is unreachable.
 async function errorMessage(response: Response): Promise<string> {
   try {
-    const body = (await response.clone().json()) as { detail?: unknown };
+    const body = (await response.clone().json()) as {
+      detail?: unknown;
+      error?: { message?: unknown };
+    };
+    if (typeof body.error?.message === "string" && body.error.message.trim()) {
+      return body.error.message;
+    }
     if (typeof body.detail === "string" && body.detail.trim()) {
       return body.detail;
     }
@@ -68,13 +74,21 @@ export async function fetchEvents(filters: EventFilters): Promise<EventsPage> {
     params.set("camera", camera);
   }
   const response = await fetch(`/api/events?${params.toString()}`);
-  const events = await jsonOrThrow<EventSummary[]>(response);
-  const header = response.headers.get("X-Unfiltered-Count");
-  const unfilteredTotal = header == null ? null : Number(header);
+  const data = await jsonOrThrow<{
+    events: EventSummary[];
+    total: number;
+    unfiltered_total: number | null;
+    limit: number;
+    offset: number;
+    filters: EventsPage["filters"];
+  }>(response);
   return {
-    events,
-    unfilteredTotal:
-      unfilteredTotal == null || Number.isNaN(unfilteredTotal) ? null : unfilteredTotal,
+    events: data.events,
+    total: data.total,
+    unfilteredTotal: data.unfiltered_total,
+    limit: data.limit,
+    offset: data.offset,
+    filters: data.filters,
   };
 }
 

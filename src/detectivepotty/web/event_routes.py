@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -95,13 +95,12 @@ def register_event_routes(
 
     @app.get("/api/events")
     def list_events(
-        response: Response,
         camera: str | None = None,
         label_status: LabelStatus | None = None,
         date: str | None = None,
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
         offset: Annotated[int, Query(ge=0)] = 0,
-    ) -> list[dict]:
+    ) -> dict:
         records = dataset_index.scan()
         unfiltered_total = len(records)
         summaries = dataset_index.list_summaries(
@@ -112,10 +111,6 @@ def register_event_routes(
         )
         total = len(summaries)
         page = summaries[offset : offset + limit]
-        response.headers["X-Total-Count"] = str(total)
-        response.headers["X-Unfiltered-Count"] = str(unfiltered_total)
-        response.headers["X-Limit"] = str(limit)
-        response.headers["X-Offset"] = str(offset)
         logger.info(
             "served events page=%d filtered=%d total=%d (camera=%s status=%s date=%s)",
             len(page),
@@ -125,7 +120,18 @@ def register_event_routes(
             label_status.value if label_status else None,
             date,
         )
-        return page
+        return {
+            "events": page,
+            "total": total,
+            "unfiltered_total": unfiltered_total,
+            "limit": limit,
+            "offset": offset,
+            "filters": {
+                "camera": camera,
+                "label_status": label_status.value if label_status else None,
+                "date": date,
+            },
+        }
 
     @app.get("/api/stream")
     async def stream_events(request: Request) -> StreamingResponse:
@@ -163,7 +169,7 @@ def register_event_routes(
     def get_crop(event_id: str, name: str) -> FileResponse:
         return _serve_image(dataset_index, event_id, "crops", name)
 
-    @app.get("/api/events/{event_id}/crops_overlay/{name:path}")
+    @app.get("/api/events/{event_id}/crops-overlay/{name:path}")
     def get_crop_overlay(event_id: str, name: str) -> FileResponse:
         return _serve_image(dataset_index, event_id, "crops_overlay", name)
 

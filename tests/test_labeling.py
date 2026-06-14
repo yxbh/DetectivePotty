@@ -418,7 +418,10 @@ def test_api_clip_detail_and_save(tmp_path: Path) -> None:
         json={"ranges": [{**payload["ranges"][0], "behavior": "nope"}]},
     )
     assert bad.status_code == 400
-    assert bad.json()["detail"] == "invalid label payload"
+    assert bad.json()["error"] == {
+        "code": "invalid_label_payload",
+        "message": "invalid label payload",
+    }
 
 
 def test_save_clip_labels_derives_seconds_from_pts_timeline(tmp_path: Path) -> None:

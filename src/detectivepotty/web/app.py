@@ -16,6 +16,7 @@ from detectivepotty.web.event_routes import (
     _event_stream as _event_stream,
     register_event_routes,
 )
+from detectivepotty.web.errors import http_exception_handler
 from detectivepotty.web.label_routes import register_label_routes
 from detectivepotty.web.media import no_store_file_response
 from detectivepotty.web.middleware import ApiNoStoreMiddleware
@@ -27,6 +28,7 @@ from detectivepotty.web.tune_routes import (
 from detectivepotty.web.tune_tracking import (
     ultralytics_tracking_available as _ultralytics_tracking_available,
 )
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
@@ -59,6 +61,7 @@ def create_app(
     dataset_index = DatasetIndex(config.resolve_path(config.global_settings.dataset_dir))
     dogs = list(config.global_settings.dogs)
     app = FastAPI(title="DetectivePotty", version="0.1.0")
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     init_app_state(
         app,
         config,

@@ -97,10 +97,16 @@ def test_events_list_sorting_and_filters(tmp_path: Path) -> None:
     response = client.get("/api/events")
 
     assert response.status_code == 200
-    assert response.headers["x-total-count"] == "2"
-    assert response.headers["x-unfiltered-count"] == "2"
+    assert "x-total-count" not in response.headers
+    assert "x-unfiltered-count" not in response.headers
     assert response.headers["cache-control"] == "no-store"
-    events = response.json()
+    body = response.json()
+    assert body["total"] == 2
+    assert body["unfiltered_total"] == 2
+    assert body["limit"] == 100
+    assert body["offset"] == 0
+    assert body["filters"] == {"camera": None, "label_status": None, "date": None}
+    events = body["events"]
     assert [event["event_id"] for event in events] == ["newer", "older"]
     assert events[0]["camera"] == "Sideyard"
     assert "dog" in events[0]
@@ -114,16 +120,22 @@ def test_events_list_sorting_and_filters(tmp_path: Path) -> None:
     assert events[0]["relative_dir"].startswith("Sideyard/2026-06-06/events/")
 
     unlabeled = client.get("/api/events", params={"label_status": "unlabeled"})
-    assert [event["event_id"] for event in unlabeled.json()] == ["older"]
+    assert unlabeled.json()["total"] == 1
+    assert unlabeled.json()["filters"]["label_status"] == "unlabeled"
+    assert [event["event_id"] for event in unlabeled.json()["events"]] == ["older"]
 
     by_camera = client.get("/api/events", params={"camera": "Sideyard"})
-    assert [event["event_id"] for event in by_camera.json()] == ["newer"]
+    assert by_camera.json()["filters"]["camera"] == "Sideyard"
+    assert [event["event_id"] for event in by_camera.json()["events"]] == ["newer"]
 
     by_date = client.get("/api/events", params={"date": "2026-06-06"})
-    assert [event["event_id"] for event in by_date.json()] == ["newer", "older"]
+    assert by_date.json()["filters"]["date"] == "2026-06-06"
+    assert [event["event_id"] for event in by_date.json()["events"]] == ["newer", "older"]
 
     paged = client.get("/api/events", params={"limit": 1, "offset": 1})
-    assert [event["event_id"] for event in paged.json()] == ["older"]
+    assert paged.json()["limit"] == 1
+    assert paged.json()["offset"] == 1
+    assert [event["event_id"] for event in paged.json()["events"]] == ["older"]
 
 
 def test_events_api_anchors_relative_dataset_to_config_dir(tmp_path: Path) -> None:
@@ -144,7 +156,7 @@ global:
 
     response = client.get("/api/events")
     assert response.status_code == 200
-    assert [event["event_id"] for event in response.json()] == ["a"]
+    assert [event["event_id"] for event in response.json()["events"]] == ["a"]
 
 
 def test_event_detail_and_media_serving_block_traversal(tmp_path: Path) -> None:
@@ -201,14 +213,14 @@ def test_event_detail_exposes_pose_overlay_media(tmp_path: Path) -> None:
     assert [item["name"] for item in detail["media"]["crops_overlay"]] == ["000.jpg"]
     assert (
         detail["media"]["crops_overlay"][0]["url"]
-        == "/api/events/event-pose/crops_overlay/000.jpg"
+        == "/api/events/event-pose/crops-overlay/000.jpg"
     )
 
-    overlay_response = client.get("/api/events/event-pose/crops_overlay/000.jpg")
+    overlay_response = client.get("/api/events/event-pose/crops-overlay/000.jpg")
     assert overlay_response.status_code == 200
     assert overlay_response.content == overlay_bytes
 
-    traversal = client.get("/api/events/event-pose/crops_overlay/..%2f..%2fmetadata.json")
+    traversal = client.get("/api/events/event-pose/crops-overlay/..%2f..%2fmetadata.json")
     assert traversal.status_code in {400, 404}
 
 

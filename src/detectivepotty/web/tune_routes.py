@@ -922,7 +922,6 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/tune/detect_range", include_in_schema=False)
     @app.get("/api/tune/detect-range")
     async def tune_detect_range(
         path: str,
@@ -959,7 +958,6 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/tune/track_range", include_in_schema=False)
     @app.get("/api/tune/track-range")
     async def tune_track_range(
         path: str,
@@ -1042,7 +1040,6 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.get("/api/tune/track_range_stream", include_in_schema=False)
     @app.get("/api/tune/track-range-stream")
     async def tune_track_range_stream(
         path: str,
@@ -1159,7 +1156,6 @@ def register_tune_routes(
         except (FileNotFoundError, IndexError) as exc:
             raise HTTPException(status_code=404, detail="frame not available") from exc
 
-    @app.post("/api/tune/pose_range", include_in_schema=False)
     @app.post("/api/tune/pose-range")
     async def tune_pose_range(req: TunePoseRangeRequest) -> dict:
         """Batched pose for a run of frames' buffered boxes — one GPU forward.

@@ -132,7 +132,7 @@ def test_pipeline_records_event_and_web_app_labels_it(tmp_path: Path) -> None:
     client = TestClient(create_app(config))
     list_response = client.get("/api/events")
     assert list_response.status_code == 200
-    events = list_response.json()
+    events = list_response.json()["events"]
     assert len(events) == 1
     assert events[0]["event_id"] == event_id
     assert events[0]["label_status"] == "unlabeled"

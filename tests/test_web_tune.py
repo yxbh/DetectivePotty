@@ -685,7 +685,7 @@ def test_tune_detect_range_caps_count_to_batch_size(tmp_path: Path) -> None:
     client = TestClient(create_app(config, tune_detector=detector))
 
     ranged = client.get(
-        "/api/tune/detect_range",
+        "/api/tune/detect-range",
         params={"path": str(clip), "start": 0, "count": 50},
     ).json()
     # The request asked for 50 but the configured cap is 5.
@@ -699,7 +699,7 @@ def test_tune_detect_range_clamps_at_eof(tmp_path: Path) -> None:
     client = TestClient(create_app(make_config(tmp_path, clip), tune_detector=detector))
 
     ranged = client.get(
-        "/api/tune/detect_range",
+        "/api/tune/detect-range",
         params={"path": str(clip), "start": 4, "count": 8},
     ).json()
     # Only frames 4 and 5 exist; the run stops at EOF rather than erroring.
@@ -712,7 +712,7 @@ def test_tune_detect_range_falls_back_without_detect_batch(tmp_path: Path) -> No
     clip = write_clip(tmp_path / "c.mp4", frames=8)
     client = make_client(tmp_path, clip)
     ranged = client.get(
-        "/api/tune/detect_range",
+        "/api/tune/detect-range",
         params={"path": str(clip), "start": 0, "count": 3},
     ).json()
     assert [f["index"] for f in ranged["frames"]] == [0, 1, 2]
@@ -724,10 +724,42 @@ def test_tune_detect_range_rejects_unknown_model(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.get(
-        "/api/tune/detect_range",
+        "/api/tune/detect-range",
         params={"path": str(clip), "start": 0, "count": 2, "model": "models/bogus.pt"},
     )
     assert resp.status_code == 400
+
+
+def test_tune_snake_case_range_aliases_are_removed(tmp_path: Path) -> None:
+    clip = write_clip(tmp_path / "c.mp4")
+    client = make_client(tmp_path, clip)
+
+    assert (
+        client.get(
+            "/api/tune/detect_range",
+            params={"path": str(clip), "start": 0, "count": 1},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/api/tune/track_range",
+            params={"path": str(clip), "start": 0, "count": 1},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/api/tune/track_range_stream",
+            params={"path": str(clip), "start": 0, "count": 1},
+        ).status_code
+        == 404
+    )
+    pose_alias = client.post(
+        "/api/tune/pose_range",
+        json={"path": str(clip), "frames": [{"index": 0, "boxes": []}]},
+    )
+    assert pose_alias.status_code in {404, 405}
 
 
 # --- tracking (track_detections + /api/tune/track-range) ------------------
@@ -837,7 +869,7 @@ def test_track_range_endpoint_falls_back_without_detect_batch(tmp_path: Path) ->
     clip = write_clip(tmp_path / "c.mp4", frames=16)
     client = make_client(tmp_path, clip)
     body = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
     ).json()
     assert [f["index"] for f in body["frames"]] == [0, 5, 10, 15]
@@ -848,7 +880,7 @@ def test_track_range_endpoint_rejects_unknown_model(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "start": 0, "count": 4, "model": "models/bogus.pt"},
     )
     assert resp.status_code == 400
@@ -902,7 +934,7 @@ def test_track_range_default_tracker_is_ours(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4", frames=16)
     client = make_client(tmp_path, clip)
     body = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
     ).json()
     assert body["stats"]["tracker"] == "ours"
@@ -912,7 +944,7 @@ def test_track_range_rejects_unknown_tracker(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "count": 4, "tracker": "nope"},
     )
     assert resp.status_code == 400
@@ -925,7 +957,7 @@ def test_track_range_ultralytics_requires_pt_model(tmp_path: Path) -> None:
     client = make_client(tmp_path, clip)
     client.app.state.tune_models.append("models/yolo11m.mlpackage")
     resp = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={
             "path": str(clip),
             "count": 4,
@@ -934,7 +966,7 @@ def test_track_range_ultralytics_requires_pt_model(tmp_path: Path) -> None:
         },
     )
     assert resp.status_code == 400
-    assert ".pt" in resp.json()["detail"]
+    assert ".pt" in resp.json()["error"]["message"]
 
 
 def test_track_range_ultralytics_unavailable_returns_400(
@@ -948,11 +980,11 @@ def test_track_range_ultralytics_unavailable_returns_400(
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "count": 4, "tracker": "bytetrack"},
     )
     assert resp.status_code == 400
-    assert "lap" in resp.json()["detail"]
+    assert "lap" in resp.json()["error"]["message"]
 
 
 def test_track_range_ultralytics_params_drive_track_call_and_yaml(
@@ -1022,7 +1054,7 @@ def test_track_range_ultralytics_params_drive_track_call_and_yaml(
         "proximity_thresh": 0.44,
         "appearance_thresh": 0.22,
     }
-    resp = client.get("/api/tune/track_range", params=params)
+    resp = client.get("/api/tune/track-range", params=params)
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
@@ -1042,7 +1074,7 @@ def test_track_range_ultralytics_params_drive_track_call_and_yaml(
     assert body["stats"]["ultralytics"]["conf"] == pytest.approx(0.12)
     assert body["stats"]["ultralytics"]["with_reid"] is True
 
-    stream = client.get("/api/tune/track_range_stream", params=params)
+    stream = client.get("/api/tune/track-range-stream", params=params)
     assert stream.status_code == 200, stream.text
     done = _read_ndjson(stream)[-1]
     assert done["type"] == "done"
@@ -1059,8 +1091,8 @@ def test_track_range_ultralytics_param_validation(tmp_path: Path) -> None:
         "tracker": "bytetrack",
         "ultra_conf": 1.5,
     }
-    assert client.get("/api/tune/track_range", params=params).status_code == 422
-    assert client.get("/api/tune/track_range_stream", params=params).status_code == 422
+    assert client.get("/api/tune/track-range", params=params).status_code == 422
+    assert client.get("/api/tune/track-range-stream", params=params).status_code == 422
 
 
 # --- track_range_stream (NDJSON forward-fill) -----------------------------
@@ -1096,7 +1128,7 @@ def test_track_range_stream_emits_frames_then_done(tmp_path: Path) -> None:
 
     # Draining-parity: the streamed frames + done.stats match the non-streaming call.
     non_stream = client.get(
-        "/api/tune/track_range",
+        "/api/tune/track-range",
         params={"path": str(clip), "start": 0, "count": 16, "sample_every": 5},
     ).json()
     assert streamed_frames == non_stream["frames"]
@@ -1108,7 +1140,7 @@ def test_track_range_stream_rejects_unknown_tracker(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.get(
-        "/api/tune/track_range_stream",
+        "/api/tune/track-range-stream",
         params={"path": str(clip), "count": 4, "tracker": "nope"},
     )
     assert resp.status_code == 400
@@ -1119,7 +1151,7 @@ def test_track_range_stream_ultralytics_requires_pt_model(tmp_path: Path) -> Non
     client = make_client(tmp_path, clip)
     client.app.state.tune_models.append("models/yolo11m.mlpackage")
     resp = client.get(
-        "/api/tune/track_range_stream",
+        "/api/tune/track-range-stream",
         params={
             "path": str(clip),
             "count": 4,
@@ -1128,7 +1160,7 @@ def test_track_range_stream_ultralytics_requires_pt_model(tmp_path: Path) -> Non
         },
     )
     assert resp.status_code == 400
-    assert ".pt" in resp.json()["detail"]
+    assert ".pt" in resp.json()["error"]["message"]
 
 
 def test_track_range_stream_ultralytics_unavailable_returns_400(
@@ -1140,11 +1172,11 @@ def test_track_range_stream_ultralytics_unavailable_returns_400(
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.get(
-        "/api/tune/track_range_stream",
+        "/api/tune/track-range-stream",
         params={"path": str(clip), "count": 4, "tracker": "bytetrack"},
     )
     assert resp.status_code == 400
-    assert "lap" in resp.json()["detail"]
+    assert "lap" in resp.json()["error"]["message"]
 
 
 class _BatchRecordingEstimator(MockPoseEstimator):
@@ -1233,7 +1265,7 @@ def test_tune_pose_range_single_estimate_batch_across_frames(tmp_path: Path) -> 
     )
     box = [[10.0, 10.0, 80.0, 90.0]]
     body = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={"path": str(clip), "frames": [{"index": i, "boxes": box} for i in (0, 1, 2)]},
     ).json()
     assert len(body["frames"]) == 3
@@ -1245,7 +1277,7 @@ def test_tune_pose_range_skips_degenerate_boxes_without_misalign(tmp_path: Path)
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     body = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={
             "path": str(clip),
             "frames": [
@@ -1269,7 +1301,7 @@ def test_tune_pose_range_caps_frames_by_batch_size(tmp_path: Path) -> None:
     )
     box = [[10.0, 10.0, 80.0, 90.0]]
     body = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={"path": str(clip), "frames": [{"index": i, "boxes": box} for i in range(4)]},
     ).json()
     assert [f["index"] for f in body["frames"]] == [0, 1]  # capped to 2 frames
@@ -1291,7 +1323,7 @@ def test_tune_pose_range_caps_total_crops(tmp_path: Path) -> None:
     almost_full = [[10.0, 10.0, 80.0, 90.0]] * (TUNE_POSE_MAX_CROPS - 1)
     full_boxes = [[20.0, 20.0, 90.0, 100.0]] * TUNE_POSE_MAX_CROPS
     body = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={
             "path": str(clip),
             "frames": [
@@ -1313,7 +1345,7 @@ def test_tune_pose_range_unavailable_without_estimator(tmp_path: Path) -> None:
     client = make_client(tmp_path, clip, with_pose=False)
     client.app.state.tune_pose_resolved = (None, False)
     body = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={
             "path": str(clip),
             "frames": [{"index": 0, "boxes": [[10, 10, 80, 90]]}, {"index": 1, "boxes": []}],
@@ -1340,7 +1372,7 @@ def test_tune_pose_range_failure_does_not_disable_pose(tmp_path: Path) -> None:
     )
 
     body = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={"path": str(clip), "frames": [{"index": 0, "boxes": [[10, 10, 80, 90]]}]},
     ).json()
 
@@ -1352,7 +1384,7 @@ def test_tune_pose_range_rejects_invalid_path(tmp_path: Path) -> None:
     clip = write_clip(tmp_path / "c.mp4")
     client = make_client(tmp_path, clip)
     resp = client.post(
-        "/api/tune/pose_range",
+        "/api/tune/pose-range",
         json={"path": "/etc/passwd", "frames": [{"index": 0, "boxes": [[0, 0, 1, 1]]}]},
     )
     assert resp.status_code == 400

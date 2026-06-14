@@ -44,7 +44,15 @@ export interface EventDetail {
 
 export interface EventsPage {
   events: EventSummary[];
+  total: number;
   unfilteredTotal: number | null;
+  limit: number;
+  offset: number;
+  filters: {
+    camera: string | null;
+    label_status: string | null;
+    date: string | null;
+  };
 }
 
 export interface EventFilters {

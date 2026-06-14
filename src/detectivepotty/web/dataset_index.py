@@ -374,7 +374,11 @@ def fixed_media_path(
 
 
 def media_url(event_id: str, kind: str, name: str) -> str:
-    path_kind = kind if kind in {"frames", "crops", "crops_overlay"} else "crops"
+    path_kind = {
+        "frames": "frames",
+        "crops": "crops",
+        "crops_overlay": "crops-overlay",
+    }.get(kind, "crops")
     return f"/api/events/{quote(event_id, safe='')}/{path_kind}/{quote(name, safe='')}"
 
 

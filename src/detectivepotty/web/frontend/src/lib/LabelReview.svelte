@@ -20,6 +20,7 @@
   import { formatClock } from "./format";
   import { BOX_DOG, BOX_SIBLING, boxLabelFontPx, formatDetLabel, formatTrackLabel, isAliasClass } from "./overlayStyle";
   import { observeResize } from "./resize";
+  import LabelClipList from "./LabelClipList.svelte";
   import Transport from "./Transport.svelte";
 
   const BEHAVIOR_KEYS: Record<string, string> = {
@@ -115,36 +116,6 @@
   // on screen regardless of source resolution (overlay scales uniformly).
   const labelFont = $derived(detail ? boxLabelFontPx(Math.max(detail.width, detail.height)) : 14);
   const isAlias = isAliasClass;
-
-  // Group the clip list into scenes (siblings clustered, first-appearance order).
-  interface ClipGroup {
-    key: string;
-    scene: string | null;
-    size: number;
-    camera: string | null;
-    items: LabelClipSummary[];
-  }
-  const clipGroups = $derived.by<ClipGroup[]>(() => {
-    const groups: ClipGroup[] = [];
-    const byKey = new Map<string, ClipGroup>();
-    for (const c of clips) {
-      const key = c.scene_size > 1 && c.scene_id ? `scene:${c.scene_id}` : `solo:${c.span_id}`;
-      let g = byKey.get(key);
-      if (!g) {
-        g = {
-          key,
-          scene: c.scene_size > 1 ? c.scene_id : null,
-          size: c.scene_size,
-          camera: c.camera_name,
-          items: [],
-        };
-        byKey.set(key, g);
-        groups.push(g);
-      }
-      g.items.push(c);
-    }
-    return groups;
-  });
 
   const dogKeyHint = $derived.by<Record<string, string>>(() => {
     const map: Record<string, string> = {};
@@ -608,66 +579,14 @@
 <svelte:window onkeydown={onKey} />
 
 <div class="label-root">
-  <aside class="clip-list">
-    <div class="list-head">
-      <h2>Harvested clips</h2>
-      <button type="button" class="ghost" onclick={() => void loadClips()} title="Reload clip list">↻</button>
-    </div>
-    {#if listLoading}
-      <p class="muted pad">Loading clips…</p>
-    {:else if listError}
-      <p class="error pad">{listError}</p>
-    {:else if clips.length === 0}
-      <p class="muted pad">
-        No harvested clips found. Run <code>detectivepotty harvest</code> to populate the
-        harvest dir.
-      </p>
-    {:else}
-      {#each clipGroups as group (group.key)}
-        {#if group.scene}
-          <div class="scene-head" title="Same camera + overlapping time window — {group.size} detection segments (often the same dog re-detected after the tracker lost it, not confirmed separate dogs). Label each on its own clip.">
-            <span class="scene-cam">{group.camera ?? "camera"}</span>
-            <span class="scene-when">{formatClock(group.items[0].span_start_utc)}</span>
-            <span class="scene-badge">×{group.size} segments</span>
-          </div>
-        {/if}
-        <ul class:scene-group={group.scene}>
-          {#each group.items as clip (clip.span_id)}
-            <li>
-              <button
-                type="button"
-                class:active={clip.span_id === selectedId}
-                onclick={() => void selectClip(clip.span_id)}
-                title={`${clip.camera_name ?? clip.camera_id ?? "unknown camera"}\n${clip.source_id}\n${formatClock(clip.span_start_utc)} → ${formatClock(clip.span_end_utc)}`}
-              >
-                <span class="row1">
-                  <span class="cam">{clip.camera_name ?? clip.camera_id ?? clip.source_id}</span>
-                  <span class="badge" class:done={clip.labeled} title={clip.labeled ? `${clip.n_trainable_ranges} trainable / ${clip.n_ranges} ranges` : "Not labeled yet"}>
-                    {clip.labeled ? `✓${clip.n_trainable_ranges}` : "·"}
-                  </span>
-                </span>
-                <span class="row2">
-                  <span class="when" title="Clip start (local time)">{formatClock(clip.span_start_utc)}</span>
-                  <span class="dur" title="Clip duration">{clip.duration_s.toFixed(1)}s</span>
-                  <span class="trk" title="Track segment this clip follows — its boxes/labels bind to this track">T{clip.track_id ?? "?"}</span>
-                </span>
-                {#if clip.labeled && (clip.behaviors.length || clip.dogs.length)}
-                  <span class="row3">
-                    {#each clip.behaviors as b (b)}
-                      <span class="chip b-{b}">{b}</span>
-                    {/each}
-                    {#each clip.dogs as d (d)}
-                      <span class="chip dog">{d}</span>
-                    {/each}
-                  </span>
-                {/if}
-              </button>
-            </li>
-          {/each}
-        </ul>
-      {/each}
-    {/if}
-  </aside>
+  <LabelClipList
+    {clips}
+    {selectedId}
+    loading={listLoading}
+    error={listError}
+    onreload={loadClips}
+    onselect={(spanId) => void selectClip(spanId)}
+  />
 
   <section class="stage">
     {#if detailLoading}
@@ -970,123 +889,6 @@
     height: 100%;
     min-height: 0;
   }
-  .clip-list {
-    border-right: 1px solid var(--line-strong);
-    overflow-y: auto;
-    min-height: 0;
-  }
-  .list-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.4rem 0.6rem;
-    position: sticky;
-    top: 0;
-    background: var(--bg, #0c1018);
-    border-bottom: 1px solid var(--line-strong);
-    z-index: 1;
-  }
-  .list-head h2 {
-    font-size: 0.78rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin: 0;
-    color: var(--text-dim);
-  }
-  .clip-list ul {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-  }
-  .scene-head {
-    display: flex;
-    align-items: baseline;
-    gap: 0.4rem;
-    padding: 0.3rem 0.6rem 0.15rem;
-    font-size: 0.68rem;
-    color: var(--text-dim);
-    border-top: 1px solid var(--line-strong);
-  }
-  .scene-cam { font-weight: 600; color: #b9c6d6; }
-  .scene-when { margin-left: auto; }
-  .scene-badge {
-    background: #3a2c12;
-    color: #f0c869;
-    border-radius: 999px;
-    padding: 0.02rem 0.4rem;
-  }
-  ul.scene-group {
-    border-left: 2px solid #3a2c12;
-    margin-left: 0.35rem;
-  }
-  .clip-list li { margin: 0; }
-  .clip-list li button {
-    display: flex;
-    flex-direction: column;
-    gap: 0.12rem;
-    width: 100%;
-    text-align: left;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--line-strong);
-    color: inherit;
-    padding: 0.32rem 0.6rem;
-    cursor: pointer;
-  }
-  .clip-list li button:hover { background: var(--hover, #131c28); }
-  .clip-list li button.active {
-    background: var(--hover, #16202e);
-    box-shadow: inset 3px 0 0 var(--amber);
-  }
-  .row1 {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.4rem;
-  }
-  .cam {
-    font-size: 0.82rem;
-    font-weight: 600;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .row2 {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    font-size: 0.7rem;
-    color: var(--text-dim);
-  }
-  .row2 .trk { margin-left: auto; }
-  .row3 {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.2rem;
-    margin-top: 0.1rem;
-  }
-  .chip {
-    font-size: 0.62rem;
-    padding: 0.02rem 0.32rem;
-    border-radius: 4px;
-    background: var(--bg-3);
-    color: var(--text-dim);
-  }
-  .chip.b-pee { background: #f1cf5b; color: #1a1204; }
-  .chip.b-poop { background: #c08a55; color: #1a1204; }
-  .chip.b-not_potty { background: #3a4150; color: var(--text); }
-  .chip.b-excluded { background: #5a2f42; color: #fdd; }
-  .chip.dog { background: #2f5d4a; color: #dfe; }
-  .badge {
-    font-size: 0.66rem;
-    padding: 0.03rem 0.38rem;
-    border-radius: 999px;
-    background: var(--bg-3);
-    color: var(--text-dim);
-    flex: none;
-  }
-  .badge.done { background: #1f7a3f; color: #d6ffe2; }
-
   .stage {
     display: grid;
     grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.85fr);
@@ -1445,20 +1247,6 @@
   .muted { color: var(--text-dim); }
   .error { color: #ff6b6b; }
   .ok { color: var(--green); }
-  .ghost {
-    background: transparent;
-    border: 1px solid var(--line-strong);
-    color: inherit;
-    border-radius: 6px;
-    cursor: pointer;
-    padding: 0.12rem 0.38rem;
-  }
-  code {
-    background: var(--bg-3);
-    padding: 0.05rem 0.3rem;
-    border-radius: 4px;
-    font-size: 0.85em;
-  }
 
   @media (max-width: 1100px) {
     .stage { grid-template-columns: 1fr; overflow-y: auto; }

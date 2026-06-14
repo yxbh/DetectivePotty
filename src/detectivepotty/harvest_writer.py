@@ -15,12 +15,17 @@ import numpy as np
 
 from detectivepotty.events import _jsonify
 from detectivepotty.harvest_spans import DogSpan, HarvestResult, make_span_id
+from detectivepotty.timeline import (
+    TIME_BASIS_CLIP_FRAMES,
+    TIME_BASIS_CLIP_PTS,
+    clip_frame_times,
+)
 from detectivepotty.video_encode import open_h264_writer
 
 CLIP_NAME = "clip.mp4"
 METADATA_NAME = "metadata.json"
 SCHEMA_VERSION = "harvest-1.1"
-TIME_BASIS_CLIP_FRAMES = "clip_frames"
+PTS_SCHEMA_VERSION = "harvest-1.2"
 
 
 class ClipWriter(Protocol):
@@ -45,6 +50,7 @@ def write_spans(
     fps: float,
     source_id: str,
     source_start_utc: datetime,
+    source_frame_times_s: Sequence[float] | None = None,
     sample_every: int,
     camera_name: str | None = None,
     detect_conf: float | None = None,
@@ -83,6 +89,11 @@ def write_spans(
             fps=fps,
             width=width,
             height=height,
+            frame_times_s=clip_frame_times(
+                source_frame_times_s,
+                span.start_frame,
+                span.end_frame,
+            ),
             sample_every=sample_every,
             camera_name=camera_name,
             detect_conf=detect_conf,
@@ -238,6 +249,7 @@ def write_clip_metadata(
     fps: float,
     width: int,
     height: int,
+    frame_times_s: Sequence[float] | None = None,
     sample_every: int,
     camera_name: str | None = None,
     detect_conf: float | None = None,
@@ -246,6 +258,11 @@ def write_clip_metadata(
     del source_path
     source_span_start_utc = source_start_utc + timedelta(seconds=span.start_s)
     source_span_end_utc = source_start_utc + timedelta(seconds=span.end_s)
+    normalized_frame_times = (
+        [round(float(value), 9) for value in frame_times_s]
+        if frame_times_s is not None
+        else None
+    )
 
     detections: list[dict[str, Any]] = []
     for sample in sorted(span.samples, key=lambda s: s.frame_idx):
@@ -262,7 +279,9 @@ def write_clip_metadata(
         )
 
     payload: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": PTS_SCHEMA_VERSION
+        if normalized_frame_times
+        else SCHEMA_VERSION,
         "span_id": span_id,
         "source_id": source_id,
         "source_path": source_id,
@@ -276,7 +295,9 @@ def write_clip_metadata(
         "frame_count": span.frame_count,
         "width": width,
         "height": height,
-        "timebase": TIME_BASIS_CLIP_FRAMES,
+        "timebase": TIME_BASIS_CLIP_PTS
+        if normalized_frame_times
+        else TIME_BASIS_CLIP_FRAMES,
         "sample_every": sample_every,
         "track_id": span.track_id,
         "source_start_frame": span.start_frame,
@@ -286,6 +307,8 @@ def write_clip_metadata(
         "detections": detections,
         "checksum": sha256_file(clip_dir / CLIP_NAME),
     }
+    if normalized_frame_times:
+        payload["frame_times_s"] = normalized_frame_times
 
     target = clip_dir / METADATA_NAME
     tmp = target.parent / f".metadata.{os.getpid()}.{os.urandom(6).hex()}.tmp"

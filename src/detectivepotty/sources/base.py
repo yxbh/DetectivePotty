@@ -50,6 +50,7 @@ class Frame:
     mono_ts: float
     wall_ts: datetime
     source_id: str
+    source_time_s: float | None = None
     width: int = 0
     height: int = 0
 

@@ -15,6 +15,7 @@ from detectivepotty.dataset_export import (
 from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox
 from detectivepotty.labels import Behavior, ClipLabels, Dog, LabelRange, save_labels
+from detectivepotty.timeline import FrameTimeline
 
 
 # --- pure helpers -----------------------------------------------------------
@@ -34,6 +35,15 @@ def test_sample_range_frames_caps_and_thins() -> None:
 
 def test_sample_range_frames_always_returns_first() -> None:
     assert sample_range_frames(7, 7, fps=10.0, stride_s=5.0, max_frames=40) == [7]
+
+
+def test_sample_range_frames_uses_pts_timeline() -> None:
+    timeline = FrameTimeline.from_frame_times([0.0, 0.1, 0.4, 0.45, 1.0], fps=10.0)
+
+    assert (
+        sample_range_frames(0, 4, fps=10.0, stride_s=0.3, max_frames=40, timeline=timeline)
+        == [0, 2, 4]
+    )
 
 
 def test_assign_split_is_deterministic_and_partitions() -> None:
@@ -210,3 +220,35 @@ def test_export_dataset_drops_unmatched_track(tmp_path: Path) -> None:
 
     assert stats.crops_written == 0
     assert stats.dropped_unmatched > 0
+
+
+def test_export_dataset_samples_vfr_ranges_by_timeline(tmp_path: Path) -> None:
+    clips_root = tmp_path / "harvest"
+    clip_dir = clips_root / "span_vfr"
+    _write_clip(clip_dir)
+    meta = json.loads((clip_dir / "metadata.json").read_text())
+    meta["frame_count"] = 5
+    meta["frame_times_s"] = [0.0, 0.1, 0.4, 0.45, 1.0]
+    meta["detections"] = [
+        {**meta["detections"][0], "clip_frame_idx": i, "source_frame_idx": i}
+        for i in range(5)
+    ]
+    (clip_dir / "metadata.json").write_text(json.dumps(meta))
+    save_labels(
+        ClipLabels(
+            ranges=[LabelRange(0, 4, 0.0, 1.0, behavior=Behavior.PEE, track_id="1")]
+        ),
+        clip_dir,
+    )
+
+    stats = export_dataset(
+        clips_root,
+        tmp_path / "export",
+        detector=FixedBoxDetector(),
+        sample_stride_s=0.3,
+        max_frames_per_range=40,
+        val_fraction=0.0,
+        capture_factory=lambda _p: FakeExportCapture(10),
+    )
+
+    assert stats.crops_written == 3

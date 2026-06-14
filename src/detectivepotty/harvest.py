@@ -63,6 +63,7 @@ from detectivepotty.harvest_writer import (
 from detectivepotty.sources.base import sanitize_source_id
 from detectivepotty.sources.file import derive_base_wall_ts
 from detectivepotty.sources.pyav_capture import open_capture
+from detectivepotty.timeline import FrameTimeline
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ def harvest_clips(
     if source_id is None:
         source_id = sanitize_source_id(str(input_path))
 
-    fps, total_frames, presence = _scan_for_dogs(
+    scan = _scan_for_dogs(
         input_path,
         detector=detector,
         sample_every=sample_every,
@@ -172,14 +173,22 @@ def harvest_clips(
         detect_batch_size=detect_batch_size,
         capture_factory=capture_factory,
     )
+    fps = scan.fps
+    total_frames = scan.total_frames
     if total_frames == 0:
         logger.warning("harvest: no frames decoded from %s", input_path)
         return []
+    timeline = FrameTimeline(
+        fps=fps,
+        frame_count=total_frames,
+        frame_times_s=scan.frame_times_s,
+    )
 
     spans = compute_spans(
-        presence,
+        scan.presence,
         fps=fps,
         total_frames=total_frames,
+        timeline=timeline,
         merge_gap_s=merge_gap_s,
         pad_s=pad_s,
         min_len_s=min_len_s,
@@ -196,6 +205,7 @@ def harvest_clips(
         fps=fps,
         source_id=source_id,
         source_start_utc=source_start_utc,
+        source_frame_times_s=scan.frame_times_s,
         sample_every=sample_every,
         camera_name=camera_name,
         detect_conf=detect_conf,

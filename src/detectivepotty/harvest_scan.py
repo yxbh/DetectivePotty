@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -13,6 +14,7 @@ from detectivepotty.detect.yolo import FrameMeta
 from detectivepotty.events import Detection
 from detectivepotty.harvest_spans import FrameSample
 from detectivepotty.sources.prefetch import prefetch
+from detectivepotty.timeline import maybe_pts_times
 from detectivepotty.tracking import Tracker
 
 # Sampled frames are detected in one batched forward when the detector exposes
@@ -37,6 +39,14 @@ class DetectorLike(Protocol):
     ) -> list[Detection]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ScanResult:
+    fps: float
+    total_frames: int
+    presence: dict[str, list[FrameSample]]
+    frame_times_s: tuple[float, ...] | None = None
+
+
 def scan_for_dogs(
     input_path: Path,
     *,
@@ -47,7 +57,7 @@ def scan_for_dogs(
     center_dist_gate: float = 0.0,
     detect_batch_size: int = DEFAULT_DETECT_BATCH_SIZE,
     capture_factory: Callable[[str], Any],
-) -> tuple[float, int, dict[str, list[FrameSample]]]:
+) -> ScanResult:
     capture = capture_factory(str(input_path))
     if not _capture_opened(capture):
         _release(capture)
@@ -60,13 +70,27 @@ def scan_for_dogs(
         center_dist_gate=center_dist_gate,
     )
     presence: dict[str, list[FrameSample]] = {}
+    frame_times: list[float] = []
+    first_frame_time_s: float | None = None
+
+    def _frame_time_s(frame_idx: int) -> float:
+        nonlocal first_frame_time_s
+        value = _capture_value(capture, cv2.CAP_PROP_POS_MSEC)
+        if value is not None or frame_idx == 0:
+            raw_s = 0.0 if value is None else value / 1000.0
+            if first_frame_time_s is None:
+                first_frame_time_s = raw_s
+            return max(0.0, raw_s - first_frame_time_s)
+        return frame_idx / fps
 
     def _decode_frames():
+        frame_idx = 0
         while True:
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
-            yield frame
+            yield frame, _frame_time_s(frame_idx)
+            frame_idx += 1
 
     # Feed one sampled frame's detections through the tracker and record presence.
     # Detections are per-image-independent, so replaying a batch's results in
@@ -74,7 +98,7 @@ def scan_for_dogs(
     # per-frame path -- batching only changes how the forward pass is issued.
     def _ingest(frame_idx: int, detections: list[Detection]) -> None:
         tracks = tracker.update(list(detections))
-        time_s = frame_idx / fps
+        time_s = frame_times[frame_idx] if frame_idx < len(frame_times) else frame_idx / fps
         for track in tracks:
             latest = latest_detection_at(track, frame_idx)
             if latest is None:
@@ -113,7 +137,8 @@ def scan_for_dogs(
         # an inference-bound one. Tracking stays sequential on this thread, and
         # sampled frames are detected in batches of ``batch_size`` (when the
         # detector supports it) so the accelerator runs one forward per batch.
-        for frame in prefetch(_decode_frames()):
+        for frame, frame_time_s in prefetch(_decode_frames()):
+            frame_times.append(frame_time_s)
             if decoded_idx % sample_every == 0:
                 if use_batch:
                     pending_frames.append(frame)
@@ -129,7 +154,12 @@ def scan_for_dogs(
     finally:
         _release(capture)
 
-    return fps, decoded_idx, presence
+    return ScanResult(
+        fps=fps,
+        total_frames=decoded_idx,
+        presence=presence,
+        frame_times_s=maybe_pts_times(frame_times, fps),
+    )
 
 
 def latest_detection_at(track: Any, frame_idx: int) -> Detection | None:

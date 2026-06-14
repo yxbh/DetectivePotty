@@ -289,6 +289,7 @@ export interface LabelClipSummary {
   span_end_utc: string | null;
   fps: number;
   frame_count: number;
+  frame_times_s: number[] | null;
   width: number;
   height: number;
   duration_s: number;

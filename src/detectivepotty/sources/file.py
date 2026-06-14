@@ -160,6 +160,7 @@ class FileSource(VideoSource):
         self._resolution: tuple[int, int] | None = None
         self._base_wall_ts: datetime | None = None
         self._time_basis: str | None = None
+        self._first_source_time_s: float | None = None
         self._frame_idx = 0
         self._decoded_idx = 0
         self._next_emit_s = 0.0
@@ -187,6 +188,7 @@ class FileSource(VideoSource):
             self._base_wall_ts, self._time_basis = derive_base_wall_ts(self.path)
         self._frame_idx = 0
         self._decoded_idx = 0
+        self._first_source_time_s = None
         self._next_emit_s = 0.0
         return self
 
@@ -207,13 +209,15 @@ class FileSource(VideoSource):
             frame_idx = self._frame_idx
             self._frame_idx += 1
             mono_ts = time.monotonic()
-            wall_ts = self._wall_ts_for_frame(frame_idx)
+            source_time_s = self._source_time_s(decoded_idx, frame_idx)
+            wall_ts = self._wall_ts_for_time(frame_idx, source_time_s)
             return Frame(
                 bgr=bgr,
                 frame_idx=frame_idx,
                 mono_ts=mono_ts,
                 wall_ts=wall_ts,
                 source_id=self.source_id,
+                source_time_s=source_time_s,
             )
 
     def close(self) -> None:
@@ -245,13 +249,33 @@ class FileSource(VideoSource):
     def is_live(self) -> bool:
         return False
 
-    def _wall_ts_for_frame(self, frame_idx: int) -> datetime:
+    def _wall_ts_for_time(self, frame_idx: int, source_time_s: float | None) -> datetime:
         if self._base_wall_ts is None:
             return datetime.now(timezone.utc)
+        if source_time_s is not None:
+            return self._base_wall_ts + timedelta(seconds=source_time_s)
         timeline_fps = self.target_fps or self._fps
         if timeline_fps is None:
             return datetime.now(timezone.utc)
         return self._base_wall_ts + timedelta(seconds=frame_idx / timeline_fps)
+
+    def _source_time_s(self, decoded_idx: int, emitted_idx: int) -> float | None:
+        if self._capture is not None:
+            getter = getattr(self._capture, "get", None)
+            if callable(getter):
+                try:
+                    value_ms = float(getter(cv2.CAP_PROP_POS_MSEC))
+                except Exception:  # pragma: no cover - defensive capture shim
+                    value_ms = 0.0
+                if value_ms > 0 or decoded_idx == 0:
+                    raw_s = max(0.0, value_ms / 1000.0)
+                    if self._first_source_time_s is None:
+                        self._first_source_time_s = raw_s
+                    return max(0.0, raw_s - self._first_source_time_s)
+        timeline_fps = self.target_fps or self._fps
+        if timeline_fps is None:
+            return None
+        return emitted_idx / timeline_fps
 
     def _should_emit(self, decoded_idx: int) -> bool:
         if self.target_fps is None or self._fps is None or self.target_fps >= self._fps:

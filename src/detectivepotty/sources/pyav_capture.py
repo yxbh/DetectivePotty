@@ -64,7 +64,9 @@ class PyAvCapture:
         self._width = 0
         self._height = 0
         self._frame_count = 0
-        self._pending: Any | None = None
+        self._pending: tuple[Any, float | None] | None = None
+        self._first_pts_s: float | None = None
+        self._last_pos_s: float | None = None
         self._open(thread_type)
 
     def _open(self, thread_type: str) -> None:
@@ -88,6 +90,8 @@ class PyAvCapture:
             self._container = container
             self._stream = stream
             self._time_base = stream.time_base
+            if stream.start_time is not None and stream.time_base:
+                self._first_pts_s = float(stream.start_time * stream.time_base)
             self._frames = container.decode(video=0)
             self._opened = True
         except Exception as exc:
@@ -102,8 +106,9 @@ class PyAvCapture:
         if not self._opened or self._frames is None:
             return False, None
         if self._pending is not None:
-            array = self._pending
+            array, pts_s = self._pending
             self._pending = None
+            self._last_pos_s = pts_s
             return True, array
         try:
             frame = next(self._frames)
@@ -112,11 +117,13 @@ class PyAvCapture:
         except Exception as exc:  # pragma: no cover - corrupt/truncated stream
             raise PyAvDecodeError(f"PyAV decode error on {self._path}") from exc
         try:
+            pts_s = self._frame_time_s(frame)
             array = frame.to_ndarray(format="bgr24")
         except Exception as exc:  # pragma: no cover - unexpected pixel format
             raise PyAvDecodeError(
                 f"PyAV frame conversion error on {self._path}"
             ) from exc
+        self._last_pos_s = pts_s
         return True, array
 
     def set(self, prop: int, value: float) -> bool:  # noqa: N802 - mirror cv2
@@ -154,7 +161,10 @@ class PyAvCapture:
                 if idx is None:
                     return False
                 if idx >= target:
-                    self._pending = frame.to_ndarray(format="bgr24")
+                    self._pending = (
+                        frame.to_ndarray(format="bgr24"),
+                        self._frame_time_s(frame),
+                    )
                     return True
         except StopIteration:
             return False
@@ -170,6 +180,15 @@ class PyAvCapture:
             return None
         return int(round(float(pts * self._time_base) * self._fps))
 
+    def _frame_time_s(self, frame: Any) -> float | None:
+        pts = getattr(frame, "pts", None)
+        if pts is None or not self._time_base:
+            return None
+        raw = float(pts * self._time_base)
+        if self._first_pts_s is None:
+            self._first_pts_s = raw
+        return max(0.0, raw - self._first_pts_s)
+
     def get(self, prop: int) -> float:
         if prop == cv2.CAP_PROP_FPS:
             return self._fps
@@ -179,6 +198,8 @@ class PyAvCapture:
             return float(self._height)
         if prop == cv2.CAP_PROP_FRAME_COUNT:
             return float(self._frame_count)
+        if prop == cv2.CAP_PROP_POS_MSEC:
+            return 0.0 if self._last_pos_s is None else self._last_pos_s * 1000.0
         return 0.0
 
     def release(self) -> None:

@@ -48,6 +48,7 @@ def _make_clip_dir(
     source_start_utc: str | None = None,
     start_s: float | None = None,
     det_time_s: list[float] | None = None,
+    frame_times_s: list[float] | None = None,
     model_name: str | None = None,
     class_names: list[str] | None = None,
 ) -> Path:
@@ -95,6 +96,9 @@ def _make_clip_dir(
         meta["source_start_utc"] = source_start_utc
     if start_s is not None:
         meta["start_s"] = start_s
+    if frame_times_s is not None:
+        meta["timebase"] = "clip_pts"
+        meta["frame_times_s"] = frame_times_s
     (clip_dir / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
     return clip_dir
 
@@ -415,6 +419,48 @@ def test_api_clip_detail_and_save(tmp_path: Path) -> None:
     )
     assert bad.status_code == 400
     assert bad.json()["detail"] == "invalid label payload"
+
+
+def test_save_clip_labels_derives_seconds_from_pts_timeline(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    clip_dir = _make_clip_dir(
+        root,
+        "span_vfr",
+        frame_times_s=[
+            0.0,
+            0.1,
+            0.4,
+            0.45,
+            1.0,
+            1.4,
+            1.5,
+            1.6,
+            2.0,
+            2.2,
+            2.5,
+            2.8,
+        ],
+    )
+    payload = {
+        "ranges": [
+            {
+                "start_frame": 2,
+                "end_frame": 4,
+                "start_s": 999.0,
+                "end_s": 999.0,
+                "behavior": "pee",
+                "dog": "gromit",
+                "track_id": "1",
+            }
+        ]
+    }
+
+    detail = labeling.save_clip_labels(clip_dir, payload, root)
+
+    saved = detail["labels"]["ranges"][0]
+    assert saved["start_s"] == pytest.approx(0.4)
+    assert saved["end_s"] == pytest.approx(1.0)
+    assert saved["time_basis"] == "clip_pts"
 
 
 def test_api_unknown_clip_404_and_traversal(tmp_path: Path) -> None:

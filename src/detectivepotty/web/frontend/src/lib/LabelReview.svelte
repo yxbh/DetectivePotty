@@ -23,11 +23,12 @@
   import {
     clampFrame,
     effectiveFps,
-    frameToSeconds,
-    frameToVideoTime,
     lastFrame,
-    ratioToFrame,
-    videoTimeToFrameFloor,
+    makeFrameTimeline,
+    timelineFrameToSeconds,
+    timelineFrameToVideoTime,
+    timelineRatioToFrame,
+    timelineVideoTimeToFrameFloor,
   } from "./video/frameTime";
   import LabelClipList from "./LabelClipList.svelte";
   import LabelFilmstrip from "./LabelFilmstrip.svelte";
@@ -93,6 +94,9 @@
 
   const fps = $derived(effectiveFps(detail?.fps, detail?.duration_s, detail?.frame_count));
   const totalFrames = $derived(detail ? Math.max(1, detail.frame_count) : 1);
+  const timeline = $derived(
+    makeFrameTimeline(detail?.fps, detail?.duration_s, detail?.frame_count, detail?.frame_times_s),
+  );
   const lastFrameIndex = $derived(lastFrame(totalFrames));
   const trackId = $derived(detail?.track_id ?? null);
   // Detector provenance + detected-object-class mix surfaced in the clip header.
@@ -209,13 +213,13 @@
 
   function syncFrame(): void {
     if (!videoEl || fps <= 0) return;
-    currentFrame = videoTimeToFrameFloor(videoEl.currentTime, fps, totalFrames);
+    currentFrame = timelineVideoTimeToFrameFloor(timeline, videoEl.currentTime);
   }
 
   function seekToFrame(frame: number): void {
     const target = clampFrame(frame, totalFrames);
     currentFrame = target;
-    if (videoEl) videoEl.currentTime = frameToVideoTime(target, fps);
+    if (videoEl) videoEl.currentTime = timelineFrameToVideoTime(timeline, target);
   }
 
   function stepFrame(delta: number): void {
@@ -230,7 +234,7 @@
   }
 
   function onLoadedMeta(): void {
-    if (videoEl) videoEl.currentTime = frameToVideoTime(0, fps);
+    if (videoEl) videoEl.currentTime = timelineFrameToVideoTime(timeline, 0);
     registerFrameLoop();
   }
 
@@ -322,7 +326,7 @@
     for (let i = 0; i < picked.length; i += 1) {
       if (token !== filmstripToken) return;
       const b = picked[i];
-      await seekThumb(frameToVideoTime(b.clip_frame_idx, fps));
+      await seekThumb(timelineFrameToVideoTime(timeline, b.clip_frame_idx));
       if (token !== filmstripToken) return;
       const bw = b.bbox.x2 - b.bbox.x1;
       const bh = b.bbox.y2 - b.bbox.y1;
@@ -473,7 +477,7 @@
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const t = (event.clientX - rect.left) / Math.max(1, rect.width);
-    seekToFrame(ratioToFrame(t, totalFrames));
+    seekToFrame(timelineRatioToFrame(timeline, t));
   }
 
   // --- range editing ------------------------------------------------------
@@ -499,8 +503,8 @@
       {
         start_frame: start,
         end_frame: end,
-        start_s: frameToSeconds(start, fps),
-        end_s: frameToSeconds(end, fps),
+        start_s: timelineFrameToSeconds(timeline, start),
+        end_s: timelineFrameToSeconds(timeline, end),
         behavior: pendingBehavior,
         dog: pendingDog,
         track_id: trackId,
@@ -540,8 +544,8 @@
     updateRange(idx, {
       start_frame: start,
       end_frame: end,
-      start_s: frameToSeconds(start, fps),
-      end_s: frameToSeconds(end, fps),
+      start_s: timelineFrameToSeconds(timeline, start),
+      end_s: timelineFrameToSeconds(timeline, end),
     });
   }
 

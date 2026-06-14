@@ -352,6 +352,26 @@ class FakeSeekCapture(_CountingCapture):
         return True
 
 
+class FakeVfrCapture(FakeCapture):
+    def __init__(self, frame_times_s: list[float], *, fps: float = 10.0) -> None:
+        super().__init__(len(frame_times_s), fps=fps)
+        self.frame_times_s = frame_times_s
+        self.last_idx = -1
+
+    def read(self):
+        ok, frame = super().read()
+        if ok:
+            self.last_idx += 1
+        return ok, frame
+
+    def get(self, prop: int) -> float:
+        import cv2
+
+        if prop == cv2.CAP_PROP_POS_MSEC and self.last_idx >= 0:
+            return self.frame_times_s[self.last_idx] * 1000.0
+        return super().get(prop)
+
+
 def _span(track_id: str, start: int, end: int, fps: float = 10.0) -> DogSpan:
     return DogSpan(
         track_id=track_id,
@@ -712,6 +732,32 @@ def test_harvest_records_model_name_and_per_detection_class(tmp_path: Path) -> N
     assert meta["model_name"] == "models/yolo11m.pt"
     classes = {d["class_name"] for d in meta["detections"]}
     assert classes == {"dog", "sheep"}  # alias preserved for audit
+
+
+def test_harvest_writes_pts_timeline_metadata(tmp_path: Path) -> None:
+    times = [0.0, 0.1, 0.4, 0.7, 1.1, 1.2]
+    FakeClipWriter.written = {}
+    results = harvest_clips(
+        tmp_path / "fake.mp4",
+        tmp_path / "harvest",
+        detector=FakeDetector(present_start=1, present_end=4),
+        sample_every=1,
+        pad_s=0.0,
+        min_len_s=0.0,
+        source_start_utc=datetime(2026, 6, 6, 9, 0, tzinfo=timezone.utc),
+        capture_factory=lambda _p: FakeVfrCapture(times, fps=10.0),
+        clip_writer_factory=lambda p, fps, size: FakeClipWriter(p, fps, size),
+    )
+
+    assert len(results) == 1
+    meta = json.loads(results[0].metadata_path.read_text())
+    assert meta["schema_version"] == "harvest-1.2"
+    assert meta["timebase"] == "clip_pts"
+    assert meta["source_start_frame"] == 1
+    assert meta["source_end_frame"] == 4
+    assert meta["start_s"] == pytest.approx(0.1)
+    assert meta["end_s"] == pytest.approx(1.1)
+    assert meta["frame_times_s"] == [0.0, 0.3, 0.6, 1.0]
 
 
 def test_harvest_model_name_none_when_detector_lacks_it(tmp_path: Path) -> None:

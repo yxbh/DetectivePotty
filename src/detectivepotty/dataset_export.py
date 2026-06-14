@@ -45,6 +45,7 @@ from detectivepotty.labels import (
 )
 from detectivepotty.recording.dataset import sanitize_path_component
 from detectivepotty.sources.pyav_capture import open_capture
+from detectivepotty.timeline import FrameTimeline, timeline_from_metadata
 from detectivepotty.tracking import iou
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ def sample_range_frames(
     *,
     stride_s: float = DEFAULT_SAMPLE_STRIDE_S,
     max_frames: int = DEFAULT_MAX_FRAMES_PER_RANGE,
+    timeline: FrameTimeline | None = None,
 ) -> list[int]:
     """Sub-sample a frame range by time stride, capped at ``max_frames``.
 
@@ -111,16 +113,14 @@ def sample_range_frames(
 
     if end_frame < start_frame:
         return []
-    if fps <= 0:
-        fps = 30.0
-    step = max(1, round(stride_s * fps))
-    frames = list(range(start_frame, end_frame + 1, step))
-    if not frames:
-        frames = [start_frame]
-    if max_frames > 0 and len(frames) > max_frames:
-        idx = np.linspace(0, len(frames) - 1, max_frames)
-        frames = sorted({frames[int(round(i))] for i in idx})
-    return frames
+    if timeline is None or (not timeline.has_pts and timeline.frame_count <= end_frame):
+        timeline = FrameTimeline.cfr(fps=fps, frame_count=end_frame + 1)
+    return timeline.sample_frames_by_time(
+        start_frame,
+        end_frame,
+        stride_s=stride_s,
+        max_frames=max_frames,
+    )
 
 
 def assign_split(key: str, val_fraction: float) -> str:
@@ -152,6 +152,7 @@ class _ClipContext:
     clip_dir: Path
     clip_path: Path
     fps: float
+    timeline: FrameTimeline
     source_id: str
     date: str
     split: str
@@ -169,6 +170,7 @@ def _load_metadata(clip_dir: Path) -> dict[str, Any]:
 def _build_clip_context(clip_dir: Path, val_fraction: float) -> _ClipContext:
     meta = _load_metadata(clip_dir)
     fps = float(meta.get("fps") or 30.0)
+    timeline = timeline_from_metadata(meta)
     source_id = str(meta.get("source_id") or clip_dir.name)
     start_utc = str(meta.get("source_span_start_utc") or "")
     date = start_utc[:10] if start_utc else "unknown-date"
@@ -194,6 +196,7 @@ def _build_clip_context(clip_dir: Path, val_fraction: float) -> _ClipContext:
         clip_dir=clip_dir,
         clip_path=clip_dir / CLIP_NAME,
         fps=fps,
+        timeline=timeline,
         source_id=source_id,
         date=date,
         split=assign_split(split_key, val_fraction),
@@ -315,6 +318,7 @@ def _export_clip(
             ctx.fps,
             stride_s=sample_stride_s,
             max_frames=max_frames_per_range,
+            timeline=ctx.timeline,
         )
         for clip_frame_idx in frames:
             needed.setdefault(clip_frame_idx, []).append(rng)

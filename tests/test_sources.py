@@ -303,3 +303,44 @@ def test_file_source_accepts_explicit_base() -> None:
     assert frame is not None
     assert source.time_basis == "explicit"
     assert frame.wall_ts == base
+
+
+class FakePtsCapture(FakeCapture):
+    def __init__(self, values: list[int], frame_times_s: list[float]) -> None:
+        super().__init__(values)
+        self.frame_times_s = frame_times_s
+        self.last_idx = -1
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        ok, frame = super().read()
+        if ok:
+            self.last_idx += 1
+        return ok, frame
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_POS_MSEC and self.last_idx >= 0:
+            return self.frame_times_s[self.last_idx] * 1000.0
+        return super().get(prop)
+
+
+def test_file_source_uses_capture_pts_for_wall_time() -> None:
+    base = datetime(2025, 3, 3, 12, 0, 0, tzinfo=timezone.utc)
+    source = FileSource(
+        "anything.mp4",
+        base_wall_ts=base,
+        capture_factory=lambda _p: FakePtsCapture([1, 2, 3], [0.0, 0.25, 0.7]),
+    )
+    source.open()
+    try:
+        frames = [source.read() for _ in range(3)]
+    finally:
+        source.close()
+
+    assert all(frame is not None for frame in frames)
+    assert [frame.source_time_s for frame in frames if frame is not None] == [
+        0.0,
+        0.25,
+        0.7,
+    ]
+    assert frames[1] is not None
+    assert (frames[1].wall_ts - base).total_seconds() == pytest.approx(0.25)

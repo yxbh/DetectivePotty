@@ -30,6 +30,7 @@ from detectivepotty.labels import (
     load_labels,
     save_labels,
 )
+from detectivepotty.timeline import FrameTimeline, timeline_from_metadata
 from detectivepotty.web.payloads import recorded_track_box_payload
 
 UNKNOWN_DATE = "unknown-date"
@@ -167,6 +168,7 @@ def summarize_clip(
         camera_names = load_camera_names(clip_dir.parent)
     fps = float(meta.get("fps") or 0.0)
     frame_count = int(meta.get("frame_count") or 0)
+    timeline = timeline_from_metadata(meta)
     detections = meta.get("detections") or []
     source_id = str(meta.get("source_id") or clip_dir.name)
     # Per-detection class distribution (dog vs accepted aliases like sheep/zebra).
@@ -203,9 +205,10 @@ def summarize_clip(
         "span_end_utc": span_end or None,
         "fps": fps,
         "frame_count": frame_count,
+        "frame_times_s": list(timeline.frame_times_s) if timeline.frame_times_s else None,
         "width": int(meta.get("width") or 0),
         "height": int(meta.get("height") or 0),
-        "duration_s": round(frame_count / fps, 3) if fps > 0 else 0.0,
+        "duration_s": round(timeline.duration_s, 3),
         "detect_conf": (
             float(meta["detect_conf"]) if meta.get("detect_conf") is not None else None
         ),
@@ -363,6 +366,7 @@ def _present_tracks(
         meta.get("source_id") or ""
     )
     fps, frame_count, span_start, _ = _clip_geom(meta)
+    timeline = timeline_from_metadata(meta)
 
     result: dict[str, dict[str, Any]] = {}
     for track_id, boxes in own_tracks.items():
@@ -395,7 +399,10 @@ def _present_tracks(
         grouped: dict[str, list[dict[str, Any]]] = {}
         for det in sib.get("detections", []):
             abs_t = sib_source_start + timedelta(seconds=float(det.get("time_s", 0.0)))
-            cf = round((abs_t - span_start).total_seconds() * fps)
+            clip_s = (abs_t - span_start).total_seconds()
+            if clip_s < -1e-9 or clip_s > timeline.duration_s + 1e-9:
+                continue
+            cf = timeline.seconds_to_frame_nearest(clip_s)
             if cf < 0 or cf > last_frame:
                 continue
             grouped.setdefault(str(det.get("track_id")), []).append(
@@ -423,7 +430,8 @@ def save_clip_labels(
     ``ValueError`` for the API to map to 400.
     """
 
-    labels = ClipLabels.from_dict(payload)
+    meta = _read_metadata(clip_dir)
+    labels = ClipLabels.from_dict(_normalize_label_times(payload, timeline_from_metadata(meta)))
     labels.clip = CLIP_NAME
     save_labels(labels, clip_dir)
     return clip_detail(clip_dir, root)
@@ -436,3 +444,27 @@ def label_vocabulary() -> dict[str, list[str]]:
         "behaviors": [b.value for b in Behavior],
         "dogs": [d.value for d in Dog],
     }
+
+
+def _normalize_label_times(
+    payload: dict[str, Any],
+    timeline: FrameTimeline,
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    ranges = payload.get("ranges")
+    if not isinstance(ranges, list):
+        return normalized
+    normalized_ranges: list[Any] = []
+    for item in ranges:
+        if not isinstance(item, dict):
+            normalized_ranges.append(item)
+            continue
+        entry = dict(item)
+        start_frame = int(entry.get("start_frame", 0))
+        end_frame = int(entry.get("end_frame", start_frame))
+        entry["start_s"] = timeline.frame_to_seconds(start_frame)
+        entry["end_s"] = timeline.frame_to_seconds(end_frame)
+        entry["time_basis"] = timeline.time_basis
+        normalized_ranges.append(entry)
+    normalized["ranges"] = normalized_ranges
+    return normalized

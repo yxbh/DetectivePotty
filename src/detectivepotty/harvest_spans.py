@@ -8,6 +8,7 @@ import hashlib
 from pathlib import Path
 
 from detectivepotty.geometry import BBox
+from detectivepotty.timeline import FrameTimeline
 
 DEFAULT_MERGE_GAP_S = 2.0
 DEFAULT_PAD_S = 1.0
@@ -62,6 +63,7 @@ def compute_spans(
     *,
     fps: float,
     total_frames: int,
+    timeline: FrameTimeline | None = None,
     merge_gap_s: float = DEFAULT_MERGE_GAP_S,
     pad_s: float = DEFAULT_PAD_S,
     min_len_s: float = DEFAULT_MIN_LEN_S,
@@ -82,7 +84,8 @@ def compute_spans(
         raise ValueError("fps must be positive")
     if total_frames <= 0:
         return []
-    duration_s = total_frames / fps
+    timeline = timeline or FrameTimeline.cfr(fps=fps, frame_count=total_frames)
+    duration_s = timeline.duration_s
 
     spans: list[DogSpan] = []
     for track_id, raw_samples in presence.items():
@@ -100,6 +103,7 @@ def compute_spans(
                         fps,
                         total_frames,
                         duration_s,
+                        timeline,
                         pad_s,
                         min_len_s,
                         max_len_s,
@@ -115,6 +119,7 @@ def compute_spans(
                 fps,
                 total_frames,
                 duration_s,
+                timeline,
                 pad_s,
                 min_len_s,
                 max_len_s,
@@ -131,6 +136,7 @@ def _finalize_group(
     fps: float,
     total_frames: int,
     duration_s: float,
+    timeline: FrameTimeline,
     pad_s: float,
     min_len_s: float,
     max_len_s: float,
@@ -153,9 +159,14 @@ def _finalize_group(
         chunks.append((start_s, end_s))
 
     out: list[DogSpan] = []
+    _ = fps
     for chunk_start_s, chunk_end_s in chunks:
-        start_frame = int(_clamp(round(chunk_start_s * fps), 0, total_frames - 1))
-        end_frame = int(_clamp(round(chunk_end_s * fps), 0, total_frames - 1))
+        start_frame = int(
+            _clamp(timeline.seconds_to_frame_nearest(chunk_start_s), 0, total_frames - 1)
+        )
+        end_frame = int(
+            _clamp(timeline.seconds_to_frame_nearest(chunk_end_s), 0, total_frames - 1)
+        )
         if end_frame < start_frame:
             end_frame = start_frame
         chunk_samples = [

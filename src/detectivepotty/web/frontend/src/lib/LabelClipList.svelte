@@ -235,23 +235,23 @@
     color: var(--text-dim);
   }
   .chip.b-pee {
-    background: #f1cf5b;
+    background: var(--beh-pee);
     color: #1a1204;
   }
   .chip.b-poop {
-    background: #c08a55;
+    background: var(--beh-poop);
     color: #1a1204;
   }
   .chip.b-not_potty {
-    background: #3a4150;
+    background: color-mix(in srgb, var(--beh-not-potty) 42%, var(--bg-3));
     color: var(--text);
   }
   .chip.b-excluded {
-    background: #5a2f42;
+    background: color-mix(in srgb, var(--beh-excluded) 48%, var(--bg-3));
     color: #fdd;
   }
   .chip.dog {
-    background: #2f5d4a;
+    background: var(--beh-dog);
     color: #dfe;
   }
   .badge {

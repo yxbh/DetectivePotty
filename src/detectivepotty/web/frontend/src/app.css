@@ -30,6 +30,9 @@
   --amber-soft: rgba(245, 165, 36, 0.13);
   --teal: #54d2c4;
   --teal-soft: rgba(84, 210, 196, 0.12);
+  --accent: var(--teal);
+  --accent-dim: color-mix(in srgb, var(--teal) 18%, var(--bg-2));
+  --accent-soft: var(--teal-soft);
 
   /* semantics */
   --green: #4fc480;
@@ -37,10 +40,40 @@
   --red: #e5544b;
   --red-soft: rgba(229, 84, 75, 0.14);
   --slate: #8290a8;
+  --success: var(--green);
+  --success-soft: var(--green-soft);
+  --danger: var(--red);
+  --danger-soft: var(--red-soft);
+  --warning: var(--amber);
+  --warning-soft: var(--amber-soft);
 
+  /* behavior / timeline palette */
+  --beh-pee: #f1cf5b;
+  --beh-poop: #c08a55;
+  --beh-not-potty: var(--slate);
+  --beh-excluded: #a35a74;
+  --beh-dog: #2f5d4a;
+  --lane-bg: #0a0e16;
+  --lane-gate: #5b6b80;
+  --lane-playhead: #ffffff;
+  --lane-pass: var(--green);
+  --lane-warn: var(--amber);
+  --muted: var(--text-dim);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --radius-xs: 0.3rem;
   --radius: 0.7rem;
   --radius-sm: 0.45rem;
+  --radius-md: var(--radius);
+  --radius-lg: 1rem;
+  --radius-pill: 999px;
   --shadow: 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+  --focus-ring: 0 0 0 3px var(--accent-soft);
 
   --font-display: "Bricolage Grotesque", "Archivo", ui-sans-serif, system-ui, sans-serif;
   --font-ui: "Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -129,8 +162,8 @@ input:focus-visible,
 textarea:focus-visible,
 button:focus-visible {
   outline: none;
-  border-color: var(--teal);
-  box-shadow: 0 0 0 3px var(--teal-soft);
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 
 textarea {
@@ -232,15 +265,15 @@ kbd {
 
 /* label chips */
 .chip.label-pee {
-  color: #f1cf5b;
+  color: var(--beh-pee);
   border-color: rgba(241, 207, 91, 0.35);
 }
 .chip.label-poop {
-  color: #c08a55;
+  color: var(--beh-poop);
   border-color: rgba(192, 138, 85, 0.35);
 }
 .chip.label-not_potty {
-  color: var(--slate);
+  color: var(--beh-not-potty);
   border-color: rgba(130, 144, 168, 0.35);
 }
 

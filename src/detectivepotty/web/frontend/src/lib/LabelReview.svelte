@@ -32,7 +32,13 @@
     "3": "not_potty",
     "4": "excluded",
   };
-  const BEH_COLOR: Record<string, string> = {
+  const BEH_COLOR_TOKEN: Record<string, string> = {
+    pee: "--beh-pee",
+    poop: "--beh-poop",
+    not_potty: "--beh-not-potty",
+    excluded: "--beh-excluded",
+  };
+  const BEH_COLOR_FALLBACK: Record<string, string> = {
     pee: "#f1cf5b",
     poop: "#c08a55",
     not_potty: "#8290a8",
@@ -336,6 +342,16 @@
 
   // --- detection / confidence lane ----------------------------------------
 
+  function cssToken(name: string, fallback: string): string {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return value || fallback;
+  }
+
+  function behaviorColor(behavior: string): string {
+    const token = BEH_COLOR_TOKEN[behavior];
+    return token ? cssToken(token, BEH_COLOR_FALLBACK[behavior] ?? "#444") : "#444";
+  }
+
   function drawLane(): void {
     const canvas = laneEl;
     if (!canvas || !detail) return;
@@ -347,14 +363,14 @@
     if (!ctx) return;
     const total = Math.max(1, totalFrames - 1);
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#0a0e16";
+    ctx.fillStyle = cssToken("--lane-bg", "#0a0e16");
     ctx.fillRect(0, 0, w, h);
 
     // Labeled range bands (behind the detection ticks).
     for (const r of ranges) {
       const x0 = (r.start_frame / total) * w;
       const x1 = (r.end_frame / total) * w;
-      ctx.fillStyle = (BEH_COLOR[r.behavior] ?? "#444") + "55";
+      ctx.fillStyle = `${behaviorColor(r.behavior)}55`;
       ctx.fillRect(x0, 0, Math.max(2, x1 - x0), h);
     }
 
@@ -362,7 +378,7 @@
     const gate = detail.detect_conf;
     if (gate != null && gate > 0) {
       const gy = h - gate * h;
-      ctx.strokeStyle = "#5b6b80";
+      ctx.strokeStyle = cssToken("--lane-gate", "#5b6b80");
       ctx.setLineDash([4, 3]);
       ctx.beginPath();
       ctx.moveTo(0, gy);
@@ -383,7 +399,7 @@
 
     // Playhead.
     const px = (currentFrame / total) * w;
-    ctx.strokeStyle = "#ffffff";
+    ctx.strokeStyle = cssToken("--lane-playhead", "#ffffff");
     ctx.beginPath();
     ctx.moveTo(px, 0);
     ctx.lineTo(px, h);

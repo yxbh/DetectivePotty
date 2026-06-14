@@ -1,0 +1,636 @@
+<script lang="ts">
+  import { get } from "svelte/store";
+  import type { EventDetail, EventSummary, LabelDraft } from "../types";
+  import { fetchEventDetail, fetchEvents, saveLabel } from "../api";
+  import { autoAdvance, loadReviewFilters, saveReviewFilters } from "../prefs";
+  import { acknowledgeEvents } from "../live";
+  import { navigate, route, routeToView } from "../router";
+  import { errMsg } from "../errors";
+  import { isTypingTarget } from "../keys";
+  import EventList from "../EventList.svelte";
+  import EventDetailView from "../EventDetail.svelte";
+  import type { ReviewHeaderState, ReviewOpenRequest } from "./types";
+
+  interface Props {
+    active: boolean;
+    dogs: string[];
+    dogError: string | null;
+    helpOpen: boolean;
+    liveNewCount: number;
+    openRequest: ReviewOpenRequest | null;
+    onheader: (state: ReviewHeaderState) => void;
+    onready: () => void;
+    onfocuscamera: () => void;
+    onrequesthelp: () => void;
+    onclosehelp: () => void;
+  }
+
+  const initialFilters = loadReviewFilters();
+
+  let {
+    active,
+    dogs,
+    dogError,
+    helpOpen,
+    liveNewCount,
+    openRequest,
+    onheader,
+    onready,
+    onfocuscamera,
+    onrequesthelp,
+    onclosehelp,
+  }: Props = $props();
+
+  let events = $state<EventSummary[]>([]);
+  let unfilteredTotal = $state<number | null>(null);
+  let selectedId = $state<string | null>(null);
+  let statusFilter = $state(initialFilters.status);
+  let cameraFilter = $state(initialFilters.camera);
+  let listLoading = $state(true);
+  let listError = $state<string | null>(null);
+  let detail = $state<EventDetail | null>(null);
+  let detailLoading = $state(false);
+  let detailError = $state<string | null>(null);
+  let saving = $state(false);
+  let saveStatus = $state("");
+
+  // Single source of truth for the label editor (lifted out of EventDetail so a
+  // keyboard shortcut and the visible form can never disagree).
+  let draft = $state<LabelDraft>({ label: "unknown", status: "labeled", dog: "", note: "" });
+  let baseline = $state<LabelDraft>({ label: "unknown", status: "labeled", dog: "", note: "" });
+
+  // Monotonic tokens guard against slow fetches resolving after a newer
+  // selection (fast j/k navigation) or a newer filter change.
+  let detailToken = 0;
+  let listToken = 0;
+  let lastOpenRequestSeq = 0;
+
+  let dirty = $derived(
+    detail != null &&
+      (draft.label !== baseline.label ||
+        draft.status !== baseline.status ||
+        draft.dog !== baseline.dog ||
+        draft.note !== baseline.note),
+  );
+  let labeledCount = $derived(
+    events.filter((event) => event.label_status && event.label_status !== "unlabeled").length,
+  );
+  let progressPct = $derived(
+    events.length ? Math.round((labeledCount / events.length) * 100) : 0,
+  );
+
+  init();
+
+  // Reconcile selection FROM the route: opening `/?event=<id>` (deep link, back/
+  // forward, or refresh) selects that event. No-ops once it matches the current
+  // selection, so it cannot loop with selectEvent's URL write-back.
+  $effect(() => {
+    const current = $route;
+    if (!active || routeToView(current.path) !== "review") {
+      return;
+    }
+    const eventId = current.query.get("event");
+    if (eventId && eventId !== selectedId) {
+      void selectEvent(eventId);
+    }
+  });
+
+  $effect(() => {
+    onheader({
+      statusFilter,
+      cameraFilter,
+      labeledCount,
+      eventCount: events.length,
+      unfilteredTotal,
+      progressPct,
+      dirty,
+      applyFilter,
+      setCameraFilter,
+      commitCameraFilter,
+      clearCamera,
+    });
+  });
+
+  $effect(() => {
+    const request = openRequest;
+    if (!request || request.seq === lastOpenRequestSeq) {
+      return;
+    }
+    lastOpenRequestSeq = request.seq;
+    void openRequestedEvent(request.eventId);
+  });
+
+  async function init(): Promise<void> {
+    await loadEvents();
+    onready();
+  }
+
+  async function openRequestedEvent(eventId: string): Promise<void> {
+    await loadEvents();
+    await selectEvent(eventId);
+  }
+
+  async function loadEvents(): Promise<void> {
+    const token = ++listToken;
+    listLoading = true;
+    listError = null;
+    try {
+      const page = await fetchEvents({ labelStatus: statusFilter, camera: cameraFilter });
+      if (token !== listToken) {
+        return; // a newer filter/search superseded this fetch
+      }
+      events = page.events;
+      unfilteredTotal = page.unfilteredTotal;
+      // Everything now shown in Review is "known" — clears the live banner and
+      // prevents these ids from re-counting/re-notifying via the stream.
+      acknowledgeEvents(events.map((event) => event.event_id));
+      if (selectedId && !events.some((event) => event.event_id === selectedId)) {
+        selectedId = null;
+        detail = null;
+      }
+      // Don't auto-select the first event when the URL deep-links a specific one
+      // (?event=…) — the route-reconciliation effect will open it instead.
+      const deepLinked = get(route).query.get("event");
+      if (events.length > 0 && !selectedId && !deepLinked) {
+        await selectEvent(events[0].event_id);
+      }
+    } catch (err) {
+      if (token !== listToken) {
+        return;
+      }
+      listError = errMsg(err);
+      events = [];
+      unfilteredTotal = null;
+    } finally {
+      if (token === listToken) {
+        listLoading = false;
+      }
+    }
+  }
+
+  async function selectEvent(eventId: string): Promise<void> {
+    if (dirty && eventId !== selectedId && !confirmUnsavedReviewChanges()) {
+      restoreReviewRoute();
+      return;
+    }
+    selectedId = eventId;
+    saveStatus = "";
+    // Reflect the open event in the URL (replace, so list navigation doesn't
+    // flood history) so a refresh restores it. navigate() is a no-op when the
+    // URL already matches, which keeps the route-reconciliation effect from
+    // looping.
+    if (active) {
+      navigate(`/?event=${encodeURIComponent(eventId)}`, { replace: true });
+    }
+    const token = ++detailToken;
+    detailLoading = true;
+    detailError = null;
+    try {
+      const loaded = await fetchEventDetail(eventId);
+      if (token !== detailToken) {
+        return; // a newer selection superseded this fetch
+      }
+      detail = loaded;
+      resetDraft(loaded);
+    } catch (err) {
+      if (token !== detailToken) {
+        return;
+      }
+      detail = null;
+      detailError = errMsg(err);
+    } finally {
+      if (token === detailToken) {
+        detailLoading = false;
+      }
+    }
+  }
+
+  function resetDraft(loaded: EventDetail): void {
+    const metadata = loaded.metadata as Record<string, unknown>;
+    const status = (metadata.label_status as string) || "unlabeled";
+    const extra = (metadata.extra as Record<string, unknown> | undefined) ?? {};
+    const next: LabelDraft = {
+      label: (metadata.label as string) || "unknown",
+      // An unsaved event edits toward "labeled" by default; the user can still
+      // switch to rejected/uncertain.
+      status: status === "unlabeled" ? "labeled" : status,
+      dog: (metadata.dog as string) || "",
+      note: (extra.label_note as string) || "",
+    };
+    draft = next;
+    baseline = { ...next };
+  }
+
+  function applySummary(updated: EventSummary): void {
+    const index = events.findIndex((event) => event.event_id === updated.event_id);
+    if (index !== -1) {
+      events[index] = updated;
+    }
+  }
+
+  async function save(): Promise<void> {
+    if (!detail || saving || !dirty) {
+      return;
+    }
+    const targetId = detail.summary.event_id;
+    const saveToken = detailToken;
+    const snapshot: LabelDraft = { ...draft };
+    saving = true;
+    saveStatus = "Saving…";
+    try {
+      const updated = await saveLabel(targetId, {
+        label: snapshot.label,
+        label_status: snapshot.status,
+        note: snapshot.note,
+        dog: snapshot.dog || null,
+      });
+      applySummary(updated);
+      // Only mutate editor state if the user is still on the very same selection
+      // (the token also rejects a navigate-away-and-back to the same id).
+      if (detail && detail.summary.event_id === targetId && detailToken === saveToken) {
+        baseline = { ...snapshot };
+        patchDetailMetadata(snapshot);
+        detail.summary = updated;
+        saveStatus = "Saved";
+        if (statusFilter !== "" && updated.label_status !== statusFilter) {
+          // The event no longer belongs to the active filter — drop it from the
+          // list and advance to its neighbour so the list stays consistent.
+          removeFromListAndAdvance(targetId);
+        } else if ($autoAdvance) {
+          jumpUnlabeled(1, targetId);
+        }
+      }
+    } catch (err) {
+      if (detail && detail.summary.event_id === targetId && detailToken === saveToken) {
+        saveStatus = `Save failed: ${errMsg(err)}`;
+      }
+    } finally {
+      saving = false;
+    }
+  }
+
+  function removeFromListAndAdvance(targetId: string): void {
+    const index = events.findIndex((event) => event.event_id === targetId);
+    events = events.filter((event) => event.event_id !== targetId);
+    if (events.length === 0) {
+      selectedId = null;
+      detail = null;
+      return;
+    }
+    const nextIndex = Math.min(index < 0 ? 0 : index, events.length - 1);
+    void selectEvent(events[nextIndex].event_id);
+  }
+
+  function patchDetailMetadata(snapshot: LabelDraft): void {
+    if (!detail) {
+      return;
+    }
+    const metadata = detail.metadata as Record<string, unknown>;
+    metadata.label = snapshot.label;
+    metadata.label_status = snapshot.status;
+    metadata.dog = snapshot.dog || null;
+    const extra =
+      metadata.extra && typeof metadata.extra === "object"
+        ? (metadata.extra as Record<string, unknown>)
+        : {};
+    // Mirror the backend, which always writes label_note from the payload.
+    extra.label_note = snapshot.note;
+    metadata.extra = extra;
+  }
+
+  function indexOfSelected(): number {
+    return events.findIndex((event) => event.event_id === selectedId);
+  }
+
+  function move(delta: number): void {
+    if (events.length === 0) {
+      return;
+    }
+    const current = indexOfSelected();
+    const next = current < 0 ? 0 : Math.min(events.length - 1, Math.max(0, current + delta));
+    void selectEvent(events[next].event_id);
+  }
+
+  function edge(end: 0 | 1): void {
+    if (events.length === 0) {
+      return;
+    }
+    void selectEvent(events[end ? events.length - 1 : 0].event_id);
+  }
+
+  function jumpUnlabeled(dir: 1 | -1, fromId: string | null = selectedId): void {
+    const n = events.length;
+    if (n === 0) {
+      return;
+    }
+    const start = events.findIndex((event) => event.event_id === fromId);
+    const base = start < 0 ? (dir === 1 ? -1 : n) : start;
+    for (let step = 1; step <= n; step += 1) {
+      const j = ((base + dir * step) % n + n) % n;
+      const candidate = events[j];
+      if (candidate.event_id === fromId) {
+        continue; // never re-select the current event (e.g. only one unlabeled)
+      }
+      if (candidate.label_status === "unlabeled") {
+        void selectEvent(candidate.event_id);
+        return;
+      }
+    }
+  }
+
+  function toggleVideo(): void {
+    const video = document.querySelector<HTMLVideoElement>(".detail video");
+    if (video) {
+      if (video.paused) {
+        void video.play().catch(() => undefined);
+      } else {
+        video.pause();
+      }
+    }
+  }
+
+  function setCameraFilter(value: string): void {
+    cameraFilter = value;
+  }
+
+  function applyFilter(value: string): void {
+    if (value !== statusFilter && dirty && !confirmUnsavedReviewChanges()) {
+      return;
+    }
+    statusFilter = value;
+    saveReviewFilters({ status: statusFilter, camera: cameraFilter });
+    void loadEvents();
+  }
+
+  function commitCameraFilter(): void {
+    if (dirty && !confirmUnsavedReviewChanges()) {
+      return;
+    }
+    cameraFilter = cameraFilter.trim();
+    saveReviewFilters({ status: statusFilter, camera: cameraFilter });
+    void loadEvents();
+  }
+
+  function clearCamera(): void {
+    if (cameraFilter && dirty && !confirmUnsavedReviewChanges()) {
+      return;
+    }
+    cameraFilter = "";
+    saveReviewFilters({ status: statusFilter, camera: cameraFilter });
+    void loadEvents();
+  }
+
+  function confirmUnsavedReviewChanges(): boolean {
+    return confirm("Continue without saving label changes?");
+  }
+
+  function reviewPath(): string {
+    return selectedId ? `/?event=${encodeURIComponent(selectedId)}` : "/";
+  }
+
+  function restoreReviewRoute(): void {
+    if (active) {
+      navigate(reviewPath(), { replace: true });
+    }
+  }
+
+  function onBeforeUnload(event: BeforeUnloadEvent): void {
+    if (!dirty) {
+      return;
+    }
+    event.preventDefault();
+    event.returnValue = "";
+  }
+
+  function onKey(event: KeyboardEvent): void {
+    if (!active || event.defaultPrevented) {
+      return;
+    }
+    if (helpOpen) {
+      if (event.key === "Escape" || event.key === "?") {
+        event.preventDefault();
+        onclosehelp();
+      }
+      return;
+    }
+    if (event.metaKey || event.ctrlKey || event.altKey) {
+      return;
+    }
+    if (isTypingTarget(event.target)) {
+      if (event.key === "Escape") {
+        (event.target as HTMLElement).blur();
+      }
+      return;
+    }
+    // Let native activation handle Enter/Space when a button, link, or media
+    // element is focused (e.g. tab to a control and press Space to click it).
+    if (event.key === " " || event.key === "Enter") {
+      const el = event.target as HTMLElement | null;
+      if (el?.closest("button, a[href], video, audio, [role='button'], [role='tab']")) {
+        return;
+      }
+    }
+
+    // Dog roster shortcuts: Shift+1…N picks the Nth configured dog, Shift+0
+    // unassigns. Uses event.code so it is layout-robust (Shift+1 = "!" on US
+    // keyboards) and never clashes with the plain-digit label keys below.
+    if (event.shiftKey && detail && /^Digit[0-9]$/.test(event.code)) {
+      const digit = Number(event.code.slice(5));
+      if (digit === 0) {
+        event.preventDefault();
+        draft.dog = "";
+        return;
+      }
+      const pick = dogs[digit - 1];
+      if (pick) {
+        event.preventDefault();
+        draft.dog = pick;
+      }
+      return;
+    }
+
+    switch (event.key) {
+      case "j":
+      case "ArrowDown":
+        event.preventDefault();
+        move(1);
+        break;
+      case "k":
+      case "ArrowUp":
+        event.preventDefault();
+        move(-1);
+        break;
+      case "n":
+        event.preventDefault();
+        jumpUnlabeled(1);
+        break;
+      case "N":
+        event.preventDefault();
+        jumpUnlabeled(-1);
+        break;
+      case "g":
+        event.preventDefault();
+        edge(0);
+        break;
+      case "G":
+        event.preventDefault();
+        edge(1);
+        break;
+      case "1":
+        if (detail) draft.label = "pee";
+        break;
+      case "2":
+        if (detail) draft.label = "poop";
+        break;
+      case "3":
+        if (detail) draft.label = "not_potty";
+        break;
+      case "0":
+        if (detail) draft.label = "unknown";
+        break;
+      case "r":
+        if (detail) draft.status = "rejected";
+        break;
+      case "u":
+        if (detail) draft.status = "uncertain";
+        break;
+      case "s":
+      case "Enter":
+        event.preventDefault();
+        void save();
+        break;
+      case "/":
+        event.preventDefault();
+        onfocuscamera();
+        break;
+      case "?":
+        event.preventDefault();
+        onrequesthelp();
+        break;
+      case "a":
+        event.preventDefault();
+        autoAdvance.update((value) => !value);
+        break;
+      case " ":
+        event.preventDefault();
+        toggleVideo();
+        break;
+      default:
+        break;
+    }
+  }
+</script>
+
+<svelte:window onkeydown={onKey} onbeforeunload={onBeforeUnload} />
+
+{#if active && liveNewCount > 0}
+  <button type="button" class="new-banner" onclick={() => void loadEvents()}>
+    <span class="pip"></span>
+    {liveNewCount} new event{liveNewCount === 1 ? "" : "s"} · click to load
+  </button>
+{/if}
+
+<main class="layout" hidden={!active}>
+  <section class="sidebar">
+    <div class="list-scroll">
+      <EventList
+        {events}
+        {selectedId}
+        loading={listLoading}
+        error={listError}
+        onselect={selectEvent}
+      />
+    </div>
+  </section>
+
+  <section class="detail-scroll detail">
+    <EventDetailView
+      {detail}
+      {dogs}
+      {dogError}
+      bind:draft
+      {dirty}
+      {saving}
+      {saveStatus}
+      loading={detailLoading}
+      error={detailError}
+      onsave={save}
+    />
+  </section>
+</main>
+
+<style>
+  main[hidden] {
+    display: none !important;
+  }
+
+  .new-banner {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.5rem 1rem;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--teal) 14%, var(--bg-1));
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .new-banner:hover {
+    background: color-mix(in srgb, var(--teal) 22%, var(--bg-1));
+  }
+
+  .new-banner .pip {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--teal);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--teal) 80%, transparent);
+  }
+
+  .layout {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(19rem, 26rem) minmax(0, 1fr);
+  }
+
+  /* Each pane owns its own scrollbar so the list and detail scroll
+     independently (bounded grid height + min-height:0 children). */
+  .sidebar {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border-right: 1px solid var(--line-strong);
+    background: var(--bg);
+  }
+
+  .list-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .detail-scroll {
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  @media (max-width: 900px) {
+    .layout {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, 42vh) minmax(0, 1fr);
+    }
+
+    .sidebar {
+      border-right: 0;
+      border-bottom: 1px solid var(--line-strong);
+    }
+  }
+</style>

@@ -60,7 +60,7 @@ vanilla-JS `web/static/` portal is gone). Two non-obvious gotchas — full dev l
 ## Testing & regression discipline
 
 - Tests are offline and inject fake detectors — no cameras, models, GPU, or network.
-- **Pose-OFF baseline on `config.multiFile.yaml` is 9 events** (7 cameras, `dwell_trigger_s`
+- **Pose-OFF baseline on `configs/baseline.yaml` is 9 events** (7 cameras, `dwell_trigger_s`
   default 2 s): sample 1 / 1946 1 / 1949 2 / 2240 2 / 0903 1 / 0908 1 / **1729 1**. The trigger is
   **dwell-only** — a non-suppressed track that reads stationary continuously for at least
   `dwell_trigger_s` becomes a candidate. The old bbox **squat** trigger was removed entirely (it was

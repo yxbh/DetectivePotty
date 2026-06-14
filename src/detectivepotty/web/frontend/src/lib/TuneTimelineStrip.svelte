@@ -1,5 +1,6 @@
 <script lang="ts">
   import { observeResize } from "./resize";
+  import { lastFrame } from "./video/frameTime";
 
   interface Props {
     canvas: HTMLCanvasElement | null;
@@ -29,7 +30,7 @@
     type="range"
     class="seek"
     min="0"
-    max={Math.max(0, totalFrames - 1)}
+    max={lastFrame(totalFrames)}
     step="1"
     value={displayIndex}
     disabled={totalFrames <= 0}

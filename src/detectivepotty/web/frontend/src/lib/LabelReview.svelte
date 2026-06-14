@@ -20,6 +20,15 @@
   import { formatClock } from "./format";
   import { BOX_DOG, BOX_SIBLING, boxLabelFontPx } from "./overlayStyle";
   import { observeResize } from "./resize";
+  import {
+    clampFrame,
+    effectiveFps,
+    frameToSeconds,
+    frameToVideoTime,
+    lastFrame,
+    ratioToFrame,
+    videoTimeToFrameFloor,
+  } from "./video/frameTime";
   import LabelClipList from "./LabelClipList.svelte";
   import LabelFilmstrip from "./LabelFilmstrip.svelte";
   import LabelOverlay from "./LabelOverlay.svelte";
@@ -82,8 +91,9 @@
   let stopLaneResize: (() => void) | null = null;
   let cleanupThumbWait: (() => void) | null = null;
 
-  const fps = $derived(detail && detail.fps > 0 ? detail.fps : 30);
+  const fps = $derived(effectiveFps(detail?.fps, detail?.duration_s, detail?.frame_count));
   const totalFrames = $derived(detail ? Math.max(1, detail.frame_count) : 1);
+  const lastFrameIndex = $derived(lastFrame(totalFrames));
   const trackId = $derived(detail?.track_id ?? null);
   // Detector provenance + detected-object-class mix surfaced in the clip header.
   const modelLabel = $derived(detail?.model_name || "unknown");
@@ -197,19 +207,15 @@
 
   // --- video / frame sync -------------------------------------------------
 
-  function clampFrame(frame: number): number {
-    return Math.max(0, Math.min(totalFrames - 1, frame));
-  }
-
   function syncFrame(): void {
     if (!videoEl || fps <= 0) return;
-    currentFrame = clampFrame(Math.floor(videoEl.currentTime * fps + 1e-6));
+    currentFrame = videoTimeToFrameFloor(videoEl.currentTime, fps, totalFrames);
   }
 
   function seekToFrame(frame: number): void {
-    const target = clampFrame(frame);
+    const target = clampFrame(frame, totalFrames);
     currentFrame = target;
-    if (videoEl) videoEl.currentTime = (target + 0.5) / fps;
+    if (videoEl) videoEl.currentTime = frameToVideoTime(target, fps);
   }
 
   function stepFrame(delta: number): void {
@@ -224,7 +230,7 @@
   }
 
   function onLoadedMeta(): void {
-    if (videoEl) videoEl.currentTime = 0.5 / fps;
+    if (videoEl) videoEl.currentTime = frameToVideoTime(0, fps);
     registerFrameLoop();
   }
 
@@ -316,7 +322,7 @@
     for (let i = 0; i < picked.length; i += 1) {
       if (token !== filmstripToken) return;
       const b = picked[i];
-      await seekThumb((b.clip_frame_idx + 0.5) / fps);
+      await seekThumb(frameToVideoTime(b.clip_frame_idx, fps));
       if (token !== filmstripToken) return;
       const bw = b.bbox.x2 - b.bbox.x1;
       const bh = b.bbox.y2 - b.bbox.y1;
@@ -371,7 +377,7 @@
     if (canvas.height !== h) canvas.height = h;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const total = Math.max(1, totalFrames - 1);
+    const total = Math.max(1, lastFrame(totalFrames));
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = cssToken("--lane-bg", "#0a0e16");
     ctx.fillRect(0, 0, w, h);
@@ -467,7 +473,7 @@
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const t = (event.clientX - rect.left) / Math.max(1, rect.width);
-    seekToFrame(Math.round(t * (totalFrames - 1)));
+    seekToFrame(ratioToFrame(t, totalFrames));
   }
 
   // --- range editing ------------------------------------------------------
@@ -493,8 +499,8 @@
       {
         start_frame: start,
         end_frame: end,
-        start_s: start / fps,
-        end_s: end / fps,
+        start_s: frameToSeconds(start, fps),
+        end_s: frameToSeconds(end, fps),
         behavior: pendingBehavior,
         dog: pendingDog,
         track_id: trackId,
@@ -521,7 +527,7 @@
   function retimeRange(idx: number, edge: "start" | "end"): void {
     const range = ranges[idx];
     if (!range) return;
-    const frame = clampFrame(currentFrame);
+    const frame = clampFrame(currentFrame, totalFrames);
     let start = range.start_frame;
     let end = range.end_frame;
     if (edge === "start") {
@@ -534,8 +540,8 @@
     updateRange(idx, {
       start_frame: start,
       end_frame: end,
-      start_s: start / fps,
-      end_s: end / fps,
+      start_s: frameToSeconds(start, fps),
+      end_s: frameToSeconds(end, fps),
     });
   }
 
@@ -812,7 +818,7 @@
           class="scrub"
           type="range"
           min="0"
-          max={totalFrames - 1}
+          max={lastFrameIndex}
           value={currentFrame}
           oninput={(e) => seekToFrame(Number((e.target as HTMLInputElement).value))}
         />

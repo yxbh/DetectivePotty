@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { frameToSeconds } from "./video/frameTime";
+
   interface FilmstripCrop {
     frame: number;
     url: string | null;
@@ -24,7 +26,7 @@
         class="film-card"
         class:cur={Math.abs(c.frame - currentFrame) < fps / 2}
         onclick={() => onseek(c.frame)}
-        title={`Frame ${c.frame} · ${(c.frame / fps).toFixed(2)}s`}
+        title={`Frame ${c.frame} · ${frameToSeconds(c.frame, fps).toFixed(2)}s`}
       >
         {#if c.url}
           <img src={c.url} alt={`detection at frame ${c.frame}`} />

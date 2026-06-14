@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { frameToSeconds, lastFrame } from "./video/frameTime";
+
   interface Props {
     playing: boolean;
     frame: number;
@@ -23,8 +25,8 @@
     onStep,
   }: Props = $props();
 
-  const lastFrame = $derived(Math.max(0, total - 1));
-  const seconds = $derived(fps > 0 ? frame / fps : 0);
+  const lastFrameIndex = $derived(lastFrame(total));
+  const seconds = $derived(frameToSeconds(frame, fps));
 </script>
 
 <div class="transport">
@@ -41,7 +43,7 @@
   {/if}
   {#if showReadout}
     <span class="frame-readout mono" title="Current frame / last frame · time">
-      f{frame} / {lastFrame} · {seconds.toFixed(2)}s
+      f{frame} / {lastFrameIndex} · {seconds.toFixed(2)}s
     </span>
   {/if}
 </div>

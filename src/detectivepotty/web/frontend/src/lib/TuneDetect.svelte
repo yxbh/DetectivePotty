@@ -44,6 +44,14 @@
   } from "./overlayStyle";
   import { loadTuneLastDir, saveTuneLastDir } from "./prefs";
   import {
+    clampFrame,
+    effectiveFps,
+    frameToVideoTime,
+    lastFrame,
+    videoTimeToFrameFloor,
+    videoTimeToFrameRounded,
+  } from "./video/frameTime";
+  import {
     DEFAULT_FLOOR,
     MAX_INFLIGHT,
     MAX_POSE_INFLIGHT,
@@ -219,8 +227,9 @@
 
   // Derived counts/fps for the HUD. Counts are derived (never written from an
   // effect) so the draw effect can't feed back into its own dependencies.
-  const fps = $derived(effectiveFps(meta));
+  const fps = $derived(effectiveFps(meta?.fps, meta?.duration, meta?.total_frames));
   const totalFrames = $derived(meta?.total_frames ?? 0);
+  const lastFrameIndex = $derived(lastFrame(totalFrames));
   const aboveCount = $derived(
     frameDetections.filter((d) => d.confidence >= threshold).length,
   );
@@ -252,13 +261,6 @@
       clearTimeout(copyTimer);
     }
   });
-
-  function effectiveFps(m: TuneMeta | null): number {
-    if (!m) return 30;
-    if (m.fps && m.fps > 0) return m.fps;
-    if (m.duration > 0 && m.total_frames) return m.total_frames / m.duration;
-    return 30;
-  }
 
   function poseWanted(): boolean {
     return overlayMode !== "boxes";
@@ -495,7 +497,7 @@
     resizeCanvas();
     // Seek to the middle of frame 0 so a frame paints (firing rVFC) and the
     // index math is unambiguous.
-    videoEl.currentTime = 0.5 / fps;
+    videoEl.currentTime = frameToVideoTime(0, fps);
     registerRvfc();
     pump();
   }
@@ -523,11 +525,7 @@
     if (!videoEl || !meta) {
       return;
     }
-    presentedIndex = clamp(
-      Math.round(metadata.mediaTime * fps),
-      0,
-      Math.max(0, totalFrames - 1),
-    );
+    presentedIndex = videoTimeToFrameRounded(metadata.mediaTime, fps, totalFrames);
     onPresented();
     syncView();
     pump();
@@ -540,11 +538,7 @@
     if (hasRvfc || !videoEl || !meta) {
       return;
     }
-    presentedIndex = clamp(
-      Math.floor(videoEl.currentTime * fps + 1e-6),
-      0,
-      Math.max(0, totalFrames - 1),
-    );
+    presentedIndex = videoTimeToFrameFloor(videoEl.currentTime, fps, totalFrames);
     onPresented();
     syncView();
     pump();
@@ -604,13 +598,13 @@
     if (!videoEl || !meta || totalFrames <= 0) {
       return;
     }
-    const next = clamp(target, 0, totalFrames - 1);
+    const next = clampFrame(target, totalFrames);
     intendedIndex = next;
     if (precise) {
       // Hold the thumb at the committed target until the video paints it.
       pendingDisplayIndex = next;
     }
-    seekPendingTime = (next + 0.5) / fps;
+    seekPendingTime = frameToVideoTime(next, fps);
     seekPendingPrecise = precise;
     if (!seekBusy) {
       issueSeek();
@@ -802,10 +796,9 @@
     if (totalFrames <= 0) {
       return;
     }
-    const value = clamp(
+    const value = clampFrame(
       Math.round(Number((event.currentTarget as HTMLInputElement).value)),
-      0,
-      totalFrames - 1,
+      totalFrames,
     );
     scrubIndex = value;
     if (scrubbing) {
@@ -1636,7 +1629,7 @@
     ctx.fillRect(0, lane2Y, w, laneH);
     ctx.fillRect(0, lane3Y, w, laneH);
 
-    const span = Math.max(1, totalFrames - 1);
+    const span = Math.max(1, lastFrame(totalFrames));
     const colW = Math.max(1, Math.ceil(w / totalFrames));
     const maxX = Math.max(0, w - colW);
     // Per-column aggregates (max). -1 marks "no bright signal" for the conf lanes.
@@ -1901,7 +1894,7 @@
 
         <div class="hud mono">
           <span class="clip" title={selectedPath}>{selectedName}</span>
-          <span>frame {displayIndex}{totalFrames ? ` / ${totalFrames - 1}` : ""}</span>
+          <span>frame {displayIndex}{totalFrames ? ` / ${lastFrameIndex}` : ""}</span>
           {#if meta}<span>{fps.toFixed(1)} fps</span>{/if}
           <span class="kept">▣ {aboveCount}</span>
           <span class="dropped">▢ {belowCount}</span>

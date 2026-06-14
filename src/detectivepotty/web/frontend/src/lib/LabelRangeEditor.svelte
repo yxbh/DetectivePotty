@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { LabelPresentTrack, LabelRangeItem, LabelVocabulary } from "./types";
+  import { frameToSeconds } from "./video/frameTime";
 
   interface Props {
     siblingTracks: LabelPresentTrack[];
@@ -64,7 +65,7 @@
   });
 
   function fmtFrame(frame: number): string {
-    return `${frame} \u00b7 ${(frame / fps).toFixed(2)}s`;
+    return `${frame} \u00b7 ${frameToSeconds(frame, fps).toFixed(2)}s`;
   }
 </script>
 

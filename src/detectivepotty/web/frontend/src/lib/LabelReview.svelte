@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     fetchLabelClips,
     fetchLabelClipDetail,
@@ -19,6 +19,7 @@
   import { isTypingTarget } from "./keys";
   import { formatClock } from "./format";
   import { BOX_DOG, BOX_SIBLING, boxLabelFontPx, formatDetLabel, formatTrackLabel, isAliasClass } from "./overlayStyle";
+  import { observeResize } from "./resize";
   import Transport from "./Transport.svelte";
 
   const BEHAVIOR_KEYS: Record<string, string> = {
@@ -65,6 +66,9 @@
   let crops = $state<{ frame: number; url: string | null }[]>([]);
   let filmstripToken = 0;
   let detailToken = 0;
+  let rvfcHandle: number | null = null;
+  let stopLaneResize: (() => void) | null = null;
+  let cleanupThumbWait: (() => void) | null = null;
 
   const fps = $derived(detail && detail.fps > 0 ? detail.fps : 30);
   const totalFrames = $derived(detail ? Math.max(1, detail.frame_count) : 1);
@@ -152,6 +156,14 @@
 
   onMount(loadClips);
 
+  onDestroy(() => {
+    cancelFrameLoop();
+    stopLaneResize?.();
+    cleanupThumbWait?.();
+    filmstripToken++;
+    detailToken++;
+  });
+
   async function loadClips(): Promise<void> {
     listLoading = true;
     listError = null;
@@ -177,6 +189,9 @@
     selectedId = spanId;
     detailLoading = true;
     detailError = null;
+    cancelFrameLoop();
+    cleanupThumbWait?.();
+    cleanupThumbWait = null;
     detail = null;
     crops = [];
     try {
@@ -229,13 +244,31 @@
 
   function onLoadedMeta(): void {
     if (videoEl) videoEl.currentTime = 0.5 / fps;
-    if (hasRvfc && videoEl) {
-      const cb = (): void => {
-        syncFrame();
-        if (videoEl) (videoEl as HTMLVideoElement).requestVideoFrameCallback(cb);
-      };
-      (videoEl as HTMLVideoElement).requestVideoFrameCallback(cb);
+    registerFrameLoop();
+  }
+
+  function cancelFrameLoop(): void {
+    if (hasRvfc && videoEl && rvfcHandle !== null) {
+      try {
+        videoEl.cancelVideoFrameCallback(rvfcHandle);
+      } catch {
+        /* element may be detaching */
+      }
     }
+    rvfcHandle = null;
+  }
+
+  function registerFrameLoop(): void {
+    if (!hasRvfc || !videoEl) return;
+    cancelFrameLoop();
+    const cb = (): void => {
+      rvfcHandle = null;
+      syncFrame();
+      if (videoEl) {
+        rvfcHandle = videoEl.requestVideoFrameCallback(cb);
+      }
+    };
+    rvfcHandle = videoEl.requestVideoFrameCallback(cb);
   }
 
   // --- detection filmstrip (per-detection crop thumbnails) ----------------
@@ -248,6 +281,11 @@
         return;
       }
       const on = (): void => {
+        cleanupThumbWait = null;
+        v.removeEventListener("seeked", on);
+        resolve();
+      };
+      cleanupThumbWait = () => {
         v.removeEventListener("seeked", on);
         resolve();
       };
@@ -273,6 +311,11 @@
     if (v.readyState < 1) {
       await new Promise<void>((r) => {
         const on = (): void => {
+          cleanupThumbWait = null;
+          v.removeEventListener("loadedmetadata", on);
+          r();
+        };
+        cleanupThumbWait = () => {
           v.removeEventListener("loadedmetadata", on);
           r();
         };
@@ -389,6 +432,11 @@
     void ranges;
     void detail;
     drawLane();
+  });
+
+  $effect(() => {
+    stopLaneResize?.();
+    stopLaneResize = observeResize(laneEl, drawLane);
   });
 
   function laneSeek(event: MouseEvent): void {

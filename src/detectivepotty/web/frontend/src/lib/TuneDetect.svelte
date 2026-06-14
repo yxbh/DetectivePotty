@@ -39,6 +39,7 @@
     BOX_WEAK,
   } from "./overlayStyle";
   import { loadTuneLastDir, saveTuneLastDir } from "./prefs";
+  import { observeResize } from "./resize";
   import {
     DEFAULT_FLOOR,
     MAX_INFLIGHT,
@@ -100,6 +101,7 @@
   let videoEl = $state<HTMLVideoElement | null>(null);
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let stripEl = $state<HTMLCanvasElement | null>(null);
+  let stopStripResize: (() => void) | null = null;
   // Per-detection zoom-crop canvases, indexed alongside `zoomCards`.
   let zoomCanvases: HTMLCanvasElement[] = [];
   let showZoom = $state(true);
@@ -242,6 +244,7 @@
 
   onDestroy(() => {
     teardownClip();
+    stopStripResize?.();
   });
 
   function effectiveFps(m: TuneMeta | null): number {
@@ -683,7 +686,7 @@
   }
 
   function step(delta: number): void {
-    seekToIndex(presentedIndex + delta);
+    seekToIndex(intendedIndex + delta);
   }
 
   function togglePlay(): void {
@@ -1359,6 +1362,11 @@
     void trackingActive;
     void tracker;
     updateStrip();
+  });
+
+  $effect(() => {
+    stopStripResize?.();
+    stopStripResize = observeResize(stripEl, updateStrip);
   });
 
   // Redraw the per-detection zoom crops when the frame, detections, pose, or

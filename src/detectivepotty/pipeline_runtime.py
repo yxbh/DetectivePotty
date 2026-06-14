@@ -141,10 +141,14 @@ def call_camera_factory(
 
 
 def buffer_window_s(camera_config: CameraConfig) -> float:
+    pre_event_window_s = max(
+        camera_config.stationary_threshold_s,
+        camera_config.dwell_trigger_s,
+    )
     return max(
         1.0,
         camera_config.pre_roll_s
-        + camera_config.stationary_threshold_s
+        + pre_event_window_s
         + camera_config.event_duration_s
         + camera_config.post_roll_s
         + 2.0,

@@ -14,7 +14,7 @@ from detectivepotty.config import CameraConfig, CameraInputConfig, Config, Globa
 from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox
 from detectivepotty.pipeline import run_pipeline
-from detectivepotty.pipeline_runtime import live_buffer_max_frames
+from detectivepotty.pipeline_runtime import buffer_window_s, live_buffer_max_frames
 from detectivepotty.sources.base import Frame, VideoSource
 
 def make_config(dataset_dir: Path, video_path: Path | None, *, enabled: bool = True) -> Config:
@@ -60,6 +60,21 @@ def write_synthetic_video(path: Path, *, frames: int = 6, fps: float = 1.0) -> N
 
 def test_live_buffer_max_frames_covers_60fps_sources() -> None:
     assert live_buffer_max_frames(2.0) >= 122
+
+
+def test_buffer_window_covers_dwell_trigger_when_longer_than_stationary_window() -> None:
+    camera = CameraConfig(
+        id="cam-1",
+        name="Backyard",
+        input=CameraInputConfig(kind="file", path=Path("clip.mp4")),
+        pre_roll_s=1.0,
+        stationary_threshold_s=1.0,
+        dwell_trigger_s=8.0,
+        event_duration_s=2.0,
+        post_roll_s=1.5,
+    )
+
+    assert buffer_window_s(camera) == pytest.approx(14.5)
 
 
 class FakeDogDetector:

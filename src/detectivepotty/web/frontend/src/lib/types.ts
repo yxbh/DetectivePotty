@@ -20,7 +20,6 @@ export interface EventSummary {
   thumbnail_url: string | null;
   frames_count: number;
   crops_count: number;
-  protect_recording_exists: boolean;
   relative_dir: string;
   media_version: number;
 }
@@ -32,7 +31,6 @@ export interface MediaItem {
 
 export interface EventMedia {
   clip: string | null;
-  protect_recording: string | null;
   frames: MediaItem[];
   crops: MediaItem[];
   crops_overlay: MediaItem[];

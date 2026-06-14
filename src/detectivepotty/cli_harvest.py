@@ -563,6 +563,8 @@ def _resolve_harvest_window(
 ) -> tuple[datetime, datetime]:
     """Resolve the harvest window from --start/--end or a --date day."""
 
+    if (start is None) != (end is None):
+        raise typer.BadParameter("provide both --start and --end, or neither")
     if start is not None and end is not None:
         start_dt = _parse_iso(start)
         end_dt = _parse_iso(end)

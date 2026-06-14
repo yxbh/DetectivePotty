@@ -41,8 +41,6 @@ sequenceDiagram
 | `sources/rtsp.py` | Live RTSP/RTSPS latest-frame reader with reconnect/backoff. | `RTSPSource` |
 | `sources/rolling_buffer.py` | Thread-safe pre-roll frame ring and worker that pumps a source into it. | `RollingBuffer`, `BufferedSourceWorker` |
 | `protect/client.py` | UniFi Protect wrapper for camera discovery, RTSPS URLs, snapshots, and recording export. | `ProtectClient`, `ProtectCameraInfo`, `ProtectCameraChannel` |
-| `protect/trigger.py` | Deduplicated Protect Animal smart-detect WebSocket trigger parsing. | `ProtectAnimalTrigger`, `parse_smartdetect_event` |
-| `triggers/yolo.py` | YOLO fallback/corroboration trigger over a warm source. | `YoloTrigger`, `TriggerEvent` |
 | `tracking.py` | Lightweight IoU tracker. | `Tracker`, `iou` |
 | `potty_event.py` | Trigger-agnostic state machine for generic potty candidates. | `PottyEventDetector`, `PottyCandidate` |
 | `classify/heuristic.py` | Weak v0 pee/poop metadata prefill. Always needs human labeling. | `HeuristicPottyClassifier`, `ClassifierResult` |
@@ -54,7 +52,7 @@ sequenceDiagram
 ## Lifecycle details
 
 1. **Capture warms up first.** File mode decodes inline. Protect mode obtains an RTSPS URL, starts an `RTSPSource`, and pumps frames into a `RollingBuffer` so event capture is not cold-started.
-2. **Triggers annotate windows.** `ProtectAnimalTrigger` parses Animal smart-detect events with detection and notification timestamps. `YoloTrigger` can emit fallback dog-appearance triggers from a warm source. The state machine itself only needs detections and a `TriggerReason`, so it is trigger-agnostic.
+2. **Sampled YOLO detections feed tracking.** The pipeline samples decoded frames, runs `DogDetector`, tracks dogs by IoU, and passes tracks into the potty state machine. Protect smart-detect trigger adapters were removed because no production pipeline instantiated them.
 3. **Detect small, crop big.** `DogDetector` resizes only the inference frame. Detections are mapped back to original pixel coordinates. `EventRecorder` saves full frames and dog-centered crops from the original decoded frames.
 4. **Track posture.** `Tracker` links dog detections by IoU. `PottyEventDetector` emits a potty
    candidate when a non-suppressed track holds **stationary continuously for `dwell_trigger_s`**
@@ -65,7 +63,7 @@ sequenceDiagram
    camera/time-window `PottyCandidate`, not just a raw track ID.
 5. **Record after post-roll.** The pipeline waits for `post_roll_s`, assembles `[pre_roll, event, post_roll]` from the buffer/history, runs the weak classifier, and writes `clip.mp4`, `frames/`, `crops/`, and `metadata.json`.
 6. **Review is the source of truth.** The FastAPI app scans `metadata.json` files, serves media (a prebuilt Svelte frontend from `web/frontend/dist/`), and atomically updates `label`, `label_status`, `extra.label_note`, and `extra.labeled_at`.
-7. **Reruns reconcile, not duplicate.** With `dedupe_reruns` on (default), `EventRecorder` snapshots the prior on-disk events for each camera + source at the start of a run and matches each new event against that snapshot (Protect `event_id` → source-relative `[source_start_s, source_end_s]` overlap → wall-clock `[start_ts, end_ts]` overlap → start within `rerun_match_tolerance_s`). The source-relative offsets are anchor-independent (`frame_idx / fps`), so file reruns dedupe even when the wall-clock basis is the non-deterministic `runtime_now` fallback. A match reuses the prior identity, carries human label fields forward, refreshes the media, moves `protect_recording.mp4` forward, and supersedes the duplicate — only after the new metadata is committed. Disagreeing labeled matches are treated as conflicts (carry nothing, delete nothing); unmatched labeled priors are kept. The `dedupe-events` CLI applies the same logic to existing on-disk duplicates without re-detecting; `cleanup-legacy` reversibly quarantines pre-determinism duplicates (unlabeled, no offsets, source still present) into `<dataset>/.trash/` so a clean rerun can regenerate honest events.
+7. **Reruns reconcile, not duplicate.** With `dedupe_reruns` on (default), `EventRecorder` snapshots the prior on-disk events for each camera + source at the start of a run and matches each new event against that snapshot (Protect `event_id` → source-relative `[source_start_s, source_end_s]` overlap → wall-clock `[start_ts, end_ts]` overlap → start within `rerun_match_tolerance_s`). The source-relative offsets are anchor-independent (`frame_idx / fps`), so file reruns dedupe even when the wall-clock basis is the non-deterministic `runtime_now` fallback. A match reuses the prior identity, carries human label fields forward, refreshes the media, and supersedes the duplicate — only after the new metadata is committed. Disagreeing labeled matches are treated as conflicts (carry nothing, delete nothing); unmatched labeled priors are kept. The `dedupe-events` CLI applies the same logic to existing on-disk duplicates without re-detecting; `cleanup-legacy` reversibly quarantines pre-determinism duplicates (unlabeled, no offsets, source still present) into `<dataset>/.trash/` so a clean rerun can regenerate honest events.
 
 ## Threading model
 

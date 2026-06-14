@@ -28,6 +28,7 @@ import json
 from pathlib import Path
 import shutil
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from detectivepotty.events import Label, LabelStatus
 
@@ -102,13 +103,36 @@ def is_legacy(metadata: dict[str, Any]) -> bool:
 
 
 def _source_exists(metadata: dict[str, Any]) -> bool:
-    source_id = metadata.get("sanitized_source_id")
-    if not isinstance(source_id, str) or not source_id:
+    for key in ("source_path", "source_id", "sanitized_source_id"):
+        if _source_value_exists(metadata.get(key)):
+            return True
+    return False
+
+
+def _source_value_exists(value: object) -> bool:
+    if not isinstance(value, str) or not value:
         return False
-    try:
-        return Path(source_id).is_file()
-    except OSError:
-        return False
+    for candidate in _source_path_candidates(value):
+        try:
+            if candidate.is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _source_path_candidates(value: str) -> list[Path]:
+    candidates = [Path(value)]
+    parts = urlsplit(value)
+    if parts.scheme == "file":
+        file_path = unquote(parts.path or parts.netloc)
+        if file_path:
+            candidates.append(Path(file_path))
+    if value.startswith("file:"):
+        file_path = unquote(value.removeprefix("file:"))
+        if file_path:
+            candidates.append(Path(file_path))
+    return candidates
 
 
 def _classify(metadata: dict[str, Any]) -> str:

@@ -6,17 +6,14 @@ The v0 pee-vs-poop result is a **weak guess, not ground truth**. Every recorded 
 
 ## Architecture
 
-DetectivePotty keeps camera streams warm, uses triggers to mark interesting time windows, detects and tracks dogs, then records reviewable events. The key strategy is **detect small, crop big**: YOLO runs on downscaled frames for speed, but bounding boxes are mapped back to original-resolution frames before saving full frames and dog crops for training.
+DetectivePotty keeps camera streams warm, samples frames for YOLO dog detections, tracks dogs, then records reviewable potty candidates. The key strategy is **detect small, crop big**: YOLO runs on downscaled frames for speed, but bounding boxes are mapped back to original-resolution frames before saving full frames and dog crops for training.
 
-Latency is handled with a warm `RollingBuffer` pre-roll. A late Protect or YOLO trigger reaches backward into already-decoded frames, and Protect recording download is available as a best-effort high-quality source for the same window.
+Latency is handled with a warm `RollingBuffer` pre-roll, so recording can reach backward into already-decoded frames once the sustained-dwell state machine emits a candidate.
 
 ```mermaid
 flowchart LR
     A[UniFi cameras / file clips] --> B[Protect client / VideoSource]
     B --> C[Warm RollingBuffer pre-roll]
-    B --> D[Triggers]
-    D --> D1[Protect animal WS primary]
-    D --> D2[YOLO fallback / corroboration]
     C --> E[DogDetector YOLO]
     E --> F[Tracker]
     F --> G[PottyEventDetector state machine]
@@ -340,7 +337,7 @@ Detection is meant to be re-run as you tune thresholds. With `global.dedupe_reru
 
 - **reuses the prior event's identity** and **carries your human review forward** — `label`, `label_status`, `dog`, the review note, and `labeled_at`;
 - **refreshes the media** (frames, crops, clip) so you review the latest detector output; and
-- **supersedes the old directory** (Protect's `protect_recording.mp4` is moved forward first, so file reruns never re-download it).
+- **supersedes the old directory** after the replacement metadata/media has been committed.
 
 Matching is per camera + sanitized source, by (in priority order) an exact Protect `event_id`, overlapping source-relative `[source_start_s, source_end_s]` offsets (the anchor-independent key for file reruns), overlapping wall-clock `[start_ts, end_ts]` intervals, or a start time within `global.rerun_match_tolerance_s` seconds (the fallback for older events recorded before offsets/`end_ts` were stored). Events written by the current run are never matched against each other.
 
@@ -381,7 +378,6 @@ It is conservative and reversible. Per camera + source, an event is removed **on
 ```text
 <dataset_dir>/<camera>/<YYYY-MM-DD>/events/<YYYYMMDDTHHMMSSZ>_<camera>_<track>_<eventId>/
     clip.mp4
-    protect_recording.mp4   # optional
     frames/000.jpg ...
     crops/000.jpg ...
     metadata.json

@@ -560,15 +560,6 @@
           </section>
         {/if}
 
-        {#if media.protect_recording}
-          <section class="media-strip">
-            <h3>Protect recording</h3>
-            <a class="protect-link" href={versioned(media.protect_recording, mediaVersion)}>
-              Open Protect recording →
-            </a>
-          </section>
-        {/if}
-
         {#if poseRows.length > 0}
           <section class="pose-panel">
             <h3>Pose features <span class="muted">({poseFrameCount} posed frames)</span></h3>
@@ -1094,16 +1085,6 @@
     object-fit: cover;
     border-radius: calc(var(--radius-sm) - 2px);
     display: block;
-  }
-
-  .protect-link {
-    color: var(--teal);
-    text-decoration: none;
-    font-weight: 600;
-  }
-
-  .protect-link:hover {
-    text-decoration: underline;
   }
 
   .metadata-panel summary {

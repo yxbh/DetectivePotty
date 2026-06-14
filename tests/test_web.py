@@ -38,7 +38,6 @@ def make_event(
     utc_ts: datetime,
     label_status: LabelStatus = LabelStatus.UNLABELED,
     label: Label = Label.UNKNOWN,
-    protect: bool = False,
 ) -> Path:
     dir_ts = utc_ts.strftime("%Y%m%dT%H%M%SZ")
     event_dir = (
@@ -51,8 +50,6 @@ def make_event(
     (event_dir / "frames").mkdir(parents=True)
     (event_dir / "crops").mkdir()
     (event_dir / "clip.mp4").write_bytes(b"fake mp4 clip")
-    if protect:
-        (event_dir / "protect_recording.mp4").write_bytes(b"fake protect clip")
     write_image(event_dir / "frames" / "000.jpg", (0, 0, 255))
     write_image(event_dir / "frames" / "001.jpg", (0, 255, 0))
     write_image(event_dir / "crops" / "000.jpg", (255, 0, 0))
@@ -94,7 +91,6 @@ def test_events_list_sorting_and_filters(tmp_path: Path) -> None:
         utc_ts=BASE_TS + timedelta(hours=1),
         label_status=LabelStatus.LABELED,
         label=Label.PEE,
-        protect=True,
     )
     client = make_client(tmp_path)
 
@@ -115,7 +111,6 @@ def test_events_list_sorting_and_filters(tmp_path: Path) -> None:
     assert events[0]["thumbnail_url"].endswith("/crops/000.jpg")
     assert events[0]["frames_count"] == 2
     assert events[0]["crops_count"] == 1
-    assert events[0]["protect_recording_exists"] is True
     assert events[0]["relative_dir"].startswith("Sideyard/2026-06-06/events/")
 
     unlabeled = client.get("/api/events", params={"label_status": "unlabeled"})
@@ -137,7 +132,6 @@ def test_event_detail_and_media_serving_block_traversal(tmp_path: Path) -> None:
         event_id="event-a",
         camera="Backyard",
         utc_ts=BASE_TS,
-        protect=True,
     )
     client = make_client(tmp_path)
 
@@ -148,7 +142,6 @@ def test_event_detail_and_media_serving_block_traversal(tmp_path: Path) -> None:
     assert detail["metadata"]["event_id"] == "event-a"
     assert detail["summary"]["event_id"] == "event-a"
     assert detail["media"]["clip"] == "/api/events/event-a/media/clip"
-    assert detail["media"]["protect_recording"] == "/api/events/event-a/media/protect"
     assert [frame["name"] for frame in detail["media"]["frames"]] == ["000.jpg", "001.jpg"]
     assert [crop["name"] for crop in detail["media"]["crops"]] == ["000.jpg"]
 
@@ -385,4 +378,47 @@ def test_stream_pushes_new_events(tmp_path: Path) -> None:
     assert '"event_id": "fresh"' in text
     assert '"camera": "Sideyard"' in text
     # The pre-existing event was seeded as known and must not be re-emitted.
+    assert '"event_id": "seed"' not in text
+
+
+def test_stream_retries_initial_scan_without_replaying_seeded_events(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from detectivepotty.web.app import _event_stream
+    from detectivepotty.web.dataset_index import DatasetIndex
+
+    make_event(tmp_path, event_id="seed", camera="Backyard", utc_ts=BASE_TS)
+
+    class FlakyIndex(DatasetIndex):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.scan_calls = 0
+
+        def scan(self):
+            self.scan_calls += 1
+            if self.scan_calls == 1:
+                raise RuntimeError("temporary scan failure")
+            return super().scan()
+
+    index = FlakyIndex(tmp_path)
+    state = {"checks": 0}
+
+    async def is_disconnected() -> bool:
+        state["checks"] += 1
+        return state["checks"] >= 2
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    async def drive() -> list[str]:
+        return [
+            chunk async for chunk in _event_stream(index, is_disconnected, sleep=no_sleep)
+        ]
+
+    text = "".join(asyncio.run(drive()))
+
+    assert "event: ready" in text
+    assert "event: new" not in text
     assert '"event_id": "seed"' not in text

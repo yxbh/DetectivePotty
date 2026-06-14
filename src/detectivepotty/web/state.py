@@ -48,6 +48,8 @@ def init_app_state(
     app.state.tune_detector_lock = threading.Lock()
     app.state.tune_infer_lock = threading.Lock()
     app.state.tune_pose_lock = threading.Lock()
+    app.state.event_label_lock = threading.Lock()
+    app.state.clip_label_lock = threading.Lock()
     # Serializes CoreML exports (heavy, macOS-only) triggered from the tuner UI so
     # only one runs at a time.
     app.state.tune_export_lock = threading.Lock()

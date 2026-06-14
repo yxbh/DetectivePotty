@@ -57,6 +57,7 @@ def detect_file(
 
     from detectivepotty.detect.yolo import DogDetector
     from detectivepotty.sources.pyav_capture import open_capture
+    from detectivepotty.video_encode import open_h264_writer
 
     cap = open_capture(str(input_path))
     if not cap.isOpened():
@@ -69,38 +70,33 @@ def detect_file(
         cap.release()
         raise typer.BadParameter("Input video did not report a valid resolution")
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(output),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
+    try:
+        writer = open_h264_writer(output, fps, (width, height))
+    except OSError as exc:
         cap.release()
-        raise typer.BadParameter(f"Could not open output video writer: {output}")
-
-    if save_crops is not None:
-        save_crops.mkdir(parents=True, exist_ok=True)
-
-    alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes)
-    detector = DogDetector(
-        model_name=model,
-        long_edge=long_edge,
-        device="auto",
-        alias_classes=alias_classes,
-        alias_nms_iou=alias_nms_iou,
-    )
-    frame_idx = 0
-    detection_frames = 0
-    dogs_detected = 0
-    frames_with_dog = 0
-    crops_saved = 0
-    inference_latencies_ms: list[float] = []
-    inference_resolution: tuple[int, int] | None = None
+        raise typer.BadParameter(f"Could not open output video writer: {output}") from exc
     started = time.perf_counter()
 
     try:
+        if save_crops is not None:
+            save_crops.mkdir(parents=True, exist_ok=True)
+
+        alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes)
+        detector = DogDetector(
+            model_name=model,
+            long_edge=long_edge,
+            device="auto",
+            alias_classes=alias_classes,
+            alias_nms_iou=alias_nms_iou,
+        )
+        frame_idx = 0
+        detection_frames = 0
+        dogs_detected = 0
+        frames_with_dog = 0
+        crops_saved = 0
+        inference_latencies_ms: list[float] = []
+        inference_resolution: tuple[int, int] | None = None
+
         while True:
             ok, frame = cap.read()
             if not ok:

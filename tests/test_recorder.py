@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 import json
-from unittest.mock import AsyncMock
 
 import numpy as np
 
@@ -15,9 +13,26 @@ from detectivepotty.potty_event import PottyCandidate, PottyLifecycle
 from detectivepotty.pose.features import PoseFeatures
 from detectivepotty.pose.keypoints import Keypoint, PoseKeypoints
 from detectivepotty.recording.recorder import EventRecorder
+from detectivepotty.recording import recorder as recorder_mod
 from detectivepotty.sources.base import Frame
 
 BASE_TS = datetime(2026, 6, 6, 9, 10, 47, tzinfo=timezone.utc)
+
+
+def test_git_provenance_only_accepts_detectivepotty_repo(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "other-project"\n',
+        encoding="utf-8",
+    )
+
+    assert recorder_mod._looks_like_detectivepotty_repo(tmp_path) is False
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "detectivepotty"\n',
+        encoding="utf-8",
+    )
+
+    assert recorder_mod._looks_like_detectivepotty_repo(tmp_path) is True
 
 
 def camera_config(**overrides: object) -> CameraConfig:
@@ -210,49 +225,6 @@ def test_event_recorder_without_pose_skips_pose_extra_and_overlays(tmp_path) -> 
     metadata = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
     assert "pose" not in metadata["extra"]
     assert not (target / "crops_overlay").exists()
-
-
-def test_maybe_download_protect_recording_awaits_client_with_preroll(tmp_path) -> None:
-    camera = camera_config()
-    potty_candidate = candidate()
-    event_path = tmp_path / "event"
-    expected_path = event_path / "protect_recording.mp4"
-    protect_client = type("Client", (), {})()
-    protect_client.download_recording = AsyncMock(return_value=expected_path)
-    recorder = EventRecorder(
-        config(tmp_path, camera),
-        protect_client=protect_client,
-        git_commit="abc123",
-    )
-
-    result = asyncio.run(
-        recorder.maybe_download_protect_recording(potty_candidate, camera, event_path),
-    )
-
-    assert result == expected_path
-    protect_client.download_recording.assert_awaited_once()
-    args = protect_client.download_recording.await_args.args
-    assert args[0] == "cam-1"
-    assert args[1] == potty_candidate.start_ts - timedelta(seconds=2.0)
-    assert args[2] == potty_candidate.end_ts + timedelta(seconds=3.0)
-    assert args[3] == expected_path
-
-
-def test_maybe_download_protect_recording_is_best_effort(tmp_path) -> None:
-    camera = camera_config()
-    protect_client = type("Client", (), {})()
-    protect_client.download_recording = AsyncMock(side_effect=RuntimeError("boom"))
-    recorder = EventRecorder(
-        config(tmp_path, camera),
-        protect_client=protect_client,
-        git_commit="abc123",
-    )
-
-    result = asyncio.run(
-        recorder.maybe_download_protect_recording(candidate(), camera, tmp_path / "event"),
-    )
-
-    assert result is None
 
 
 def test_assemble_window_uses_pre_and_post_roll() -> None:

@@ -104,8 +104,6 @@ class DatasetIndex:
         camera_name = _optional_str(metadata.get("camera_name"))
         camera_id = _optional_str(metadata.get("camera_id"))
         camera = camera_name or camera_id or record.camera_dir or "unknown"
-        protect_path = fixed_media_path(record, "protect_recording.mp4", missing_ok=True)
-
         return {
             "event_id": record.event_id,
             "camera": camera,
@@ -131,7 +129,6 @@ class DatasetIndex:
             "thumbnail_url": thumbnail_url,
             "frames_count": frames_count,
             "crops_count": crops_count,
-            "protect_recording_exists": protect_path is not None,
             "relative_dir": record.relative_dir,
             "media_version": _media_version(record),
         }
@@ -141,16 +138,12 @@ class DatasetIndex:
         crops = media_names(record, "crops")
         crops_overlay = media_names(record, "crops_overlay")
         clip = fixed_media_path(record, "clip.mp4", missing_ok=True)
-        protect = fixed_media_path(record, "protect_recording.mp4", missing_ok=True)
 
         return {
             "summary": self.summary(record),
             "metadata": record.metadata,
             "media": {
                 "clip": fixed_media_url(record.event_id, "clip") if clip else None,
-                "protect_recording": (
-                    fixed_media_url(record.event_id, "protect") if protect else None
-                ),
                 "frames": [
                     {"name": name, "url": media_url(record.event_id, "frames", name)}
                     for name in frames

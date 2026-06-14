@@ -14,7 +14,6 @@ Safety properties (see the recorder for how they are wired):
   wrote (no self-deletion).
 - Disagreeing human labels are treated as a conflict: nothing is carried and
   nothing is deleted.
-- ``protect_recording.mp4`` is carried forward before a prior dir is removed.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ import shutil
 from typing import Any
 
 from detectivepotty.events import LabelStatus
-
-PROTECT_RECORDING_NAME = "protect_recording.mp4"
 
 
 @dataclass
@@ -228,25 +225,6 @@ def decide_carry(matched: list[PriorEvent]) -> ReconcileResult:
         carried=carried,
         superseded=list(matched),
     )
-
-
-def preserve_protect_recording(old_dir: Path, new_dir: Path) -> bool:
-    """Move a prior ``protect_recording.mp4`` into ``new_dir`` if it lacks one.
-
-    Returns ``True`` when there is nothing to preserve or the move succeeds, and
-    ``False`` when a recording exists but could not be carried forward (so a
-    caller can choose to keep the source dir instead of deleting it).
-    """
-
-    src = old_dir / PROTECT_RECORDING_NAME
-    dst = new_dir / PROTECT_RECORDING_NAME
-    try:
-        if not src.is_file() or src.is_symlink() or dst.exists():
-            return True
-        shutil.move(str(src), str(dst))
-        return True
-    except OSError:
-        return False
 
 
 def remove_event_dir(path: Path) -> None:
@@ -472,10 +450,6 @@ def _dedupe_cluster(cluster: list[PriorEvent], *, dry_run: bool) -> DedupeAction
 
     removed: list[Path] = []
     for prior in removable:
-        # Also fail-closed on protect-recording preservation: if a recording
-        # exists but cannot be carried forward, keep the source dir.
-        if not preserve_protect_recording(prior.dir_path, keeper.dir_path):
-            continue
         remove_event_dir(prior.dir_path)
         removed.append(prior.dir_path)
 

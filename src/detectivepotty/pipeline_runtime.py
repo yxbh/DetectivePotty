@@ -19,7 +19,9 @@ from detectivepotty.recording.recorder import EventRecorder
 from detectivepotty.sources.base import Frame, VideoSource
 
 # Assumed worst-case decode rate used to bound per-camera live buffer memory.
-_LIVE_ASSUMED_MAX_FPS = 30.0
+# 60fps keeps pre-roll intact for common high-fps cameras while still bounding
+# long-running live buffers when the source cannot report its decode rate up front.
+_LIVE_ASSUMED_MAX_FPS = 60.0
 
 
 class Detector(Protocol):

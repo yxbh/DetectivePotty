@@ -21,6 +21,8 @@ const acknowledged = new Set<string>();
 // Ids already ingested into the feed — dedupes the SSE push vs the poll/reconcile
 // paths so an event is only ever surfaced once.
 const seen = new Set<string>();
+// Seen events that are not part of the currently-acknowledged Review list.
+const pendingNew = new Set<string>();
 const hooks = new Set<(summary: EventSummary) => void>();
 
 let source: EventSource | null = null;
@@ -34,12 +36,13 @@ export function onLiveEvent(cb: (summary: EventSummary) => void): () => void {
   return () => hooks.delete(cb);
 }
 
-/** Mark events as already shown in Review; resets the banner counter. */
+/** Mark events as already shown in Review; keeps hidden filtered events pending. */
 export function acknowledgeEvents(ids: string[]): void {
   for (const id of ids) {
     acknowledged.add(id);
+    pendingNew.delete(id);
   }
-  liveNewCount.set(0);
+  liveNewCount.set(pendingNew.size);
 }
 
 function ingest(summary: EventSummary, notify: boolean): void {
@@ -50,7 +53,8 @@ function ingest(summary: EventSummary, notify: boolean): void {
   seen.add(id);
   liveEvents.update((list) => [summary, ...list].slice(0, MAX_FEED));
   if (!acknowledged.has(id)) {
-    liveNewCount.update((n) => n + 1);
+    pendingNew.add(id);
+    liveNewCount.set(pendingNew.size);
     if (notify) {
       for (const cb of hooks) {
         try {

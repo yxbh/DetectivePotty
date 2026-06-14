@@ -187,15 +187,20 @@ class ProtectClient:
         """Close websocket and HTTP sessions owned by uiprotect."""
 
         api = self._api
-        if api is None:
-            return
-        if hasattr(api, "async_disconnect_ws"):
-            await api.async_disconnect_ws()
-        if hasattr(api, "close_session"):
-            await api.close_session()
-        if hasattr(api, "close_public_api_session"):
-            await api.close_public_api_session()
-        self._connected = False
+        try:
+            if api is None:
+                return
+            if hasattr(api, "async_disconnect_ws"):
+                await api.async_disconnect_ws()
+            if hasattr(api, "close_session"):
+                await api.close_session()
+            if hasattr(api, "close_public_api_session"):
+                await api.close_public_api_session()
+        finally:
+            self._connected = False
+            self._private_enabled = False
+            self._public_enabled = False
+            self._public_rtsps_streams.clear()
 
     async def list_cameras(self) -> list[ProtectCameraInfo]:
         """Return connected/capability/channel metadata without raw RTSP secrets."""

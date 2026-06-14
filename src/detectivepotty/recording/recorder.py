@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import tomllib
 from typing import Any, NamedTuple
 from uuid import uuid4
 
@@ -19,7 +20,6 @@ from detectivepotty.recording.clip_writer import write_frames_to_mp4
 from detectivepotty.recording.dataset import (
     camera_dataset_dir,
     event_dir,
-    sanitize_path_component,
     write_event_images,
 )
 from detectivepotty.recording.pose_overlay import write_pose_overlays
@@ -29,7 +29,6 @@ from detectivepotty.recording.reconcile import (
     decide_carry,
     match_priors,
     paths_equal,
-    preserve_protect_recording,
     remove_event_dir,
     snapshot_prior_events,
 )
@@ -216,7 +215,6 @@ class EventRecorder:
         for _prior, path in to_delete:
             if paths_equal(path, target_dir):
                 continue
-            preserve_protect_recording(path, target_dir)
             remove_event_dir(path)
         if superseded:
             self._drop_from_snapshot(camera_config, source_id, superseded)
@@ -256,30 +254,6 @@ class EventRecorder:
             LOGGER.warning(
                 "Pose overlay generation failed for event %s", target_dir.name
             )
-
-    async def maybe_download_protect_recording(
-        self,
-        candidate: PottyCandidate,
-        camera_config: CameraConfig,
-        target_event_dir: str | Path,
-    ) -> Path | None:
-        if self.protect_client is None:
-            return None
-
-        start = candidate.start_ts - timedelta(seconds=camera_config.pre_roll_s)
-        end = candidate.end_ts + timedelta(seconds=camera_config.post_roll_s)
-        dest = Path(target_event_dir) / "protect_recording.mp4"
-        try:
-            return await self.protect_client.download_recording(
-                camera_config.id,
-                start,
-                end,
-                dest,
-            )
-        except Exception:
-            safe_camera = sanitize_path_component(camera_config.id)
-            LOGGER.warning("Protect recording download failed for camera %s", safe_camera)
-            return None
 
     def _metadata(
         self,
@@ -541,7 +515,9 @@ def _ensure_utc(value: datetime) -> datetime:
 
 
 def _resolve_git_commit() -> str | None:
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = _detectivepotty_git_root(Path(__file__).resolve().parent)
+    if repo_root is None:
+        return None
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -555,3 +531,31 @@ def _resolve_git_commit() -> str | None:
         return None
     commit = result.stdout.strip()
     return commit or None
+
+
+def _detectivepotty_git_root(cwd: Path) -> Path | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    root_text = result.stdout.strip()
+    if not root_text:
+        return None
+    root = Path(root_text).resolve()
+    return root if _looks_like_detectivepotty_repo(root) else None
+
+
+def _looks_like_detectivepotty_repo(root: Path) -> bool:
+    try:
+        pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    project = pyproject.get("project")
+    return isinstance(project, dict) and project.get("name") == "detectivepotty"

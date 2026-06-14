@@ -227,6 +227,14 @@ def test_connect_falls_back_to_public_when_private_auth_fails(
     assert client._public_enabled is True  # noqa: SLF001
     assert "private auth failed" in caplog.text
 
+    client._public_rtsps_streams["cam-1"] = object()  # noqa: SLF001
+    asyncio.run(client.close())
+
+    assert client._connected is False  # noqa: SLF001
+    assert client._private_enabled is False  # noqa: SLF001
+    assert client._public_enabled is False  # noqa: SLF001
+    assert client._public_rtsps_streams == {}  # noqa: SLF001
+
 
 def test_connect_raises_when_private_fails_and_no_public_key(
     monkeypatch: pytest.MonkeyPatch,
@@ -243,4 +251,3 @@ def test_connect_raises_when_private_fails_and_no_public_key(
     assert api.update_public_calls == 0
     assert client._private_enabled is False  # noqa: SLF001
     assert client._public_enabled is False  # noqa: SLF001
-

@@ -44,14 +44,15 @@ def register_label_routes(
 
         from detectivepotty.web import labeling
 
-        try:
-            clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="clip not found") from exc
-        try:
-            return labeling.save_clip_labels(clip_dir, payload, app.state.harvest_root)
-        except (ValueError, KeyError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        with app.state.clip_label_lock:
+            try:
+                clip_dir = labeling.clip_dir_for(app.state.harvest_root, span_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="clip not found") from exc
+            try:
+                return labeling.save_clip_labels(clip_dir, payload, app.state.harvest_root)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/label/clips/{span_id}/video")
     def label_clip_video(span_id: str) -> FileResponse:

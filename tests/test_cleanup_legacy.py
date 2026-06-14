@@ -80,6 +80,33 @@ def test_plan_classifies_each_event(tmp_path: Path) -> None:
     assert by_dir[missing] == KEEP_SOURCE_MISSING
 
 
+def test_plan_checks_source_path_when_sanitized_id_is_not_a_path(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    src = make_source(tmp_path)
+    legacy = write_event(dataset, event_id="legacy", source_path="file:backyard")
+    metadata_path = legacy / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["source_path"] = src
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    report = plan_cleanup(dataset)
+
+    assert report.items[0].classification == REMOVE_LEGACY
+
+
+def test_plan_accepts_file_url_source_ids(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    src = make_source(tmp_path)
+    legacy = write_event(dataset, event_id="legacy", source_path=f"file:{src}")
+
+    report = plan_cleanup(dataset)
+    by_dir = {item.event_dir: item.classification for item in report.items}
+
+    assert by_dir[legacy] == REMOVE_LEGACY
+
+
 def test_dry_run_moves_nothing(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     src = make_source(tmp_path)

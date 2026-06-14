@@ -369,25 +369,6 @@ def test_same_run_does_not_self_match(tmp_path: Path) -> None:
     assert len(event_dirs(tmp_path)) == 2
 
 
-def test_protect_recording_carried_forward(tmp_path: Path) -> None:
-    camera = camera_config()
-    cfg = make_config(tmp_path, camera)
-    frames = [make_frame(idx) for idx in range(5)]
-
-    first_dir = EventRecorder(cfg).record(make_candidate(), frames, camera)
-    (first_dir / "protect_recording.mp4").write_bytes(b"protect-bytes")
-    label_on_disk(first_dir)
-
-    second_dir = EventRecorder(cfg).record(
-        make_candidate(start_offset=2.0, end_offset=3.0), frames, camera
-    )
-
-    assert event_dirs(tmp_path) == [second_dir]
-    carried = second_dir / "protect_recording.mp4"
-    assert carried.exists()
-    assert carried.read_bytes() == b"protect-bytes"
-
-
 def test_dedupe_disabled_appends(tmp_path: Path) -> None:
     camera = camera_config()
     cfg = make_config(tmp_path, camera, dedupe_reruns=False)
@@ -533,26 +514,6 @@ def test_apply_carried_reports_read_failure(tmp_path: Path) -> None:
 
     (missing / "metadata.json").write_text("{}", encoding="utf-8")
     assert _apply_carried_to_metadata_file(missing, {"label": "poop"}) is True
-
-
-def test_preserve_protect_recording_returns_status(tmp_path: Path) -> None:
-    from detectivepotty.recording.reconcile import (
-        PROTECT_RECORDING_NAME,
-        preserve_protect_recording,
-    )
-
-    old = tmp_path / "old"
-    new = tmp_path / "new"
-    old.mkdir()
-    new.mkdir()
-
-    # Nothing to move -> success.
-    assert preserve_protect_recording(old, new) is True
-
-    (old / PROTECT_RECORDING_NAME).write_bytes(b"data")
-    assert preserve_protect_recording(old, new) is True
-    assert (new / PROTECT_RECORDING_NAME).is_file()
-    assert not (old / PROTECT_RECORDING_NAME).exists()
 
 
 def test_dedupe_dataset_skips_records_missing_identity(tmp_path: Path) -> None:

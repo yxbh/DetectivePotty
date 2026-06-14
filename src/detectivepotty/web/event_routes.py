@@ -33,11 +33,11 @@ async def _event_stream(
 
     if poll_seconds is None:
         poll_seconds = STREAM_POLL_SECONDS
-    try:
-        records = await run_in_threadpool(dataset_index.scan)
-    except Exception:  # pragma: no cover - defensive
-        records = []
-    known: set[str] = {record.event_id for record in records}
+    known = await _seed_known_event_ids(
+        dataset_index, is_disconnected, sleep=sleep, poll_seconds=poll_seconds
+    )
+    if known is None:
+        return
     yield f"event: ready\ndata: {json.dumps({'count': len(known)})}\n\n"
 
     while True:
@@ -59,6 +59,26 @@ async def _event_stream(
             payload = json.dumps(summary)
             yield f"id: {record.event_id}\nevent: new\ndata: {payload}\n\n"
         yield ": ping\n\n"
+
+
+async def _seed_known_event_ids(
+    dataset_index,
+    is_disconnected,
+    *,
+    sleep,
+    poll_seconds: float,
+) -> set[str] | None:
+    """Return the initial known event ids; retry so seed failures don't replay all."""
+
+    while True:
+        try:
+            records = await run_in_threadpool(dataset_index.scan)
+            return {record.event_id for record in records}
+        except Exception:
+            logger.warning("Initial event stream scan failed; retrying.", exc_info=True)
+            if await is_disconnected():
+                return None
+            await sleep(poll_seconds)
 
 
 def register_event_routes(
@@ -137,16 +157,6 @@ def register_event_routes(
             path, media_type="video/mp4", headers={"Cache-Control": MEDIA_CACHE_CONTROL}
         )
 
-    @app.get("/api/events/{event_id}/media/protect")
-    def get_protect_recording(event_id: str) -> FileResponse:
-        record = _event_or_404(dataset_index, event_id)
-        path = fixed_media_path(record, "protect_recording.mp4", missing_ok=True)
-        if path is None:
-            raise HTTPException(status_code=404, detail="protect recording not found")
-        return FileResponse(
-            path, media_type="video/mp4", headers={"Cache-Control": MEDIA_CACHE_CONTROL}
-        )
-
     @app.get("/api/events/{event_id}/frames/{name:path}")
     def get_frame(event_id: str, name: str) -> FileResponse:
         return _serve_image(dataset_index, event_id, "frames", name)
@@ -161,24 +171,25 @@ def register_event_routes(
 
     @app.post("/api/events/{event_id}/label")
     def label_event(event_id: str, update: LabelUpdate) -> dict:
-        record = _event_or_404(dataset_index, event_id)
-        dog_kwargs: dict = {}
-        if "dog" in update.model_fields_set:
-            dog = update.dog.strip() if update.dog is not None else None
-            dog = dog or None
-            if dog is not None and dogs and dog not in dogs:
-                raise HTTPException(status_code=422, detail="unknown dog")
-            dog_kwargs["dog"] = dog
-        try:
-            return dataset_index.update_label(
-                record,
-                label=update.label,
-                label_status=update.label_status,
-                note=update.note,
-                **dog_kwargs,
-            )
-        except (OSError, ValueError) as exc:
-            raise HTTPException(status_code=500, detail="label update failed") from exc
+        with app.state.event_label_lock:
+            record = _event_or_404(dataset_index, event_id)
+            dog_kwargs: dict = {}
+            if "dog" in update.model_fields_set:
+                dog = update.dog.strip() if update.dog is not None else None
+                dog = dog or None
+                if dog is not None and dogs and dog not in dogs:
+                    raise HTTPException(status_code=422, detail="unknown dog")
+                dog_kwargs["dog"] = dog
+            try:
+                return dataset_index.update_label(
+                    record,
+                    label=update.label,
+                    label_status=update.label_status,
+                    note=update.note,
+                    **dog_kwargs,
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(status_code=500, detail="label update failed") from exc
 
 
 def _event_or_404(dataset_index: DatasetIndex, event_id: str):

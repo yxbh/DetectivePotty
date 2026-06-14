@@ -17,6 +17,7 @@ from detectivepotty.classify.pose import PosePottyClassifier
 from detectivepotty.config import CameraConfig, Config
 from detectivepotty.detect.yolo import DogDetector
 from detectivepotty.events import Detection
+from detectivepotty.pipeline_file import process_file_camera as run_file_camera
 from detectivepotty.pipeline_runtime import (
     ClassifierFactory,
     Detector,
@@ -29,15 +30,11 @@ from detectivepotty.pipeline_runtime import (
     StateMachineFactory,
     buffer_window_s as _buffer_window_s,
     call_camera_factory as _call_camera_factory,
-    detect_frames_batched as _detect_frames_batched,
-    history_max_frames as _history_max_frames,
     is_live_kind as _is_live_kind,
     is_valid_rtsp_url as _is_valid_rtsp_url,
     live_buffer_max_frames as _live_buffer_max_frames,
     redact_url as _redact_url,
-    retimestamp_file_frame as _retimestamp_file_frame,
-    sample_every as _sample_every,
-    source_fps as _source_fps,
+    detect_frames_batched as _detect_frames_batched,
 )
 from detectivepotty.pipeline_recording import record_all_pending, record_ready_pending
 from detectivepotty.pose.base import PoseEstimator
@@ -235,111 +232,17 @@ class PottyPipeline:
         return []
 
     def process_file_camera(self, camera_config: CameraConfig) -> list[Path]:
-        if camera_config.input.path is None:
-            LOGGER.warning("File camera %s has no input path", sanitize_source_id(camera_config.id))
-            return []
-
-        detector = self._new_detector(camera_config)
-        classifier = self._new_classifier(camera_config)
-        state_machine = self._new_state_machine(camera_config)
-        recorder = self.recorder_factory(self.config, None)
-        buffer_window_s = _buffer_window_s(camera_config)
-        buffer = RollingBuffer(buffer_window_s)
-        source = self.file_source_factory(camera_config)
-        event_dirs: list[Path] = []
-        pending: list[_PendingCandidate] = []
-
-        with source:
-            source_fps = _source_fps(source, camera_config)
-            sample_every = _sample_every(source_fps, camera_config.sample_rate_fps)
-            history = _FrameHistory(buffer_window_s, max_frames=_history_max_frames(source_fps, buffer_window_s))
-            base_mono: float | None = None
-            batch_size = max(1, self.config.global_settings.file_detection_batch_size)
-            max_lookahead = max(1, self.config.global_settings.max_lookahead_frames)
-
-            while not self._stop_event.is_set():
-                # Read a bounded segment ahead WITHOUT touching buffer/history/state
-                # so its sampled frames can be detected in one batched forward. The
-                # segment ends once it holds ``batch_size`` sampled frames, hits the
-                # lookahead cap, or reaches EOF.
-                segment: list[Frame] = []
-                sampled_in_segment = 0
-                while (
-                    not self._stop_event.is_set()
-                    and sampled_in_segment < batch_size
-                    and len(segment) < max_lookahead
-                ):
-                    raw_frame = source.read()
-                    if raw_frame is None:
-                        break
-                    if base_mono is None:
-                        base_mono = raw_frame.mono_ts
-                    frame = _retimestamp_file_frame(raw_frame, base_mono, source_fps)
-                    segment.append(frame)
-                    if frame.frame_idx % sample_every == 0:
-                        sampled_in_segment += 1
-
-                if not segment:
-                    break
-
-                sampled = [f for f in segment if f.frame_idx % sample_every == 0]
-                detections_by_idx: dict[int, list[Detection]] = {}
-                if sampled:
-                    batch_results = _detect_frames_batched(
-                        detector, sampled, lock=self._inference_lock
-                    )
-                    detections_by_idx = {
-                        f.frame_idx: dets for f, dets in zip(sampled, batch_results)
-                    }
-
-                # Replay the segment in frame order: this reproduces the original
-                # per-frame loop exactly (buffer/history/state/recording advance in
-                # order, up to the processed point), only the detections were
-                # precomputed in a batch.
-                for frame in segment:
-                    buffer.append(frame)
-                    history.append(frame)
-
-                    if frame.frame_idx % sample_every == 0:
-                        emitted = state_machine.process(
-                            frame, detections_by_idx[frame.frame_idx]
-                        )
-                        pending.extend(
-                            _PendingCandidate(candidate) for candidate in emitted
-                        )
-
-                    event_dirs.extend(
-                        record_ready_pending(
-                            pending,
-                            current_wall_ts=frame.wall_ts,
-                            buffer=buffer,
-                            history=history,
-                            camera_config=camera_config,
-                            classifier=classifier,
-                            recorder=recorder,
-                        ),
-                    )
-
-            pending.extend(_PendingCandidate(candidate) for candidate in state_machine.flush())
-            event_dirs.extend(
-                record_all_pending(
-                    pending,
-                    buffer=buffer,
-                    history=history,
-                    camera_config=camera_config,
-                    classifier=classifier,
-                    recorder=recorder,
-                ),
-            )
-
-        summary = enforce_retention(self.config.global_settings.dataset_dir, camera_config)
-        LOGGER.info(
-            "Recorded %d event(s) for file camera %s; retention deleted %d event(s)",
-            len(event_dirs),
-            sanitize_source_id(camera_config.id),
-            summary.deleted_events,
+        return run_file_camera(
+            camera_config,
+            config=self.config,
+            new_detector=self._new_detector,
+            new_classifier=self._new_classifier,
+            new_state_machine=self._new_state_machine,
+            recorder_factory=self.recorder_factory,
+            file_source_factory=self.file_source_factory,
+            inference_lock=self._inference_lock,
+            stop_event=self._stop_event,
         )
-        return event_dirs
 
     def process_protect_camera(self, camera_config: CameraConfig) -> list[Path]:
         if not self.config.protect_configured():

@@ -150,7 +150,9 @@
   // Open a live/banner event in the Review console: refresh the list (which also
   // acknowledges the new arrivals and clears the banner), then select it.
   async function openLiveEvent(eventId: string): Promise<void> {
-    navigate("/");
+    if (!navigateView("/")) {
+      return;
+    }
     await loadEvents();
     await selectEvent(eventId);
   }
@@ -206,6 +208,10 @@
   }
 
   async function selectEvent(eventId: string): Promise<void> {
+    if (dirty && eventId !== selectedId && !confirmUnsavedReviewChanges()) {
+      restoreReviewRoute();
+      return;
+    }
     selectedId = eventId;
     saveStatus = "";
     // Reflect the open event in the URL (replace, so list navigation doesn't
@@ -381,6 +387,9 @@
   }
 
   function applyFilter(value: string): void {
+    if (value !== statusFilter && dirty && !confirmUnsavedReviewChanges()) {
+      return;
+    }
     statusFilter = value;
     saveReviewFilters({ status: statusFilter, camera: cameraFilter });
     void loadEvents();
@@ -388,6 +397,9 @@
 
   function onCameraKeydown(event: KeyboardEvent): void {
     if (event.key === "Enter") {
+      if (dirty && !confirmUnsavedReviewChanges()) {
+        return;
+      }
       cameraFilter = cameraFilter.trim();
       saveReviewFilters({ status: statusFilter, camera: cameraFilter });
       void loadEvents();
@@ -395,9 +407,45 @@
   }
 
   function clearCamera(): void {
+    if (cameraFilter && dirty && !confirmUnsavedReviewChanges()) {
+      return;
+    }
     cameraFilter = "";
     saveReviewFilters({ status: statusFilter, camera: cameraFilter });
     void loadEvents();
+  }
+
+  function confirmUnsavedReviewChanges(): boolean {
+    return confirm("Continue without saving label changes?");
+  }
+
+  function reviewPath(): string {
+    return selectedId ? `/?event=${encodeURIComponent(selectedId)}` : "/";
+  }
+
+  function restoreReviewRoute(): void {
+    if (view === "review") {
+      navigate(reviewPath(), { replace: true });
+    }
+  }
+
+  function navigateView(path: string): boolean {
+    if (view === "review" && path === "/") {
+      return true;
+    }
+    if (view === "review" && dirty && !confirmUnsavedReviewChanges()) {
+      return false;
+    }
+    navigate(path);
+    return true;
+  }
+
+  function onBeforeUnload(event: BeforeUnloadEvent): void {
+    if (!dirty) {
+      return;
+    }
+    event.preventDefault();
+    event.returnValue = "";
   }
 
   function onKey(event: KeyboardEvent): void {
@@ -425,7 +473,7 @@
     if (view === "tune") {
       if (event.key === "Escape") {
         event.preventDefault();
-        navigate("/");
+        void navigateView("/");
       }
       return;
     }
@@ -434,7 +482,7 @@
     if (view === "label") {
       if (event.key === "Escape") {
         event.preventDefault();
-        navigate("/");
+        void navigateView("/");
       }
       return;
     }
@@ -442,7 +490,7 @@
     if (view === "live") {
       if (event.key === "v" || event.key === "Escape") {
         event.preventDefault();
-        navigate("/");
+        void navigateView("/");
       } else if (event.key === "?") {
         event.preventDefault();
         helpOpen = true;
@@ -541,7 +589,7 @@
         break;
       case "v":
         event.preventDefault();
-        navigate("/live");
+        void navigateView("/live");
         break;
       case " ":
         event.preventDefault();
@@ -553,7 +601,7 @@
   }
 </script>
 
-<svelte:window onkeydown={onKey} />
+<svelte:window onkeydown={onKey} onbeforeunload={onBeforeUnload} />
 
 <div class="app">
   <header class="bar">
@@ -568,7 +616,7 @@
         role="tab"
         aria-selected={view === "review"}
         class:active={view === "review"}
-        onclick={() => navigate("/")}
+        onclick={() => navigateView("/")}
       >
         Review
       </button>
@@ -577,7 +625,7 @@
         role="tab"
         aria-selected={view === "live"}
         class:active={view === "live"}
-        onclick={() => navigate("/live")}
+        onclick={() => navigateView("/live")}
         title="Real-time feed of new events (v)"
       >
         Live
@@ -589,7 +637,7 @@
         role="tab"
         aria-selected={view === "tune"}
         class:active={view === "tune"}
-        onclick={() => navigate("/tune")}
+        onclick={() => navigateView("/tune")}
         title="Tune YOLO detection on a clip"
       >
         Tune
@@ -599,7 +647,7 @@
         role="tab"
         aria-selected={view === "label"}
         class:active={view === "label"}
-        onclick={() => navigate("/label")}
+        onclick={() => navigateView("/label")}
         title="Label harvested clips for training"
       >
         Label
@@ -708,7 +756,7 @@
         {detail}
         {dogs}
         {dogError}
-        {draft}
+        bind:draft
         {dirty}
         {saving}
         {saveStatus}

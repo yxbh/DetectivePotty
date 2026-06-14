@@ -24,8 +24,18 @@
     onsave: () => void;
   }
 
-  let { detail, dogs, dogError, loading, error, draft, dirty, saving, saveStatus, onsave }: Props =
-    $props();
+  let {
+    detail,
+    dogs,
+    dogError,
+    loading,
+    error,
+    draft = $bindable(),
+    dirty,
+    saving,
+    saveStatus,
+    onsave,
+  }: Props = $props();
 
   const LABEL_BUTTONS: Array<[string, string, string]> = [
     ["pee", "Pee", "1"],

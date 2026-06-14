@@ -8,7 +8,7 @@ import cv2
 from fastapi.testclient import TestClient
 import numpy as np
 
-from detectivepotty.config import Config, GlobalSettings
+from detectivepotty.config import Config, GlobalSettings, load_config
 from detectivepotty.events import ClassifierGuess, EventMetadata, Label, LabelStatus, TriggerReason
 from detectivepotty.web import create_app
 
@@ -124,6 +124,27 @@ def test_events_list_sorting_and_filters(tmp_path: Path) -> None:
 
     paged = client.get("/api/events", params={"limit": 1, "offset": 1})
     assert [event["event_id"] for event in paged.json()] == ["older"]
+
+
+def test_events_api_anchors_relative_dataset_to_config_dir(tmp_path: Path) -> None:
+    config_dir = tmp_path / "cfg"
+    dataset_dir = config_dir / "dataset"
+    dataset_dir.mkdir(parents=True)
+    make_event(dataset_dir, event_id="a", camera="cam1", utc_ts=BASE_TS)
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+global:
+  dataset_dir: dataset
+""",
+        encoding="utf-8",
+    )
+
+    client = TestClient(create_app(load_config(config_path)))
+
+    response = client.get("/api/events")
+    assert response.status_code == 200
+    assert [event["event_id"] for event in response.json()] == ["a"]
 
 
 def test_event_detail_and_media_serving_block_traversal(tmp_path: Path) -> None:

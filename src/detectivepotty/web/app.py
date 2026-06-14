@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -17,6 +17,7 @@ from detectivepotty.web.event_routes import (
     register_event_routes,
 )
 from detectivepotty.web.label_routes import register_label_routes
+from detectivepotty.web.media import no_store_file_response
 from detectivepotty.web.middleware import ApiNoStoreMiddleware
 from detectivepotty.web.state import init_app_state
 from detectivepotty.web.tune_routes import (
@@ -49,28 +50,13 @@ npm run build</pre>
 """
 
 
-# Suffix -> MIME for the tuner clip endpoint. Browsers play mp4/mov/webm
-# natively; mkv/avi are served with a correct type even if a given browser
-# can't decode them.
-_VIDEO_MIME = {
-    ".mp4": "video/mp4",
-    ".m4v": "video/mp4",
-    ".mov": "video/quicktime",
-    ".webm": "video/webm",
-    ".mkv": "video/x-matroska",
-    ".avi": "video/x-msvideo",
-}
-
-
-
-
 def create_app(
     config: Config,
     *,
     tune_detector: object | None = None,
     tune_pose_estimator: object | None = None,
 ) -> FastAPI:
-    dataset_index = DatasetIndex(config.global_settings.dataset_dir)
+    dataset_index = DatasetIndex(config.resolve_path(config.global_settings.dataset_dir))
     dogs = list(config.global_settings.dogs)
     app = FastAPI(title="DetectivePotty", version="0.1.0")
     init_app_state(
@@ -94,7 +80,7 @@ def create_app(
     def index() -> Response:
         built = FRONTEND_DIST / "index.html"
         if built.is_file():
-            return FileResponse(built, headers={"Cache-Control": "no-store"})
+            return no_store_file_response(built)
         return HTMLResponse(_BUILD_MISSING_HTML)
 
     register_event_routes(app, dataset_index=dataset_index, dogs=dogs)
@@ -102,11 +88,10 @@ def create_app(
     register_tune_routes(
         app,
         config,
-        video_mime=_VIDEO_MIME,
         ultralytics_tracking_available=_ultralytics_tracking_available,
     )
 
-    register_label_routes(app, video_mime=_VIDEO_MIME)
+    register_label_routes(app)
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str) -> Response:
@@ -122,7 +107,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="not found")
         built = FRONTEND_DIST / "index.html"
         if built.is_file():
-            return FileResponse(built, headers={"Cache-Control": "no-store"})
+            return no_store_file_response(built)
         return HTMLResponse(_BUILD_MISSING_HTML)
 
     return app

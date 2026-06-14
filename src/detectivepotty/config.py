@@ -10,7 +10,14 @@ import re
 from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 import yaml
 
 Device = Literal["auto", "cuda", "mps", "cpu"]
@@ -267,6 +274,7 @@ class CameraConfig(BaseModel):
 
 class Config(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    _config_path: Path | None = PrivateAttr(default=None)
 
     global_settings: GlobalSettings = Field(default_factory=GlobalSettings, alias="global")
     protect: ProtectConfig = Field(default_factory=ProtectConfig)
@@ -275,6 +283,26 @@ class Config(BaseModel):
 
     def config_hash(self) -> str:
         return config_hash(self)
+
+    @property
+    def config_path(self) -> Path | None:
+        """Absolute path this config was loaded from, if known."""
+
+        return self._config_path
+
+    @property
+    def config_dir(self) -> Path:
+        """Directory relative config paths should be interpreted from."""
+
+        if self._config_path is not None:
+            return self._config_path.parent
+        return Path.cwd()
+
+    def resolve_path(self, path: str | Path) -> Path:
+        """Resolve a config-relative path without mutating the loaded schema."""
+
+        candidate = Path(path)
+        return candidate if candidate.is_absolute() else self.config_dir / candidate
 
     def resolve_secret(self, env_field: Literal["api_key", "username", "password"]) -> str | None:
         env_name = getattr(self.protect, f"{env_field}_env")
@@ -299,9 +327,12 @@ def resolve_config_path(path: str | Path | None = None) -> Path:
 
 
 def load_config(path: str | Path | None = None) -> Config:
-    with resolve_config_path(path).open("r", encoding="utf-8") as fh:
+    resolved = resolve_config_path(path)
+    with resolved.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh) or {}
-    return Config.model_validate(raw)
+    config = Config.model_validate(raw)
+    config._config_path = resolved.resolve()
+    return config
 
 
 def config_hash(config: Config) -> str:

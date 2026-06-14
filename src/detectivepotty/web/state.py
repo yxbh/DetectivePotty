@@ -9,7 +9,11 @@ from typing import Any
 from fastapi import FastAPI
 
 from detectivepotty.config import Config
-from detectivepotty.web.tune import collect_tune_models, collect_tune_roots
+from detectivepotty.web.tune import (
+    collect_tune_models,
+    collect_tune_roots,
+    default_tune_model,
+)
 
 
 def init_app_state(
@@ -30,8 +34,8 @@ def init_app_state(
     # Root the range-labeling API discovers harvested clips under. Kept separate
     # from the tuner's browse roots (which include it) so /api/label only ever
     # exposes harvested clip dirs, never the wider dataset/data tree.
-    app.state.harvest_root = config.global_settings.harvest_dir
-    app.state.tune_default_model = config.global_settings.model_name
+    app.state.harvest_root = config.resolve_path(config.global_settings.harvest_dir)
+    app.state.tune_default_model = default_tune_model(config)
     # Per-model detector cache (model string -> DogDetector), built lazily under
     # ``tune_detector_lock``. An injected detector (tests) seeds the cache for the
     # default model and pins the allow-list to just that model, so no scanning or

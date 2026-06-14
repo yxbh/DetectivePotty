@@ -96,6 +96,9 @@ def test_load_config_uses_default_config_path_env(
     cfg = load_config()
 
     assert cfg.global_settings.dataset_dir == Path("env-dataset")
+    assert cfg.config_path == config_path.resolve()
+    assert cfg.config_dir == tmp_path
+    assert cfg.resolve_path("relative-file") == tmp_path / "relative-file"
 
 
 def test_config_reports_protect_configured(

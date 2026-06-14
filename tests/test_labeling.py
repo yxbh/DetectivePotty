@@ -414,6 +414,7 @@ def test_api_clip_detail_and_save(tmp_path: Path) -> None:
         json={"ranges": [{**payload["ranges"][0], "behavior": "nope"}]},
     )
     assert bad.status_code == 400
+    assert bad.json()["detail"] == "invalid label payload"
 
 
 def test_api_unknown_clip_404_and_traversal(tmp_path: Path) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -22,6 +22,7 @@ from detectivepotty.web.schemas import (
     TunePoseRequest,
 )
 from detectivepotty.web.payloads import scene_object_payload
+from detectivepotty.web.media import no_store_video_response
 from detectivepotty.web.tune_tracking import (
     TUNE_DETECTION_FLOOR,
     TUNE_TRACKERS,
@@ -72,7 +73,6 @@ def register_tune_routes(
     app: FastAPI,
     config: Config,
     *,
-    video_mime: Mapping[str, str],
     ultralytics_tracking_available: Callable[[], bool],
 ) -> None:
     """Register Tune detection, tracking, export, and pose routes on ``app``."""
@@ -836,11 +836,7 @@ def register_tune_routes(
         # FileResponse honours the Range header (206 partial content) so the
         # <video> element can seek; no-store avoids caching a large local clip
         # across selections.
-        return FileResponse(
-            file_path,
-            media_type=video_mime.get(file_path.suffix.lower(), "video/mp4"),
-            headers={"Cache-Control": "no-store"},
-        )
+        return no_store_video_response(file_path)
 
     @app.get("/api/tune/frame")
     async def tune_frame(

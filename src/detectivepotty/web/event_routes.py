@@ -13,13 +13,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from detectivepotty.events import LabelStatus
 from detectivepotty.web.dataset_index import DatasetIndex, fixed_media_path, media_path
+from detectivepotty.web.media import cached_media_response, cached_video_response
 from detectivepotty.web.schemas import LabelUpdate
 
 
 logger = logging.getLogger(__name__)
 
 STREAM_POLL_SECONDS = 2.0
-MEDIA_CACHE_CONTROL = "private, max-age=3600"
 
 
 async def _event_stream(
@@ -153,9 +153,7 @@ def register_event_routes(
         path = fixed_media_path(record, "clip.mp4", missing_ok=True)
         if path is None:
             raise HTTPException(status_code=404, detail="clip not found")
-        return FileResponse(
-            path, media_type="video/mp4", headers={"Cache-Control": MEDIA_CACHE_CONTROL}
-        )
+        return cached_video_response(path)
 
     @app.get("/api/events/{event_id}/frames/{name:path}")
     def get_frame(event_id: str, name: str) -> FileResponse:
@@ -212,4 +210,4 @@ def _serve_image(
         raise HTTPException(status_code=400, detail="invalid media filename") from exc
     if path is None:
         raise HTTPException(status_code=404, detail="media not found")
-    return FileResponse(path, headers={"Cache-Control": MEDIA_CACHE_CONTROL})
+    return cached_media_response(path)

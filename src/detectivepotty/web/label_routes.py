@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from detectivepotty.web.media import no_store_video_response
 
-def register_label_routes(
-    app: FastAPI,
-    *,
-    video_mime: Mapping[str, str],
-) -> None:
+
+def register_label_routes(app: FastAPI) -> None:
     """Register range-labeling routes on ``app``."""
 
     @app.get("/api/label/clips")
@@ -52,7 +48,7 @@ def register_label_routes(
             try:
                 return labeling.save_clip_labels(clip_dir, payload, app.state.harvest_root)
             except (ValueError, KeyError, TypeError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail="invalid label payload") from exc
 
     @app.get("/api/label/clips/{span_id}/video")
     def label_clip_video(span_id: str) -> FileResponse:
@@ -66,8 +62,4 @@ def register_label_routes(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="clip not found") from exc
         clip_path = clip_dir / CLIP_NAME
-        return FileResponse(
-            clip_path,
-            media_type=video_mime.get(clip_path.suffix.lower(), "video/mp4"),
-            headers={"Cache-Control": "no-store"},
-        )
+        return no_store_video_response(clip_path)

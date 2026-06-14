@@ -75,10 +75,10 @@ def collect_tune_roots(config: Config) -> list[Path]:
 
     for camera in config.cameras:
         if camera.input.kind == "file" and camera.input.path is not None:
-            add(camera.input.path.parent)
-    add(Path("data"))
-    add(config.global_settings.dataset_dir)
-    add(config.global_settings.harvest_dir)
+            add(config.resolve_path(camera.input.path).parent)
+    add(config.resolve_path("data"))
+    add(config.resolve_path(config.global_settings.dataset_dir))
+    add(config.resolve_path(config.global_settings.harvest_dir))
     return roots
 
 
@@ -186,9 +186,21 @@ def _root_label(root: Path) -> str:
     return root.name or str(root)
 
 
-def collect_tune_models(
-    config: Config, models_dir: Path = Path("models")
-) -> list[str]:
+def default_tune_model(config: Config) -> str:
+    """Return the configured model name as the tuner should pass it to YOLO."""
+
+    value = config.global_settings.model_name
+    path = Path(value)
+    if path.is_absolute() or config.config_path is None:
+        return value
+    path_like = "/" in value or "\\" in value or value.startswith(".")
+    config_relative = config.resolve_path(path)
+    if path_like or config_relative.exists():
+        return str(config_relative)
+    return value
+
+
+def collect_tune_models(config: Config, models_dir: Path | None = None) -> list[str]:
     """Return the YOLO weights the model picker may select, as detector strings.
 
     Discovers ``*.pt`` files and ``*.mlpackage`` CoreML bundles under
@@ -206,6 +218,9 @@ def collect_tune_models(
     detector for a model in this set, so an arbitrary ``model`` query can't be
     turned into a download or filesystem read.
     """
+
+    if models_dir is None:
+        models_dir = config.resolve_path("models")
 
     seen: set[str] = set()
     models: list[str] = []
@@ -228,7 +243,7 @@ def collect_tune_models(
     discover(models_dir, "*.mlpackage", want_dir=True)
     discover(models_dir / "coreml", "*.mlpackage", want_dir=True)
 
-    add(config.global_settings.model_name)
+    add(default_tune_model(config))
     return models
 
 

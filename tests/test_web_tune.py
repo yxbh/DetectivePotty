@@ -23,6 +23,7 @@ from detectivepotty.config import (
     CameraInputConfig,
     Config,
     GlobalSettings,
+    load_config,
     PoseConfig,
 )
 from detectivepotty.events import Detection
@@ -110,6 +111,39 @@ def test_collect_tune_roots_includes_file_camera_dir(tmp_path: Path) -> None:
     config = make_config(tmp_path, clip)
     roots = tune_mod.collect_tune_roots(config)
     assert (tmp_path / "clips").resolve() in roots
+
+
+def test_collect_tune_roots_anchors_relative_paths_to_config_dir(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "cfg"
+    (config_dir / "clips").mkdir(parents=True)
+    (config_dir / "data").mkdir()
+    (config_dir / "dataset" / "harvest").mkdir(parents=True)
+    write_clip(config_dir / "clips" / "c.mp4")
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+global:
+  dataset_dir: dataset
+  harvest_dir: dataset/harvest
+  model_name: models/yolo.pt
+cameras:
+  - id: cam
+    name: Cam
+    input:
+      kind: file
+      path: clips/c.mp4
+""",
+        encoding="utf-8",
+    )
+
+    roots = tune_mod.collect_tune_roots(load_config(config_path))
+
+    assert config_dir / "clips" in roots
+    assert config_dir / "data" in roots
+    assert config_dir / "dataset" in roots
+    assert config_dir / "dataset" / "harvest" in roots
 
 
 def test_tune_files_top_level_lists_roots(tmp_path: Path) -> None:
@@ -294,6 +328,29 @@ def test_collect_tune_models_scans_dir_and_appends_default(tmp_path: Path) -> No
     assert models[:2] == [str(models_dir / "a.pt"), str(models_dir / "b.pt")]
     assert models[-1] == config.global_settings.model_name
     assert all(not m.endswith(".txt") for m in models)
+
+
+def test_collect_tune_models_anchors_default_scan_to_config_dir(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "cfg"
+    models_dir = config_dir / "models"
+    models_dir.mkdir(parents=True)
+    (models_dir / "a.pt").write_bytes(b"x")
+    (models_dir / "default.pt").write_bytes(b"x")
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(
+        """
+global:
+  model_name: models/default.pt
+""",
+        encoding="utf-8",
+    )
+
+    models = tune_mod.collect_tune_models(load_config(config_path))
+
+    assert str(models_dir / "a.pt") in models
+    assert models[-1] == str(models_dir / "default.pt")
 
 
 def test_collect_tune_models_discovers_mlpackage_dirs(tmp_path: Path) -> None:

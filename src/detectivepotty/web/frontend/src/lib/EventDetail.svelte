@@ -334,187 +334,195 @@
       </div>
     </header>
 
-    <div class="video-wrap">
-      {#if media.clip}
-        {#key detail.summary.event_id + mediaVersion}
-          <!-- svelte-ignore a11y_media_has_caption -->
-          <video controls preload="metadata" playsinline loop src={versioned(media.clip, mediaVersion)}
-          ></video>
-        {/key}
-      {:else}
-        <div class="empty-state">No clip.mp4 found.</div>
-      {/if}
-    </div>
+    <div class="review-grid">
+      <div class="media-column">
+        <div class="video-wrap">
+          {#if media.clip}
+            {#key detail.summary.event_id + mediaVersion}
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <video controls preload="metadata" playsinline loop src={versioned(media.clip, mediaVersion)}
+              ></video>
+            {/key}
+          {:else}
+            <div class="empty-state">No clip.mp4 found.</div>
+          {/if}
+        </div>
 
-    {#if hero}
-      <div class="hero-slot">
-        <img class="hero-image" src={hero.src} alt={hero.alt} />
+        {#if hero}
+          <div class="hero-slot">
+            <img class="hero-image" src={hero.src} alt={hero.alt} />
+          </div>
+        {/if}
       </div>
-    {/if}
 
-    <section class="label-panel">
-      <div class="panel-head">
-        <h3>Label</h3>
-        {#if dirty}<span class="dirty-dot" title="Unsaved changes">unsaved</span>{/if}
-      </div>
-      <div class="label-buttons">
-        {#each LABEL_BUTTONS as [value, text, key] (value)}
-          <button
-            type="button"
-            class="label-btn"
-            class:selected={draft.label === value}
-            onclick={() => (draft.label = value)}
-          >
-            <span>{text}</span>
-            <kbd>{key}</kbd>
-          </button>
-        {/each}
-      </div>
-      <div class="dog-group">
-        <span class="dog-heading">Dog</span>
-        <div class="dog-chips">
-          <button
-            type="button"
-            class="dog-chip"
-            class:selected={!draft.dog}
-            onclick={() => (draft.dog = "")}
-          >
-            <span>Unassigned</span>
-            <kbd>⇧0</kbd>
-          </button>
-          {#each dogChips as chip (chip.name)}
+      <section class="label-panel">
+        <div class="panel-head">
+          <h3>Label</h3>
+          {#if dirty}<span class="dirty-dot" title="Unsaved changes">unsaved</span>{/if}
+        </div>
+        <div class="label-buttons">
+          {#each LABEL_BUTTONS as [value, text, key] (value)}
+            <button
+              type="button"
+              class="label-btn"
+              class:selected={draft.label === value}
+              onclick={() => (draft.label = value)}
+            >
+              <span>{text}</span>
+              <kbd>{key}</kbd>
+            </button>
+          {/each}
+        </div>
+        <div class="dog-group">
+          <span class="dog-heading">Dog</span>
+          <div class="dog-chips">
             <button
               type="button"
               class="dog-chip"
-              class:selected={draft.dog === chip.name}
-              onclick={() => (draft.dog = chip.name)}
+              class:selected={!draft.dog}
+              onclick={() => (draft.dog = "")}
             >
-              <span>{chip.name}</span>
-              {#if chip.hint}<kbd>{chip.hint}</kbd>{/if}
+              <span>Unassigned</span>
+              <kbd>⇧0</kbd>
             </button>
-          {/each}
-        </div>
-        {#if dogError}
-          <p class="dog-warning">Dog roster unavailable: {dogError}</p>
-        {/if}
-      </div>
-      <div class="form-row">
-        <label>
-          Status
-          <select bind:value={draft.status}>
-            <option value="labeled">labeled</option>
-            <option value="rejected">rejected</option>
-            <option value="uncertain">uncertain</option>
-          </select>
-        </label>
-        <label class="note-field">
-          Note
-          <textarea bind:value={draft.note} placeholder="Optional training note"></textarea>
-        </label>
-        <button
-          type="button"
-          class="btn-primary save-btn"
-          onclick={onsave}
-          disabled={saving || !dirty}
-        >
-          {saving ? "Saving…" : "Save"}
-          <kbd>S</kbd>
-        </button>
-      </div>
-      {#if saveStatus}<p class="save-status muted">{saveStatus}</p>{/if}
-    </section>
-
-    <section class="summary-panel">
-      <div class="summary-grid">
-        {#each summaryRows as row (row.title)}
-          <div class="summary-card" title={row.hint}>
-            <span class="info-label">{row.title}</span><strong>{row.value}</strong>
+            {#each dogChips as chip (chip.name)}
+              <button
+                type="button"
+                class="dog-chip"
+                class:selected={draft.dog === chip.name}
+                onclick={() => (draft.dog = chip.name)}
+              >
+                <span>{chip.name}</span>
+                {#if chip.hint}<kbd>{chip.hint}</kbd>{/if}
+              </button>
+            {/each}
           </div>
-        {/each}
-      </div>
-    </section>
-
-    {#if media.crops.length > 0}
-      <section class="media-strip">
-        <div class="strip-head">
-          <h3>Crops</h3>
-          <label class="overlay-toggle" title="Draw the detected keypoint skeleton on crops. Pose runs on an evenly-sampled subset (max 30 frames) and skips low-quality frames, so only some crops have dots.">
-            <input type="checkbox" bind:checked={$poseOverlay} disabled={!hasOverlays} />
-            Pose overlay{#if !hasOverlays}<span class="muted"> · none</span>{/if}
+          {#if dogError}
+            <p class="dog-warning">Dog roster unavailable: {dogError}</p>
+          {/if}
+        </div>
+        <div class="form-row">
+          <label>
+            Status
+            <select bind:value={draft.status}>
+              <option value="labeled">labeled</option>
+              <option value="rejected">rejected</option>
+              <option value="uncertain">uncertain</option>
+            </select>
           </label>
+          <label class="note-field">
+            Note
+            <textarea bind:value={draft.note} placeholder="Optional training note"></textarea>
+          </label>
+          <button
+            type="button"
+            class="btn-primary save-btn"
+            onclick={onsave}
+            disabled={saving || !dirty}
+          >
+            {saving ? "Saving…" : "Save"}
+            <kbd>S</kbd>
+          </button>
         </div>
-        {#if poseCoverageHint}
-          <p class="strip-note muted">{poseCoverageHint}</p>
+        {#if saveStatus}<p class="save-status muted">{saveStatus}</p>{/if}
+      </section>
+
+      <div class="below-column">
+        <section class="summary-panel">
+          <div class="summary-grid">
+            {#each summaryRows as row (row.title)}
+              <div class="summary-card" title={row.hint}>
+                <span class="info-label">{row.title}</span><strong>{row.value}</strong>
+              </div>
+            {/each}
+          </div>
+        </section>
+
+        {#if media.crops.length > 0}
+          <section class="media-strip">
+            <div class="strip-head">
+              <h3>Crops</h3>
+              <label class="overlay-toggle" title="Draw the detected keypoint skeleton on crops. Pose runs on an evenly-sampled subset (max 30 frames) and skips low-quality frames, so only some crops have dots.">
+                <input type="checkbox" bind:checked={$poseOverlay} disabled={!hasOverlays} />
+                Pose overlay{#if !hasOverlays}<span class="muted"> · none</span>{/if}
+              </label>
+            </div>
+            {#if poseCoverageHint}
+              <p class="strip-note muted">{poseCoverageHint}</p>
+            {/if}
+            <div class="strip-grid">
+              {#each media.crops as crop (crop.name)}
+                {@const posed = overlayByName.has(crop.name)}
+                {@const cl = cropLabels.get(crop.name)}
+                <button
+                  type="button"
+                  class="strip-item"
+                  class:posed
+                  class:no-pose={showOverlay && !posed}
+                  title={posed ? "Pose estimated for this frame" : "No pose for this frame (not sampled, or low-quality crop)"}
+                  onclick={() => showHero(cropUrl(crop.name, crop.url), crop.name)}
+                >
+                  <img src={cropUrl(crop.name, crop.url)} alt={crop.name} loading="lazy" />
+                  {#if cl}<span class="crop-label" class:alias={cl.alias} title="The detected object class + confidence of the box this crop came from. Cyan = an accepted non-dog alias (sheep/zebra/…) recovered via class-agnostic NMS.">{formatDetLabel(cl.cls, cl.conf)}</span>{/if}
+                  {#if posed}<span class="pose-badge" aria-hidden="true"></span>{/if}
+                </button>
+              {/each}
+            </div>
+          </section>
         {/if}
-        <div class="strip-grid">
-          {#each media.crops as crop (crop.name)}
-            {@const posed = overlayByName.has(crop.name)}
-            {@const cl = cropLabels.get(crop.name)}
-            <button
-              type="button"
-              class="strip-item"
-              class:posed
-              class:no-pose={showOverlay && !posed}
-              title={posed ? "Pose estimated for this frame" : "No pose for this frame (not sampled, or low-quality crop)"}
-              onclick={() => showHero(cropUrl(crop.name, crop.url), crop.name)}
-            >
-              <img src={cropUrl(crop.name, crop.url)} alt={crop.name} loading="lazy" />
-              {#if cl}<span class="crop-label" class:alias={cl.alias} title="The detected object class + confidence of the box this crop came from. Cyan = an accepted non-dog alias (sheep/zebra/…) recovered via class-agnostic NMS.">{formatDetLabel(cl.cls, cl.conf)}</span>{/if}
-              {#if posed}<span class="pose-badge" aria-hidden="true"></span>{/if}
-            </button>
-          {/each}
-        </div>
-      </section>
-    {/if}
 
-    {#if media.frames.length > 0}
-      <section class="media-strip">
-        <h3>Frames</h3>
-        <div class="strip-grid">
-          {#each media.frames as frame (frame.name)}
-            <button
-              type="button"
-              class="strip-item"
-              onclick={() => showHero(versioned(frame.url, mediaVersion) ?? frame.url, frame.name)}
-            >
-              <img src={versioned(frame.url, mediaVersion)} alt={frame.name} loading="lazy" />
-            </button>
-          {/each}
-        </div>
-      </section>
-    {/if}
+        {#if media.frames.length > 0}
+          <section class="media-strip">
+            <h3>Frames</h3>
+            <div class="strip-grid">
+              {#each media.frames as frame (frame.name)}
+                <button
+                  type="button"
+                  class="strip-item"
+                  onclick={() => showHero(versioned(frame.url, mediaVersion) ?? frame.url, frame.name)}
+                >
+                  <img src={versioned(frame.url, mediaVersion)} alt={frame.name} loading="lazy" />
+                </button>
+              {/each}
+            </div>
+          </section>
+        {/if}
 
-    {#if media.protect_recording}
-      <section class="media-strip">
-        <h3>Protect recording</h3>
-        <a class="protect-link" href={versioned(media.protect_recording, mediaVersion)}>
-          Open Protect recording →
-        </a>
-      </section>
-    {/if}
+        {#if media.protect_recording}
+          <section class="media-strip">
+            <h3>Protect recording</h3>
+            <a class="protect-link" href={versioned(media.protect_recording, mediaVersion)}>
+              Open Protect recording →
+            </a>
+          </section>
+        {/if}
 
-    {#if poseRows.length > 0}
-      <section class="pose-panel">
-        <h3>Pose features <span class="muted">({poseFrameCount} posed frames)</span></h3>
-        <div class="summary-grid">
-          {#each poseRows as [title, value] (title)}
-            <div class="summary-card"><span>{title}</span><strong>{value}</strong></div>
-          {/each}
-        </div>
-      </section>
-    {/if}
+        {#if poseRows.length > 0}
+          <section class="pose-panel">
+            <h3>Pose features <span class="muted">({poseFrameCount} posed frames)</span></h3>
+            <div class="summary-grid">
+              {#each poseRows as [title, value] (title)}
+                <div class="summary-card"><span>{title}</span><strong>{value}</strong></div>
+              {/each}
+            </div>
+          </section>
+        {/if}
 
-    <details class="metadata-panel">
-      <summary>Raw metadata</summary>
-      <pre>{JSON.stringify(meta, null, 2)}</pre>
-    </details>
+        <details class="metadata-panel">
+          <summary>Raw metadata</summary>
+          <pre>{JSON.stringify(meta, null, 2)}</pre>
+        </details>
+      </div>
+    </div>
   {/if}
 </div>
 
 <style>
   .detail {
     padding: 1.25rem 1.4rem 3rem;
-    max-width: 64rem;
+    width: 100%;
+    max-width: 94rem;
+    margin-inline: auto;
   }
 
   .detail-head {
@@ -648,6 +656,54 @@
   .label-panel {
     border-color: var(--line-strong);
     background: var(--bg-2);
+  }
+
+  .review-grid {
+    display: grid;
+    gap: 1rem;
+  }
+
+  .media-column,
+  .below-column {
+    min-width: 0;
+  }
+
+  .review-grid .label-panel {
+    margin-top: 0;
+  }
+
+  @media (min-width: 1180px) {
+    .review-grid {
+      grid-template-columns: minmax(0, 1fr) minmax(20rem, 24rem);
+      align-items: start;
+    }
+
+    .media-column,
+    .below-column {
+      grid-column: 1;
+    }
+
+    .label-panel {
+      grid-column: 2;
+      grid-row: 1 / span 2;
+      position: sticky;
+      top: 1rem;
+      max-height: calc(100dvh - 2rem);
+      overflow-y: auto;
+    }
+
+    video,
+    .hero-image {
+      max-height: 52vh;
+    }
+
+    .label-panel .form-row {
+      grid-template-columns: 1fr;
+    }
+
+    .save-btn {
+      justify-content: center;
+    }
   }
 
   .panel-head {

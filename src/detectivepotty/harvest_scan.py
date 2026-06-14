@@ -76,7 +76,7 @@ def scan_for_dogs(
         tracks = tracker.update(list(detections))
         time_s = frame_idx / fps
         for track in tracks:
-            latest = _latest_detection_at(track, frame_idx)
+            latest = latest_detection_at(track, frame_idx)
             if latest is None:
                 continue
             presence.setdefault(track.track_id, []).append(
@@ -132,13 +132,16 @@ def scan_for_dogs(
     return fps, decoded_idx, presence
 
 
-def _latest_detection_at(track: Any, frame_idx: int) -> Detection | None:
+def latest_detection_at(track: Any, frame_idx: int) -> Detection | None:
     best: Detection | None = None
     for det in track.detections:
         if det.frame_idx == frame_idx:
             if best is None or det.confidence > best.confidence:
                 best = det
     return best
+
+
+_latest_detection_at = latest_detection_at
 
 
 def _capture_opened(capture: Any) -> bool:

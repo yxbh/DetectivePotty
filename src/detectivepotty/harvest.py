@@ -29,7 +29,7 @@ from typing import Any
 from detectivepotty.harvest_scan import (
     DEFAULT_DETECT_BATCH_SIZE,
     DetectorLike,
-    _latest_detection_at as _latest_detection_at,
+    latest_detection_at as _latest_detection_at,
     scan_for_dogs as _scan_for_dogs,
 )
 from detectivepotty.harvest_spans import (

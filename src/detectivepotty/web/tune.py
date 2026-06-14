@@ -520,12 +520,12 @@ def track_step(
     stateful). Pure aside from the tracker mutation; no model, no I/O.
     """
 
-    from detectivepotty.harvest import _latest_detection_at
+    from detectivepotty.harvest_scan import latest_detection_at
 
     tracks = tracker.update(list(detections))
     boxes: list[dict[str, Any]] = []
     for track in tracks:
-        latest = _latest_detection_at(track, frame_idx)
+        latest = latest_detection_at(track, frame_idx)
         if latest is None:
             continue
         boxes.append(
@@ -558,7 +558,7 @@ def track_detections(
     the per-frame detection lists the detect path already produces (one ``(frame_idx,
     detections)`` pair per *sampled* frame, in any order), it replays them through
     :class:`detectivepotty.tracking.Tracker` **in ascending frame order** — exactly
-    as :func:`detectivepotty.harvest._scan_for_dogs` does — and returns persistent
+    as :func:`detectivepotty.harvest_scan.scan_for_dogs` does — and returns persistent
     per-frame track-ID boxes plus de-fragmentation stats.
 
     The tracker knobs (``iou_threshold`` / ``max_age_frames`` / ``center_dist_gate``)
@@ -623,11 +623,8 @@ def summarize_tracked_frames(
     """
 
     from detectivepotty.geometry import BBox
-    from detectivepotty.harvest import (
-        FrameSample,
-        _merge_frame_ranges,
-        compute_spans,
-    )
+    from detectivepotty.harvest_spans import FrameSample, compute_spans
+    from detectivepotty.harvest_writer import merge_frame_ranges
 
     fps_safe = fps if fps and fps > 0 else 30.0
     presence: dict[str, list[FrameSample]] = {}
@@ -659,7 +656,7 @@ def summarize_tracked_frames(
         if resolved_total > 0
         else []
     )
-    windows = _merge_frame_ranges(
+    windows = merge_frame_ranges(
         [(span.start_frame, span.end_frame) for span in spans]
     )
     n_spans = len(spans)

@@ -15,19 +15,16 @@ fake and never touch a model, GPU, or video file.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Protocol, Sequence
+from typing import Iterable, Iterator
 
 import numpy as np
+
+from detectivepotty.detect import BatchDetector
 
 from .timeline import SecondTimeline
 
 
-class DetectorLike(Protocol):
-    """Minimal surface this module needs from ``DogDetector`` (inject a fake in tests)."""
-
-    def detect_batch(
-        self, frames: Sequence[np.ndarray], metas: Sequence[object] | None = ...
-    ) -> list[list[object]]: ...
+DetectorLike = BatchDetector
 
 
 @dataclass(frozen=True)

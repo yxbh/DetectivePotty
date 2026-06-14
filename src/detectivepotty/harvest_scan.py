@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import cv2
 import numpy as np
 
+from detectivepotty.detect import FrameDetector
 from detectivepotty.detect.yolo import FrameMeta
 from detectivepotty.events import Detection
 from detectivepotty.harvest_spans import FrameSample
@@ -26,17 +27,7 @@ from detectivepotty.tracking import Tracker
 DEFAULT_DETECT_BATCH_SIZE = 32
 
 
-class DetectorLike(Protocol):
-    """Minimal detector surface the harvester needs (matches ``DogDetector``).
-
-    The scan uses :meth:`detect_batch` when present (batched forward, much faster
-    on accelerated backends) and otherwise falls back to per-frame :meth:`detect`,
-    so a fake exposing only ``detect`` still works unchanged.
-    """
-
-    def detect(
-        self, frame_bgr_original: np.ndarray, frame_idx: int = ...
-    ) -> list[Detection]: ...
+DetectorLike = FrameDetector
 
 
 @dataclass(frozen=True, slots=True)

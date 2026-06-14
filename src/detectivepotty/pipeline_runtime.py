@@ -7,11 +7,12 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import math
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import urlsplit
 
 from detectivepotty.classify.base import PottyClassifier
 from detectivepotty.config import CameraConfig, Config
+from detectivepotty.detect import FrameDetector
 from detectivepotty.detect.yolo import FrameMeta
 from detectivepotty.events import Detection, Track
 from detectivepotty.potty_event import PottyCandidate, PottyEventDetector
@@ -24,17 +25,7 @@ from detectivepotty.sources.base import Frame, VideoSource
 _LIVE_ASSUMED_MAX_FPS = 60.0
 
 
-class Detector(Protocol):
-    def detect(
-        self,
-        frame_bgr: Any,
-        *,
-        frame_idx: int,
-        mono_ts: float,
-        wall_ts: datetime,
-    ) -> list[Detection]: ...
-
-
+Detector = FrameDetector
 DetectorFactory = Callable[..., Detector]
 ClassifierFactory = Callable[..., PottyClassifier]
 FileSourceFactory = Callable[[CameraConfig], VideoSource]

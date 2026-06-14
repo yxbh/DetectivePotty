@@ -33,6 +33,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from detectivepotty.detect import FrameDetector
 from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox, crop_from_frame
 from detectivepotty.harvest import CLIP_NAME, METADATA_NAME
@@ -63,10 +64,7 @@ MANIFEST_HEADER = (
 )
 
 
-class DetectorLike:  # pragma: no cover - structural typing hint only
-    def detect(
-        self, frame_bgr_original: np.ndarray, frame_idx: int = 0
-    ) -> list[Detection]: ...
+DetectorLike = FrameDetector
 
 
 @dataclass(slots=True)

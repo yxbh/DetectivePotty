@@ -5,81 +5,30 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
-import logging
 from pathlib import Path
 import time
 from typing import Annotated, Optional
 
-import cv2
-import numpy as np
 import typer
 
+from detectivepotty.cli_common import (
+    ConfigPathOption,
+    DogAliasOption,
+    PROTECT_DOWNLOAD_TIMEOUT_S,
+    load_cli_config,
+    resolve_dog_aliases,
+    set_cli_log_level,
+)
+from detectivepotty.cli_detect import register_detect_commands
 from detectivepotty.config import (
-    CONFIG_ENV_VAR,
-    DEFAULT_CONFIG_PATH,
     Config,
-    DEFAULT_DOG_ALIAS_CLASSES,
-    load_config,
     resolve_config_path,
 )
 from detectivepotty.detect.yolo import DogDetector
-from detectivepotty.geometry import crop_from_frame
 
 app = typer.Typer(help="DetectivePotty offline and live utilities.")
 
-_PROTECT_DOWNLOAD_TIMEOUT_S = 30 * 60.0
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
-_CLI_LOG_LEVEL_OVERRIDE: str | None = None
-_CONFIG_HELP = (
-    "Path to DetectivePotty YAML config. Defaults to "
-    f"${CONFIG_ENV_VAR}, then {DEFAULT_CONFIG_PATH}."
-)
-
-ConfigPathOption = Annotated[
-    Path | None,
-    typer.Option(
-        "--config",
-        "-c",
-        exists=True,
-        dir_okay=False,
-        readable=True,
-        help=_CONFIG_HELP,
-    ),
-]
-
-
-def _resolve_dog_aliases(
-    override: str | None, config: Config | None = None
-) -> tuple[list[str], float]:
-    """Resolve the accepted dog-alias classes + NMS IoU for a CLI detector.
-
-    Precedence: an explicit ``--dog-alias-classes`` override (comma list; empty
-    string disables) wins; otherwise the loaded config's values; otherwise the
-    built-in safe-set default. Keeps aliases default-ON for every detection command.
-    """
-
-    iou = config.global_settings.dog_alias_nms_iou if config is not None else 0.65
-    if override is not None:
-        classes = [c.strip().lower() for c in override.split(",") if c.strip()]
-        return classes, iou
-    if config is not None:
-        return list(config.global_settings.dog_alias_classes), iou
-    return list(DEFAULT_DOG_ALIAS_CLASSES), iou
-
-
-# Shared CLI option for overriding the accepted dog-alias classes on detection
-# commands. ``None`` (the default) means "use config / the built-in safe set".
-DogAliasOption = Annotated[
-    Optional[str],
-    typer.Option(
-        "--dog-alias-classes",
-        help=(
-            "Comma-separated YOLO classes to also accept as dogs (e.g. "
-            "'sheep,cow'). Empty string disables. Defaults to config / the "
-            "built-in safe set."
-        ),
-    ),
-]
+_PROTECT_DOWNLOAD_TIMEOUT_S = PROTECT_DOWNLOAD_TIMEOUT_S
 
 
 def _protect_download_result(future):
@@ -93,26 +42,6 @@ def _protect_download_result(future):
         ) from exc
 
 
-def _configure_cli_logging(level_name: str) -> None:
-    level = getattr(logging, str(level_name).upper(), logging.INFO)
-    root = logging.getLogger()
-    if not root.handlers:
-        logging.basicConfig(level=level, format=_LOG_FORMAT)
-    else:
-        root.setLevel(level)
-    logging.getLogger("detectivepotty").setLevel(level)
-
-
-def _load_cli_config(config_path: Path | None) -> Config:
-    resolved = resolve_config_path(config_path)
-    try:
-        config = load_config(resolved)
-    except FileNotFoundError as exc:
-        raise typer.BadParameter(f"Config file not found: {resolved}") from exc
-    _configure_cli_logging(_CLI_LOG_LEVEL_OVERRIDE or config.global_settings.log_level)
-    return config
-
-
 @app.callback()
 def main(
     log_level: Annotated[
@@ -124,10 +53,10 @@ def main(
     ] = None,
 ) -> None:
     """DetectivePotty offline and live utilities."""
+    set_cli_log_level(log_level)
 
-    global _CLI_LOG_LEVEL_OVERRIDE
-    _CLI_LOG_LEVEL_OVERRIDE = log_level
-    _configure_cli_logging(log_level or "INFO")
+
+register_detect_commands(app)
 
 
 @app.command("run")
@@ -158,7 +87,7 @@ def run_command(
 
     from detectivepotty.pipeline import run_pipeline
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     event_dirs = run_pipeline(config, camera_ids=camera_ids, max_workers=max_workers)
     if not event_dirs:
         typer.echo("No events recorded.")
@@ -186,7 +115,7 @@ def dedupe_events_command(
 
     from detectivepotty.recording.reconcile import dedupe_dataset
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     actions = dedupe_dataset(
         config.global_settings.dataset_dir,
         tolerance_s=config.global_settings.rerun_match_tolerance_s,
@@ -238,7 +167,7 @@ def cleanup_legacy_command(
 
     from detectivepotty.recording.cleanup import cleanup_legacy_events
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     report = cleanup_legacy_events(
         config.global_settings.dataset_dir,
         dry_run=not apply,
@@ -281,7 +210,7 @@ def serve_command(
 ) -> None:
     """Launch the local review web app."""
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     try:
         from detectivepotty.web import run_server
     except Exception as exc:
@@ -296,7 +225,7 @@ def list_cameras_command(
 ) -> None:
     """Best-effort UniFi Protect camera discovery."""
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     if not config.protect_configured():
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
         raise typer.Exit(1)
@@ -357,142 +286,6 @@ def _list_cameras_via_curl(config) -> list | None:
         (cam.get("id"), cam.get("name"), cam.get("state") == "CONNECTED", "?")
         for cam in cameras
     ]
-
-
-@app.command("detect-file")
-def detect_file(
-    input_path: Annotated[
-        Path,
-        typer.Option(
-            "--input",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Input video file.",
-        ),
-    ],
-    output: Annotated[
-        Path,
-        typer.Option("--output", help="Annotated MP4 output path."),
-    ] = Path("outputs/annotated.mp4"),
-    save_crops: Annotated[
-        Path | None,
-        typer.Option("--save-crops", help="Directory for high-res dog crops."),
-    ] = None,
-    long_edge: Annotated[
-        int,
-        typer.Option(
-            "--long-edge",
-            min=1,
-            help="YOLO inference long edge (ultralytics imgsz). Default 640 (model-native).",
-        ),
-    ] = 640,
-    every_n: Annotated[
-        int,
-        typer.Option("--every-n", min=1, help="Run detection every N frames."),
-    ] = 1,
-    model: Annotated[
-        str,
-        typer.Option("--model", help="YOLO model name/path."),
-    ] = "models/yolo11m.pt",
-    dog_alias_classes: DogAliasOption = None,
-) -> None:
-    from detectivepotty.sources.pyav_capture import open_capture
-
-    cap = open_capture(str(input_path))
-    if not cap.isOpened():
-        raise typer.BadParameter(f"Could not open input video: {input_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if width <= 0 or height <= 0:
-        cap.release()
-        raise typer.BadParameter("Input video did not report a valid resolution")
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(output),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        cap.release()
-        raise typer.BadParameter(f"Could not open output video writer: {output}")
-
-    if save_crops is not None:
-        save_crops.mkdir(parents=True, exist_ok=True)
-
-    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
-    detector = DogDetector(
-        model_name=model,
-        long_edge=long_edge,
-        device="auto",
-        alias_classes=alias_classes,
-        alias_nms_iou=alias_nms_iou,
-    )
-    frame_idx = 0
-    detection_frames = 0
-    dogs_detected = 0
-    frames_with_dog = 0
-    crops_saved = 0
-    inference_latencies_ms: list[float] = []
-    inference_resolution: tuple[int, int] | None = None
-    started = time.perf_counter()
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            detections = []
-            if frame_idx % every_n == 0:
-                detection_frames += 1
-                detections = detector.detect(
-                    frame,
-                    frame_idx=frame_idx,
-                    mono_ts=time.monotonic(),
-                    wall_ts=datetime.now(timezone.utc),
-                )
-                if detector.last_inference is not None:
-                    inference_latencies_ms.append(detector.last_inference.latency_ms)
-                    inference_resolution = detector.last_inference.inference_wh
-                dogs_detected += len(detections)
-                if detections:
-                    frames_with_dog += 1
-                    if save_crops is not None:
-                        crops_saved += _save_best_crop(
-                            frame,
-                            detections,
-                            save_crops,
-                            frame_idx,
-                        )
-
-            _draw_detections(frame, detections)
-            writer.write(frame)
-            frame_idx += 1
-    finally:
-        cap.release()
-        writer.release()
-
-    elapsed_s = max(time.perf_counter() - started, 1e-9)
-    _print_summary(
-        frames_read=frame_idx,
-        detection_frames=detection_frames,
-        dogs_detected=dogs_detected,
-        frames_with_dog=frames_with_dog,
-        crops_saved=crops_saved,
-        output=output,
-        save_crops=save_crops,
-        original_resolution=(width, height),
-        inference_resolution=inference_resolution,
-        latencies_ms=inference_latencies_ms,
-        elapsed_s=elapsed_s,
-        device=detector.device,
-        model_name=detector.model_name,
-    )
 
 
 @app.command("tune-detect")
@@ -576,7 +369,7 @@ def tune_detect(
     else:
         if camera_id is None:
             raise typer.BadParameter("Provide --input, or --camera.")
-        config = _load_cli_config(config_path)
+        config = load_cli_config(config_path)
         camera = next((cam for cam in config.cameras if cam.id == camera_id), None)
         if camera is None:
             raise typer.BadParameter(
@@ -586,7 +379,7 @@ def tune_detect(
         initial_conf = conf if conf is not None else camera.detection_conf_threshold
         provider = _build_camera_provider(config, camera, FileFrameProvider, LiveFrameProvider)
 
-    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes, config)
+    alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes, config)
     detector = DogDetector(
         model_name=model_name,
         long_edge=long_edge,
@@ -765,7 +558,7 @@ def harvest_command(
 
     from detectivepotty.harvest import harvest_clips
 
-    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
+    alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes)
     detector = DogDetector(
         model_name=model,
         long_edge=long_edge,
@@ -910,14 +703,14 @@ def harvest_camera_command(
     ``export-dataset``. Failed/empty chunks are skipped; re-runs are idempotent.
     """
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     if not config.protect_configured():
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
         raise typer.Exit(1)
 
     start_utc, end_utc = _resolve_harvest_window(date, start, end, utc_offset)
 
-    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes, config)
+    alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes, config)
     detector = DogDetector(
         model_name=model,
         long_edge=long_edge,
@@ -1216,7 +1009,7 @@ def export_dataset_command(
 
     from detectivepotty.dataset_export import export_dataset
 
-    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
+    alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes)
     detector = DogDetector(
         model_name=model,
         long_edge=long_edge,
@@ -1333,7 +1126,7 @@ def experiment_bakeoff_command(
         if not chunks:
             raise typer.BadParameter(f"no chunk videos found in {input_dir}")
 
-    alias_classes, alias_nms_iou = _resolve_dog_aliases(dog_alias_classes)
+    alias_classes, alias_nms_iou = resolve_dog_aliases(dog_alias_classes)
     detector = DogDetector(
         model_name=model,
         long_edge=long_edge,
@@ -1427,7 +1220,7 @@ def experiment_acquire_command(
     can skip. Acquisition is bandwidth/disk-heavy — start with a 2–4h window.
     """
 
-    config = _load_cli_config(config_path)
+    config = load_cli_config(config_path)
     if not config.protect_configured():
         typer.echo("Protect is not configured; set nvr_host and credentials env vars.")
         raise typer.Exit(1)
@@ -1585,84 +1378,3 @@ def _resolve_protect_url(config: Config, camera) -> str:
             f"No RTSPS URL for protect camera '{camera.id}' substream {camera.substream_choice}."
         )
     return url
-
-
-
-def _draw_detections(frame: np.ndarray, detections: list[object]) -> None:
-    height, width = frame.shape[:2]
-    for detection in detections:
-        x1, y1, x2, y2 = detection.bbox.clip_to(width, height).to_int_tuple()
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 220, 30), 3)
-        label = f"{detection.class_name} {detection.confidence:.2f}"
-        cv2.putText(
-            frame,
-            label,
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (30, 220, 30),
-            2,
-            cv2.LINE_AA,
-        )
-
-
-def _save_best_crop(
-    frame: np.ndarray,
-    detections: list[object],
-    save_crops: Path,
-    frame_idx: int,
-) -> int:
-    best = max(detections, key=lambda detection: detection.confidence)
-    crop = crop_from_frame(frame, best.bbox, margin_frac=0.5)
-    if crop.size == 0:
-        return 0
-    crop_path = save_crops / f"frame_{frame_idx:06d}_dog_{best.confidence:.2f}.jpg"
-    if not cv2.imwrite(str(crop_path), crop):
-        raise typer.BadParameter(f"Failed to write crop: {crop_path}")
-    return 1
-
-
-def _print_summary(
-    *,
-    frames_read: int,
-    detection_frames: int,
-    dogs_detected: int,
-    frames_with_dog: int,
-    crops_saved: int,
-    output: Path,
-    save_crops: Path | None,
-    original_resolution: tuple[int, int],
-    inference_resolution: tuple[int, int] | None,
-    latencies_ms: list[float],
-    elapsed_s: float,
-    device: str,
-    model_name: str,
-) -> None:
-    if latencies_ms:
-        mean_latency = float(np.mean(latencies_ms))
-        p95_latency = float(np.percentile(latencies_ms, 95))
-        inference_fps = detection_frames / (sum(latencies_ms) / 1000.0)
-    else:
-        mean_latency = 0.0
-        p95_latency = 0.0
-        inference_fps = 0.0
-    end_to_end_fps = frames_read / elapsed_s
-
-    typer.echo("Detection summary")
-    typer.echo(f"  model: {model_name}")
-    typer.echo(f"  device: {device}")
-    typer.echo(f"  frames read: {frames_read}")
-    typer.echo(f"  detection frames: {detection_frames}")
-    typer.echo(f"  dog detections: {dogs_detected}")
-    typer.echo(f"  frames with dog: {frames_with_dog}")
-    typer.echo(f"  crops saved: {crops_saved}")
-    typer.echo(f"  annotated video: {output}")
-    if save_crops is not None:
-        typer.echo(f"  crop directory: {save_crops}")
-    typer.echo(f"  original resolution: {original_resolution[0]}x{original_resolution[1]}")
-    if inference_resolution is not None:
-        typer.echo(f"  inference resolution: {inference_resolution[0]}x{inference_resolution[1]}")
-    typer.echo(f"  mean inference FPS: {inference_fps:.2f}")
-    typer.echo(f"  end-to-end FPS: {end_to_end_fps:.2f}")
-    typer.echo(f"  mean inference latency ms: {mean_latency:.1f}")
-    typer.echo(f"  p95 inference latency ms: {p95_latency:.1f}")

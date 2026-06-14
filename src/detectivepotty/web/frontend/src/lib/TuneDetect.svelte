@@ -26,6 +26,7 @@
     TuneUltralyticsTrackerParams,
   } from "./types";
   import TuneClipBrowser from "./TuneClipBrowser.svelte";
+  import TuneTimelineStrip from "./TuneTimelineStrip.svelte";
   import Transport from "./Transport.svelte";
   import {
     classBoxColor,
@@ -39,7 +40,6 @@
     BOX_WEAK,
   } from "./overlayStyle";
   import { loadTuneLastDir, saveTuneLastDir } from "./prefs";
-  import { observeResize } from "./resize";
   import {
     DEFAULT_FLOOR,
     MAX_INFLIGHT,
@@ -101,7 +101,6 @@
   let videoEl = $state<HTMLVideoElement | null>(null);
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let stripEl = $state<HTMLCanvasElement | null>(null);
-  let stopStripResize: (() => void) | null = null;
   // Per-detection zoom-crop canvases, indexed alongside `zoomCards`.
   let zoomCanvases: HTMLCanvasElement[] = [];
   let showZoom = $state(true);
@@ -244,7 +243,6 @@
 
   onDestroy(() => {
     teardownClip();
-    stopStripResize?.();
   });
 
   function effectiveFps(m: TuneMeta | null): number {
@@ -1349,11 +1347,6 @@
     updateStrip();
   });
 
-  $effect(() => {
-    stopStripResize?.();
-    stopStripResize = observeResize(stripEl, updateStrip);
-  });
-
   // Redraw the per-detection zoom crops when the frame, detections, pose, or
   // threshold change. Cheap: a few small drawImage() pulls from the <video>.
   $effect(() => {
@@ -1847,31 +1840,15 @@
           {/if}
         </div>
 
-        <div class="scrub">
-          <input
-            type="range"
-            class="seek"
-            min="0"
-            max={Math.max(0, totalFrames - 1)}
-            step="1"
-            value={displayIndex}
-            disabled={totalFrames <= 0}
-            aria-label="Timeline"
-            onpointerdown={onSeekPointerDown}
-            oninput={onSeekInput}
-            onpointerup={onSeekCommit}
-            onpointercancel={onSeekCommit}
-            onchange={onSeekCommit}
-          />
-          <div class="strip-wrap">
-            <canvas bind:this={stripEl} class="strip"></canvas>
-            <div class="strip-legend mono small muted">
-              <span><i class="sw yolo"></i> YOLO (analyzed · detected)</span>
-              <span><i class="sw pose"></i> pose</span>
-              <span><i class="sw track"></i> track</span>
-            </div>
-          </div>
-        </div>
+        <TuneTimelineStrip
+          bind:canvas={stripEl}
+          {displayIndex}
+          {totalFrames}
+          onpointerdown={onSeekPointerDown}
+          oninput={onSeekInput}
+          oncommit={onSeekCommit}
+          onresize={updateStrip}
+        />
 
         <div class="controls">
           <Transport
@@ -2366,113 +2343,6 @@
     width: 100%;
     height: 100%;
     pointer-events: none;
-  }
-
-  .scrub {
-    /* Single source of truth for the thumb width: the native range thumb and
-       the analyzed-strip inset both derive from it, so they stay aligned. */
-    --seek-thumb-w: 14px;
-    --seek-track-h: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .seek {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 100%;
-    height: var(--seek-thumb-w);
-    margin: 0;
-    background: transparent;
-    cursor: pointer;
-  }
-
-  .seek:disabled {
-    cursor: default;
-    opacity: 0.5;
-  }
-
-  .seek::-webkit-slider-runnable-track {
-    height: var(--seek-track-h);
-    border-radius: 3px;
-    background: var(--line-strong, #324056);
-  }
-
-  .seek::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    box-sizing: border-box;
-    width: var(--seek-thumb-w);
-    height: var(--seek-thumb-w);
-    border: none;
-    border-radius: 50%;
-    background: var(--amber, #f0b35a);
-    /* Centre the thumb vertically on the track. */
-    margin-top: calc((var(--seek-track-h) - var(--seek-thumb-w)) / 2);
-  }
-
-  .seek::-moz-range-track {
-    height: var(--seek-track-h);
-    border-radius: 3px;
-    background: var(--line-strong, #324056);
-  }
-
-  .seek::-moz-range-thumb {
-    box-sizing: border-box;
-    width: var(--seek-thumb-w);
-    height: var(--seek-thumb-w);
-    border: none;
-    border-radius: 50%;
-    background: var(--amber, #f0b35a);
-  }
-
-  .seek:focus-visible {
-    outline: 2px solid var(--accent, #3f7d5a);
-    outline-offset: 3px;
-    border-radius: 6px;
-  }
-
-  /* Inset by half the thumb width so the strip's [0..width] spans exactly the
-     thumb's centre-travel range; the strip then uses idx/(total-1) like the
-     range, lining up at every position including both ends. */
-  .strip-wrap {
-    padding-inline: calc(var(--seek-thumb-w) / 2);
-  }
-
-  .strip-wrap .strip {
-    display: block;
-    width: 100%;
-    height: 28px;
-    border-radius: 3px;
-  }
-
-  .strip-legend {
-    display: flex;
-    gap: 1rem;
-    margin-top: 3px;
-    padding-inline: 1px;
-  }
-
-  .strip-legend .sw {
-    display: inline-block;
-    width: 9px;
-    height: 9px;
-    border-radius: 2px;
-    margin-right: 4px;
-    vertical-align: -1px;
-  }
-
-  .strip-legend .sw.yolo {
-    background: #28d17c;
-  }
-
-  .strip-legend .sw.pose {
-    background: #5ad1ff;
-  }
-
-  .strip-legend .sw.track {
-    background: #b388ff;
   }
 
   .model {

@@ -8,6 +8,8 @@ that writes a placeholder file, and the file pipeline runs against injected
 
 from __future__ import annotations
 
+import threading
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,8 @@ from detectivepotty.events import Detection
 from detectivepotty.geometry import BBox
 from detectivepotty.harvest import DogSpan, HarvestResult
 from detectivepotty.harvest_unvr import (
+    _ChunkDownload,
+    _download_chunks_ahead,
     harvest_camera_window,
     plan_chunks,
 )
@@ -397,3 +401,125 @@ def test_harvest_camera_window_records_camera_name_and_conf(tmp_path: Path) -> N
     # The id->name sidecar is written at the harvest root for later resolution.
     cameras = json.loads((out / "cameras.json").read_text(encoding="utf-8"))
     assert cameras["6695ef21030c4603e400040d"] == "Backyard Grass"
+
+
+# --------------------------------------------------------------------------- #
+# download-ahead pipelining (S1): overlap network I/O with the scan, but keep
+# chunks consumed in planned order so spans/dedup are byte-identical.
+# --------------------------------------------------------------------------- #
+
+
+def test_download_chunks_ahead_prefetches_on_background_thread(tmp_path: Path) -> None:
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    end = start + timedelta(hours=3)
+    chunks = plan_chunks(start, end, chunk_s=3600.0, overlap_s=0.0)
+    assert len(chunks) == 3
+
+    main_thread = threading.current_thread().name
+    started: list[tuple[str, datetime]] = []
+    lock = threading.Lock()
+
+    def dl(camera_id, c_start, c_end, dest):
+        with lock:
+            started.append((threading.current_thread().name, c_start))
+        dest.write_bytes(b"placeholder")
+        return dest
+
+    it = _download_chunks_ahead(
+        chunks, camera_id="cam", download_fn=dl, tmp_root=tmp_path, max_ahead=2
+    )
+    first = next(it)
+    # Before consuming the second item, the background producer should have raced
+    # ahead and started downloading at least one more chunk (bounded polling, so
+    # the assertion is robust to scheduling jitter rather than timing-flaky).
+    deadline = time.time() + 2.0
+    while True:
+        with lock:
+            n_started = len(started)
+        if n_started >= 2 or time.time() >= deadline:
+            break
+        time.sleep(0.01)
+    with lock:
+        assert n_started >= 2  # prefetched ahead of consumption
+        assert all(name != main_thread for name, _ in started)  # on a bg thread
+
+    rest = list(it)
+    ordered = [first, *rest]
+    assert [c.index for c in ordered] == [0, 1, 2]  # consumed in planned order
+
+
+def test_download_chunks_ahead_sequential_when_disabled(tmp_path: Path) -> None:
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    chunks = plan_chunks(start, end, chunk_s=3600.0, overlap_s=0.0)
+
+    main_thread = threading.current_thread().name
+    threads: list[str] = []
+
+    def dl(camera_id, c_start, c_end, dest):
+        threads.append(threading.current_thread().name)
+        dest.write_bytes(b"placeholder")
+        return dest
+
+    items = list(
+        _download_chunks_ahead(
+            chunks, camera_id="cam", download_fn=dl, tmp_root=tmp_path, max_ahead=0
+        )
+    )
+    assert [c.index for c in items] == [0, 1]
+    assert threads == [main_thread, main_thread]  # inline on the calling thread
+
+
+def test_download_chunks_ahead_captures_errors_and_missing(tmp_path: Path) -> None:
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    end = start + timedelta(hours=3)
+    chunks = plan_chunks(start, end, chunk_s=3600.0, overlap_s=0.0)
+
+    def flaky(camera_id, c_start, c_end, dest):
+        if c_start.hour == 0:
+            raise RuntimeError("network blip")
+        if c_start.hour == 1:
+            return None  # no recording
+        dest.write_bytes(b"placeholder")
+        return dest
+
+    items = list(
+        _download_chunks_ahead(
+            chunks, camera_id="cam", download_fn=flaky, tmp_root=tmp_path, max_ahead=2
+        )
+    )
+    assert len(items) == 3
+    assert all(isinstance(c, _ChunkDownload) for c in items)
+    assert isinstance(items[0].error, RuntimeError) and items[0].path is None
+    assert items[1].error is None and items[1].path is None  # missing recording
+    assert items[2].error is None and items[2].path is not None
+    assert items[2].path.exists()
+
+
+def _run_window(tmp_path: Path, download_ahead: int, calls: list[Any]):
+    start = datetime(2026, 6, 6, 0, 0, tzinfo=UTC)
+    end = start + timedelta(hours=3)
+    return harvest_camera_window(
+        "Backyard Grass",
+        start,
+        end,
+        tmp_path / "harvest",
+        download_fn=_make_download_fn(60, calls),
+        chunk_s=3600.0,
+        overlap_s=0.0,
+        download_ahead=download_ahead,
+        **_kwargs(60),
+    )
+
+
+def test_harvest_camera_window_output_identical_with_download_ahead(tmp_path: Path) -> None:
+    seq_calls: list[Any] = []
+    seq = _run_window(tmp_path / "seq", 0, seq_calls)
+    pipe_calls: list[Any] = []
+    pipe = _run_window(tmp_path / "pipe", 2, pipe_calls)
+
+    # Same chunks downloaded, same spans kept in the same order — pipelining only
+    # changes wall-clock, never which clips are produced.
+    assert [c[1] for c in seq_calls] == [c[1] for c in pipe_calls]
+    assert [r.span_id for r in seq] == [r.span_id for r in pipe]
+    assert len(seq) == len(pipe) == 3

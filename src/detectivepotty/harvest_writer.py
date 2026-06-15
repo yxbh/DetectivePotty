@@ -167,6 +167,13 @@ def extract_span_clips(
     the clip-frame / source-frame metadata mapping stays correct. Returns
     ``span_id -> (width, height)``.
 
+    Each writer is a live ffmpeg encoder subprocess, so a writer is **released the
+    moment the decode index passes its span's ``end_frame``** — this bounds the
+    number of *simultaneously open* encoders to the spans that genuinely overlap in
+    time (a handful), not every span in the chunk. Without it, a busy burst chunk
+    (100s of spans) would keep 100s of concurrent ffmpeg processes open until the
+    whole chunk finished decoding and exhaust system memory.
+
     When the capture cannot seek (no ``CAP_PROP_POS_FRAMES`` support), falls back
     to a single sequential pass over the whole file.
     """
@@ -179,6 +186,13 @@ def extract_span_clips(
     segments = merge_frame_ranges([(span.start_frame, span.end_frame) for span, _, _ in plans])
     writers: dict[str, ClipWriter] = {}
     sizes: dict[str, tuple[int, int]] = {}
+    release_errors: list[Exception] = []
+
+    # span_ids that finish at each frame index, so a single O(1) lookup per decoded
+    # frame can release the encoders whose span just ended (see _release_completed).
+    ends_by_frame: dict[int, list[str]] = {}
+    for span, span_id, _ in plans:
+        ends_by_frame.setdefault(span.end_frame, []).append(span_id)
 
     def _emit(frame: np.ndarray, decoded_idx: int) -> None:
         height, width = frame.shape[:2]
@@ -190,6 +204,19 @@ def extract_span_clips(
                     writers[span_id] = writer
                     sizes[span_id] = (width, height)
                 writer.write(frame)
+
+    def _release_completed(decoded_idx: int) -> None:
+        # Free each span's ffmpeg encoder as soon as it has received its final frame
+        # (``end_frame`` reached), keeping concurrent encoders bounded by temporal
+        # overlap rather than the chunk's total span count.
+        for span_id in ends_by_frame.get(decoded_idx, ()):
+            writer = writers.pop(span_id, None)
+            if writer is None:
+                continue
+            try:
+                writer.release()
+            except Exception as exc:  # noqa: BLE001 - aggregate, raise after cleanup
+                release_errors.append(exc)
 
     try:
         seekable = False
@@ -212,6 +239,7 @@ def extract_span_clips(
                             f"{seg_end} in segment starting at {seg_start}"
                         )
                     _emit(frame, decoded_idx)
+                    _release_completed(decoded_idx)
                     decoded_idx += 1
         else:
             # No seek support: one sequential pass writes each frame into every
@@ -222,15 +250,19 @@ def extract_span_clips(
                 if not ok or frame is None:
                     break
                 _emit(frame, decoded_idx)
+                _release_completed(decoded_idx)
                 decoded_idx += 1
     finally:
-        release_errors: list[Exception] = []
         try:
+            # Force-release any stragglers the in-loop releases didn't cover (the
+            # error path, or a span whose end frame was never decoded). Idempotent
+            # with _release_completed, which already popped the finished writers.
             for writer in writers.values():
                 try:
                     writer.release()
                 except Exception as exc:
                     release_errors.append(exc)
+            writers.clear()
         finally:
             release_capture(capture)
         if release_errors:

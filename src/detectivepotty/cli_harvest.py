@@ -78,7 +78,7 @@ def harvest_command(
             help="Detect this many sampled frames per batched forward (faster on "
             "accelerated backends; CoreML/MPS true-batch here). 1 = single-frame.",
         ),
-    ] = 32,
+    ] = 64,
     max_age_frames: Annotated[
         int,
         typer.Option(
@@ -228,7 +228,27 @@ def harvest_camera_command(
             help="Detect this many sampled frames per batched forward (faster on "
             "accelerated backends; CoreML/MPS true-batch here). 1 = single-frame.",
         ),
-    ] = 32,
+    ] = 64,
+    max_age_frames: Annotated[
+        int,
+        typer.Option(
+            "--max-age-frames",
+            min=0,
+            help="Keep a track alive across this many missed source frames "
+            "(survives brief detector misses/occlusions). Higher = fewer "
+            "fragmented spans during busy multi-dog activity.",
+        ),
+    ] = 15,
+    center_dist_gate: Annotated[
+        float,
+        typer.Option(
+            "--center-dist-gate",
+            min=0.0,
+            help="Re-associate a detection to a track when its box center is within "
+            "this many box-diagonals, even if IoU is low (0 disables). Higher = "
+            "stickier tracks, fewer fragments.",
+        ),
+    ] = 1.5,
     merge_gap_s: Annotated[
         float,
         typer.Option("--merge-gap", min=0.0, help="Merge same-track gaps up to N seconds."),
@@ -249,6 +269,17 @@ def harvest_camera_command(
         bool,
         typer.Option("--keep-chunks", help="Keep downloaded chunk MP4s (debug)."),
     ] = False,
+    download_ahead: Annotated[
+        int,
+        typer.Option(
+            "--download-ahead",
+            min=0,
+            help="Prefetch this many chunks on a background thread while the current "
+            "chunk is scanned/extracted, hiding download latency behind the "
+            "(inference-bound) scan. Each in-flight chunk is one MP4 on disk "
+            "(~1-2GB); 0 = sequential download-then-harvest. Output is identical.",
+        ),
+    ] = 2,
     downloader: Annotated[
         str,
         typer.Option(
@@ -296,11 +327,14 @@ def harvest_camera_command(
         overlap_s=overlap_s,
         sample_every=sample_every,
         detect_batch_size=detect_batch_size,
+        max_age_frames=max_age_frames,
+        center_dist_gate=center_dist_gate,
         merge_gap_s=merge_gap_s,
         pad_s=pad_s,
         min_len_s=min_len_s,
         max_len_s=max_len_s,
         keep_chunks=keep_chunks,
+        download_ahead=download_ahead,
         detect_conf=conf,
     )
 

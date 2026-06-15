@@ -27,7 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ from detectivepotty.harvest import (
     _default_clip_writer_factory,
     harvest_clips,
 )
+from detectivepotty.sources.prefetch import prefetch
 from detectivepotty.sources.pyav_capture import open_capture
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHUNK_S = 3600.0
 DEFAULT_OVERLAP_S = 5.0
 DEFAULT_DEDUP_TIME_IOU = 0.5
+
+# How many chunks may be downloaded *ahead* of the one currently being harvested.
+# Downloading is network I/O and harvesting is CPU/ANE compute, so they don't
+# contend; running the next download(s) on a background thread hides download
+# latency behind the (inference-bound) scan. The cap bounds how many downloaded
+# chunk MP4s sit on disk at once (~1GB each) — cheap on a 64GB machine, and the
+# crash-fixed extractor keeps RAM bounded regardless. 0/1 still pipeline one ahead.
+DEFAULT_DOWNLOAD_AHEAD = 2
 
 # Sidecar at the harvest root mapping camera_id -> friendly NVR name, so the
 # labeling UI can show a human name even for clips harvested before a name was
@@ -124,6 +134,7 @@ def harvest_camera_window(
     center_dist_gate: float = DEFAULT_CENTER_DIST_GATE,
     detect_batch_size: int = DEFAULT_DETECT_BATCH_SIZE,
     keep_chunks: bool = False,
+    download_ahead: int = DEFAULT_DOWNLOAD_AHEAD,
     capture_factory: Callable[[str], Any] = open_capture,
     clip_writer_factory: Callable[
         [Path, float, tuple[int, int]], ClipWriter
@@ -136,6 +147,13 @@ def harvest_camera_window(
     spans whose absolute source-time intervals overlap an already-kept span by at
     least ``dedup_time_iou`` (the cross-chunk overlap region). Failed/empty chunk
     downloads are skipped. Temp chunk files are deleted unless ``keep_chunks``.
+
+    ``download_ahead`` chunks are fetched on a background thread while the current
+    chunk is harvested, so network download overlaps the (inference-bound) scan;
+    chunks are still *consumed* in planned order, so spans, dedup, and idempotency
+    are byte-for-byte identical to the old sequential download-then-harvest path —
+    only the wall-clock changes. The cap bounds how many downloaded chunk files sit
+    on disk at once; ``download_ahead <= 0`` restores fully sequential behavior.
     """
 
     out_dir = Path(out_dir)
@@ -153,27 +171,43 @@ def harvest_camera_window(
     kept: list[HarvestResult] = []
     kept_intervals: list[tuple[float, float]] = []  # absolute epoch seconds
 
-    for index, (chunk_start, chunk_end) in enumerate(chunks):
-        dest = tmp_root / f"{_safe(camera_id)}_{chunk_start:%Y%m%dT%H%M%S}.mp4"
-        try:
-            path = download_fn(camera_id, chunk_start, chunk_end, dest)
-        except Exception as exc:  # noqa: BLE001 - one bad chunk must not abort the day
+    # Download the next chunk(s) on a background thread while this one is harvested:
+    # network I/O overlaps the inference-bound scan, hiding download latency. Chunks
+    # are still *consumed* strictly in order here, so dedup/idempotency are unchanged.
+    #
+    # Future opportunity (deferred — "S2"): each chunk runs scan (decode + YOLO, ANE/
+    # inference-bound) then extract (x264 encode, CPU-bound) serially. Those two use
+    # different silicon and don't contend, so chunk N's *extract* could overlap chunk
+    # N+1's *scan*, shrinking the per-chunk critical path toward pure scan time. This
+    # is orthogonal to the download-ahead above (that hides the network stage; S2 hides
+    # the extract stage). Left undone because after download-ahead, extract is a small
+    # slice of each chunk's compute (scan dominates) so the marginal win is modest, and
+    # it adds real complexity (two chunks' decode/encode state in flight + PyAV/CPU
+    # decode contention). Revisit only if a real NVR day-harvest shows extract is a
+    # meaningful fraction of wall-clock after download-ahead.
+    downloads = _download_chunks_ahead(
+        chunks, camera_id=camera_id, download_fn=download_fn,
+        tmp_root=tmp_root, max_ahead=download_ahead,
+    )
+    for chunk in downloads:
+        n = f"{chunk.index + 1}/{len(chunks)}"
+        if chunk.error is not None:
             logger.warning(
-                "harvest-unvr: chunk %d/%d download failed (%s-%s): %s",
-                index + 1, len(chunks), chunk_start.isoformat(), chunk_end.isoformat(), exc,
+                "harvest-unvr: chunk %s download failed (%s-%s): %s",
+                n, chunk.start.isoformat(), chunk.end.isoformat(), chunk.error,
             )
             continue
-        if path is None or not Path(path).exists():
+        if chunk.path is None or not Path(chunk.path).exists():
             logger.info(
-                "harvest-unvr: no recording for chunk %d/%d (%s-%s)",
-                index + 1, len(chunks), chunk_start.isoformat(), chunk_end.isoformat(),
+                "harvest-unvr: no recording for chunk %s (%s-%s)",
+                n, chunk.start.isoformat(), chunk.end.isoformat(),
             )
             continue
 
-        source_id = f"{camera_id}@{chunk_start.strftime('%Y%m%dT%H%M%SZ')}"
+        source_id = f"{camera_id}@{chunk.start.strftime('%Y%m%dT%H%M%SZ')}"
         try:
             results = harvest_clips(
-                path,
+                chunk.path,
                 out_dir,
                 detector=detector,
                 sample_every=sample_every,
@@ -181,7 +215,7 @@ def harvest_camera_window(
                 pad_s=pad_s,
                 min_len_s=min_len_s,
                 max_len_s=max_len_s,
-                source_start_utc=chunk_start,
+                source_start_utc=chunk.start,
                 source_id=source_id,
                 camera_name=camera_name,
                 detect_conf=detect_conf,
@@ -194,9 +228,9 @@ def harvest_camera_window(
             )
         finally:
             if not keep_chunks:
-                _unlink(Path(path))
+                _unlink(Path(chunk.path))
 
-        base = chunk_start.timestamp()
+        base = chunk.start.timestamp()
         overlap_window = (base, base + max(0.0, overlap_s))
         dedup_intervals = [
             interval
@@ -222,6 +256,57 @@ def harvest_camera_window(
     if not keep_chunks:
         _rmtree(tmp_root, missing_ok=True)
     return kept
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkDownload:
+    """One planned chunk's download outcome, yielded in planned order.
+
+    Exactly one of ``path`` (a written file, possibly ``None`` for "no recording")
+    or ``error`` (the download raised) is meaningful; the consumer logs+skips both
+    the error and missing-file cases just as the old inline loop did.
+    """
+
+    index: int
+    start: datetime
+    end: datetime
+    path: Path | None
+    error: Exception | None
+
+
+def _download_chunks_ahead(
+    chunks: list[tuple[datetime, datetime]],
+    *,
+    camera_id: str,
+    download_fn: DownloadFn,
+    tmp_root: Path,
+    max_ahead: int,
+) -> Iterator[_ChunkDownload]:
+    """Yield each chunk's download result in order, fetching ahead on a thread.
+
+    A background producer downloads up to ``max_ahead`` chunks ahead of the
+    consumer (bounding how many chunk files sit on disk); each download's success,
+    "no recording" (``None``), or exception is captured into a :class:`_ChunkDownload`
+    so one bad chunk never aborts the day. ``max_ahead <= 0`` falls back to fully
+    sequential download-then-harvest (the pre-pipeline behavior).
+    """
+
+    def _produce() -> Iterator[_ChunkDownload]:
+        for index, (chunk_start, chunk_end) in enumerate(chunks):
+            dest = tmp_root / f"{_safe(camera_id)}_{chunk_start:%Y%m%dT%H%M%S}.mp4"
+            try:
+                path = download_fn(camera_id, chunk_start, chunk_end, dest)
+            except Exception as exc:  # noqa: BLE001 - one bad chunk must not abort the day
+                yield _ChunkDownload(index, chunk_start, chunk_end, None, exc)
+                continue
+            yield _ChunkDownload(
+                index, chunk_start, chunk_end,
+                Path(path) if path is not None else None, None,
+            )
+
+    if max_ahead <= 0:
+        return _produce()
+    return prefetch(_produce(), max_prefetch=max_ahead)
 
 
 def _is_duplicate(

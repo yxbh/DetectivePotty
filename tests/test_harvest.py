@@ -482,6 +482,108 @@ def test_extract_overlapping_spans_share_one_segment(tmp_path: Path) -> None:
     assert FakeClipWriter.written["s1"] == 21  # 20..40
 
 
+class _ConcurrencyTrackingWriter:
+    """Clip writer that records, via a shared ledger, how many writers are open at
+    once and the open/release event order — so a test can assert encoders are freed
+    as their span ends (bounded concurrency) rather than all held to the chunk end.
+    """
+
+    def __init__(self, ledger: dict, path: Path, fps: float, size) -> None:
+        self.ledger = ledger
+        self.path = path
+        self.released = False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fake")  # checksum/existence checks pass
+        ledger["open"] += 1
+        ledger["live"] += 1
+        ledger["peak"] = max(ledger["peak"], ledger["live"])
+        ledger["events"].append(("open", path.parent.name))
+
+    def write(self, frame: np.ndarray) -> None:
+        pass
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.ledger["live"] -= 1
+        self.ledger["events"].append(("release", self.path.parent.name))
+
+
+def _new_ledger() -> dict:
+    return {"open": 0, "live": 0, "peak": 0, "events": []}
+
+
+def test_extract_releases_writer_as_each_span_ends(tmp_path: Path) -> None:
+    # Three disjoint spans: only one encoder should ever be open at a time, and each
+    # must be released before the next opens (the fix that bounds concurrent ffmpeg).
+    ledger = _new_ledger()
+    spans = [_span("1", 10, 20), _span("2", 30, 40), _span("3", 50, 60)]
+    plans = _plans(tmp_path, spans)
+
+    _extract_span_clips(
+        tmp_path / "fake.mp4",
+        plans,
+        fps=10.0,
+        capture_factory=lambda _p: FakeSeekCapture(100),
+        clip_writer_factory=lambda p, fps, size: _ConcurrencyTrackingWriter(ledger, p, fps, size),
+    )
+
+    assert ledger["open"] == 3  # every span written
+    assert ledger["live"] == 0  # every encoder released
+    assert ledger["peak"] == 1  # never two encoders alive at once
+    assert ledger["events"] == [
+        ("open", "s0"), ("release", "s0"),
+        ("open", "s1"), ("release", "s1"),
+        ("open", "s2"), ("release", "s2"),
+    ]
+
+
+def test_extract_keeps_overlapping_writers_concurrent(tmp_path: Path) -> None:
+    # Overlapping spans must run concurrently (one decode feeds both), but the
+    # earlier-ending span is released first — its encoder is not held open to the end.
+    ledger = _new_ledger()
+    spans = [_span("1", 10, 30), _span("2", 20, 40)]  # overlap [20, 30]
+    plans = _plans(tmp_path, spans)
+
+    _extract_span_clips(
+        tmp_path / "fake.mp4",
+        plans,
+        fps=10.0,
+        capture_factory=lambda _p: FakeSeekCapture(100),
+        clip_writer_factory=lambda p, fps, size: _ConcurrencyTrackingWriter(ledger, p, fps, size),
+    )
+
+    assert ledger["open"] == 2
+    assert ledger["live"] == 0
+    assert ledger["peak"] == 2  # both open during the overlap
+    # s0 ends at frame 30, s1 at 40 -> s0 released before s1.
+    releases = [name for kind, name in ledger["events"] if kind == "release"]
+    assert releases == ["s0", "s1"]
+
+
+def test_extract_bounds_concurrent_writers_in_busy_chunk(tmp_path: Path) -> None:
+    # Reproduces the OOM-crash condition: many spans packed into one merged decode
+    # segment. Pre-fix every writer stayed open until the chunk finished (peak == 6,
+    # i.e. 6 live ffmpeg); post-fix only the temporally-overlapping spans are open at
+    # once. These 6 spans are a staggered chain where at most 2 overlap any frame.
+    ledger = _new_ledger()
+    spans = [_span(str(i), i * 10, i * 10 + 15) for i in range(6)]
+    plans = _plans(tmp_path, spans)
+
+    _extract_span_clips(
+        tmp_path / "fake.mp4",
+        plans,
+        fps=10.0,
+        capture_factory=lambda _p: FakeSeekCapture(200),
+        clip_writer_factory=lambda p, fps, size: _ConcurrencyTrackingWriter(ledger, p, fps, size),
+    )
+
+    assert ledger["open"] == 6  # all six clips still produced
+    assert ledger["live"] == 0  # all released
+    assert ledger["peak"] == 2  # bounded by overlap, NOT the 6-span chunk total
+
+
 def test_extract_sequential_fallback_without_seek(tmp_path: Path) -> None:
     # A capture without ``set`` decodes the whole file (legacy path) but still
     # writes exactly each span's frames.

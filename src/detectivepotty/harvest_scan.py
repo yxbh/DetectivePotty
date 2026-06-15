@@ -22,9 +22,12 @@ from detectivepotty.tracking import Tracker
 # ``detect_batch`` (real ``DogDetector``); the live pipeline proves CoreML/MPS
 # true-batches here. Measured on the production CoreML export, batch 32 runs the
 # scan's inference ~3.4x faster than single-frame ``detect`` (the dominant cost
-# of a decode-overlapped scan). ``1`` reproduces the legacy single-frame path,
-# as does any detector lacking ``detect_batch`` (e.g. test fakes).
-DEFAULT_DETECT_BATCH_SIZE = 32
+# of a decode-overlapped scan); batch 64 buys a further ~5% with negligible extra
+# RAM on the 64GB target machines, so it is the default. ``1`` reproduces the
+# legacy single-frame path, as does any detector lacking ``detect_batch`` (e.g.
+# test fakes). Batching is numerically per-frame identical — only throughput
+# changes, never which detections (and therefore which spans/clips) are produced.
+DEFAULT_DETECT_BATCH_SIZE = 64
 
 
 DetectorLike = FrameDetector

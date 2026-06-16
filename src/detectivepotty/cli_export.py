@@ -56,7 +56,8 @@ def export_coreml_command(
     path) instead of crashing the MPSGraph compiler — numerically identical to the
     original weights. macOS-only. The result is auto-discovered by the ``/tune``
     model picker; pass ``--out models/coreml`` to produce the curated, committable
-    set. Use ``--batch 32`` for a batched package (fastest dense-detection backend).
+    set. Use ``--batch N`` (e.g. 16) for a batched package — the fastest dense
+    detection backend; the detector auto-chunks larger requests to the baked N.
     """
 
     from detectivepotty.detect.coreml_export import export_coreml
@@ -186,7 +187,9 @@ def experiment_bakeoff_command(
         typer.Option(
             "--model",
             help="Ground-truth detector. A batched CoreML .mlpackage "
-            "(export-coreml --batch 32) is fastest; .pt also works.",
+            "(export-coreml --batch N) is fastest; .pt also works. The detector "
+            "auto-chunks each request to the package's baked batch, so any "
+            "--batch-size >= N runs fully batched.",
         ),
     ] = "models/yolo11m.pt",
     long_edge: Annotated[
@@ -199,7 +202,9 @@ def experiment_bakeoff_command(
     ] = 0.25,
     batch_size: Annotated[
         int,
-        typer.Option("--batch-size", min=1, help="Ground-truth detect batch size (CoreML fastest at 32)."),
+        typer.Option("--batch-size", min=1, help="Ground-truth detect batch size. "
+                     "Auto-chunked to the CoreML package's baked batch; set >= it "
+                     "(e.g. 16) for full GPU batching."),
     ] = 32,
     thresholds: Annotated[
         str,
@@ -208,6 +213,17 @@ def experiment_bakeoff_command(
             help="Comma-separated motion thresholds (fraction of peak second) to sweep.",
         ),
     ] = "0.05,0.10,0.15,0.25,0.40",
+    abs_cutoff: Annotated[
+        Optional[str],
+        typer.Option(
+            "--abs-cutoff",
+            help="Comma-separated ABSOLUTE per-second byte cutoffs scored as "
+            "'absmotion@<cutoff>' strategies. Unlike peak-relative --thresholds, an "
+            "absolute cutoff is shared across chunks, so a whole dog-free hour below "
+            "the cutoff is skipped wholesale. Calibrate from a busy chunk's "
+            "dog-second energy floor (e.g. ~0.25x its peak-second energy).",
+        ),
+    ] = None,
     min_dog_frames: Annotated[
         int,
         typer.Option("--min-dog-frames", min=1, help="Dog frames/second to count as a dog-second."),
@@ -215,6 +231,17 @@ def experiment_bakeoff_command(
     pad_s: Annotated[
         int,
         typer.Option("--pad-s", min=0, help="Seconds to dilate each motion hit (recall guard)."),
+    ] = 1,
+    gt_every_n: Annotated[
+        int,
+        typer.Option(
+            "--gt-every-n",
+            min=1,
+            help="Stride for the ground-truth pass: score every Nth frame and divide "
+            "effective fps by N so second-mapping stays exact. 1 = exhaustive (default). "
+            "3 = 10 fps truth on 30 fps footage (still denser than production's "
+            "every-5th-frame scan) for a ~3x faster pass on long windows.",
+        ),
     ] = 1,
     dog_alias_classes: DogAliasOption = None,
 ) -> None:
@@ -224,8 +251,11 @@ def experiment_bakeoff_command(
     chunk under ``--input-dir`` aggregated) to build the ground-truth dog-seconds
     (this is the ``blind-scrub`` baseline), then scores the compressed-domain motion
     pre-filter (swept across ``--thresholds``) on recall of those dog-seconds vs the
-    compute it saves. Prints a bake-off table; pick the greediest threshold that
-    still holds recall near 1.0. Offline/local — no NVR.
+    compute it saves. Optionally also scores ``--abs-cutoff`` absolute byte cutoffs
+    (``absmotion@<cutoff>`` rows) — these are shared across chunks, so an entire
+    dog-free hour can be skipped wholesale where peak-relative thresholds can't.
+    Prints a bake-off table; pick the greediest strategy that still holds recall
+    near 1.0. Offline/local — no NVR.
     """
 
     from detectivepotty.detect.yolo import DogDetector
@@ -242,6 +272,15 @@ def experiment_bakeoff_command(
         raise typer.BadParameter(f"--thresholds must be comma-separated floats: {exc}")
     if not threshold_vals:
         raise typer.BadParameter("--thresholds must contain at least one value")
+
+    try:
+        abs_cutoff_vals = (
+            tuple(float(c) for c in abs_cutoff.split(",") if c.strip())
+            if abs_cutoff
+            else ()
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(f"--abs-cutoff must be comma-separated floats: {exc}")
 
     if input_dir is not None:
         chunks = find_chunk_videos(input_dir)
@@ -274,6 +313,8 @@ def experiment_bakeoff_command(
             min_dog_frames=min_dog_frames,
             pad_s=pad_s,
             batch_size=batch_size,
+            abs_cutoffs=abs_cutoff_vals,
+            gt_every_n=gt_every_n,
             progress=_progress,
         )
     else:
@@ -285,6 +326,8 @@ def experiment_bakeoff_command(
             min_dog_frames=min_dog_frames,
             pad_s=pad_s,
             batch_size=batch_size,
+            abs_cutoffs=abs_cutoff_vals,
+            gt_every_n=gt_every_n,
         )
     elapsed_s = time.perf_counter() - started
     typer.echo("")

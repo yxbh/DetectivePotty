@@ -17,8 +17,8 @@ Correctness rules this module enforces (from the design critique):
   is sub-sampled by a time stride and capped per range.
 * **Split by day/source-recording**, not by random frame, so adjacent frames and
   same-recording background can't leak across train/val.
-* ``excluded`` behavior never produces crops; ``unknown`` dog is excluded from the
-  dog-ID tree but can still feed the behavior tree.
+* ``excluded`` behavior and ``not_dog`` subjects never produce crops; ``unknown``
+  dog is excluded from the dog-ID tree but can still feed the behavior tree.
 """
 
 from __future__ import annotations
@@ -396,7 +396,7 @@ def _emit_crop(
     stats.crops_written += 1
 
     dog_rel: Path | None = None
-    if rng.dog is not Dog.UNKNOWN:
+    if rng.dog not in {Dog.UNKNOWN, Dog.NOT_DOG}:
         dog = rng.dog.value
         dog_rel = Path("dog") / ctx.split / dog / f"{stem}.jpg"
         _write_jpeg(out_path / dog_rel, crop, jpeg_params)

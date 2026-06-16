@@ -156,6 +156,35 @@ def test_detect_batch_empty_returns_empty(monkeypatch):
     assert det.detect_batch([]) == []
 
 
+def test_detect_batch_chunks_to_coreml_max_batch(monkeypatch):
+    """A request larger than the baked CoreML batch is split into baked-sized
+    sub-batches on the SAME accelerator (not collapsed to per-frame)."""
+
+    per_frame = {i: ([[1, 1, 9, 9]], [0.7], [0]) for i in range(1, 6)}
+    model = _BatchModel(per_frame, supports_batch=True)
+    det = _make_detector(monkeypatch, model)
+    det._coreml_max_batch = 2  # mimic a batch=2 .mlpackage
+
+    out = det.detect_batch([_frame(i) for i in range(1, 6)])
+
+    assert [len(o) for o in out] == [1, 1, 1, 1, 1]
+    # 5 frames, cap 2 -> sub-batches of 2, 2, 1 (still all batched calls).
+    assert model.predict_calls == [2, 2, 1]
+    assert det._batch_unsupported is False
+
+
+def test_detect_batch_no_chunk_when_within_coreml_max_batch(monkeypatch):
+    per_frame = {i: ([], [], []) for i in range(1, 4)}
+    model = _BatchModel(per_frame, supports_batch=True)
+    det = _make_detector(monkeypatch, model)
+    det._coreml_max_batch = 8
+
+    det.detect_batch([_frame(1), _frame(2), _frame(3)])
+    # 3 <= cap 8 -> one batched forward, no splitting.
+    assert model.predict_calls == [3]
+    assert det._batch_unsupported is False
+
+
 def test_detect_batch_meta_length_mismatch_raises(monkeypatch):
     det = _make_detector(monkeypatch, _BatchModel({}))
     with pytest.raises(ValueError):

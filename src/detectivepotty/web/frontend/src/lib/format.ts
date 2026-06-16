@@ -100,3 +100,54 @@ export function labelText(label: string | null | undefined): string {
   }
   return LABEL_TEXT[label] ?? label;
 }
+
+const BEHAVIOR_TEXT: Record<string, string> = {
+  pee: "pee",
+  poop: "poop",
+  not_potty: "not potty",
+  excluded: "exclude",
+};
+
+const DOG_TEXT: Record<string, string> = {
+  gromit: "gromit",
+  walle: "walle",
+  apollo: "apollo",
+  unknown: "unknown dog",
+  not_dog: "not dog",
+};
+
+export function behaviorText(behavior: string | null | undefined): string {
+  if (!behavior) {
+    return "unknown";
+  }
+  return BEHAVIOR_TEXT[behavior] ?? behavior;
+}
+
+export function dogText(dog: string | null | undefined): string {
+  if (!dog) {
+    return "unknown dog";
+  }
+  return DOG_TEXT[dog] ?? dog;
+}
+
+export function behaviorHint(behavior: string): string {
+  switch (behavior) {
+    case "not_potty":
+      return "Trainable negative: a real dog is visible but not pottying.";
+    case "excluded":
+      return "Reviewed skip: do not use this range for behavior or dog-ID training.";
+    default:
+      return `Set behavior to ${behaviorText(behavior)}.`;
+  }
+}
+
+export function dogHint(dog: string): string {
+  switch (dog) {
+    case "unknown":
+      return "Real dog, but identity is uncertain; behavior can train, dog-ID will skip it.";
+    case "not_dog":
+      return "Detector false positive; exclude this range from behavior and dog-ID training.";
+    default:
+      return `Set dog to ${dogText(dog)}.`;
+  }
+}

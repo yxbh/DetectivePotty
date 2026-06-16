@@ -335,7 +335,7 @@
 
   <main class="tune-main" hidden={view !== "label"}>
     {#if labelMounted}
-      <LabelReview />
+      <LabelReview active={view === "label"} />
     {/if}
   </main>
 

@@ -182,6 +182,19 @@ class DogDetector:
         # fixed-batch=1 CoreML package): we then submit frames one-at-a-time on
         # the SAME accelerator rather than forcing CPU.
         self._batch_unsupported = False
+        # A CoreML ``.mlpackage`` is exported with a fixed/flexible max batch
+        # (``export_coreml(batch=N)``); submitting MORE than that in one
+        # ``predict`` raises and would otherwise trip the per-frame cliff above.
+        # Cache the baked ceiling so :meth:`_predict_batch` can split an oversized
+        # request into baked-sized sub-batches and stay on the fast GPU path.
+        # ``None`` means "no cap" (e.g. a ``.pt`` model, which batches dynamically
+        # on MPS); only resolved for CoreML packages so the ``.pt``/test path never
+        # imports ``coremltools``.
+        self._coreml_max_batch: int | None = None
+        if str(self.model_name).endswith(".mlpackage"):
+            from detectivepotty.detect.coreml_export import coreml_max_batch
+
+            self._coreml_max_batch = coreml_max_batch(self.model_name)
         self.batch_stats = BatchStats()
 
     def _acquire_model(self, device: str):
@@ -423,6 +436,25 @@ class DogDetector:
 
         if not self._batch_unsupported:
             try:
+                cap = self._coreml_max_batch
+                if cap is not None and cap >= 2 and len(frames) > cap:
+                    # Oversized request for a batched CoreML package: split into
+                    # baked-sized sub-batches so each forward stays within the
+                    # package's flexible-shape range instead of raising and
+                    # collapsing to per-frame for the rest of the run.
+                    results: list = []
+                    for start in range(0, len(frames), cap):
+                        sub = list(frames[start : start + cap])
+                        results.extend(
+                            self.model.predict(
+                                sub,
+                                imgsz=self.long_edge,
+                                conf=self.conf_threshold,
+                                device=self.device,
+                                verbose=False,
+                            )
+                        )
+                    return results, True
                 results = self.model.predict(
                     list(frames),
                     imgsz=self.long_edge,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatClock } from "./format";
+  import { behaviorText, dogText, formatClock } from "./format";
   import type { LabelClipSummary } from "./types";
 
   interface Props {
@@ -83,7 +83,7 @@
           Todo <span>{unlabeledCount}</span>
         </button>
         <button type="button" role="tab" class:active={filter === "labeled"} aria-selected={filter === "labeled"} onclick={() => onfilter("labeled")}>
-          Done <span>{labeledCount}</span>
+          Reviewed <span>{labeledCount}</span>
         </button>
       </div>
       <button
@@ -95,8 +95,8 @@
       >
         next unlabeled <kbd>N</kbd>
       </button>
-      <div class="list-progress mono" title={`${labeledCount} of ${totalCount} clips have at least one label range`}>
-        <span>{labeledCount}/{totalCount} labeled</span>
+      <div class="list-progress mono" title={`${labeledCount} of ${totalCount} clips have at least one saved range`}>
+        <span>{labeledCount}/{totalCount} reviewed</span>
         <span>
           {#if selectedPosition != null}
             {selectedPosition + 1}/{clips.length} shown
@@ -147,10 +147,10 @@
                   class="badge"
                   class:done={clip.labeled}
                   title={clip.labeled
-                    ? `${clip.n_trainable_ranges} trainable / ${clip.n_ranges} ranges`
-                    : "Not labeled yet"}
+                    ? `${clip.n_ranges} reviewed range${clip.n_ranges === 1 ? "" : "s"} · ${clip.n_trainable_ranges} trainable`
+                    : "Not reviewed yet"}
                 >
-                  {clip.labeled ? `✓${clip.n_trainable_ranges}` : "·"}
+                  {clip.labeled ? `✓${clip.n_ranges}` : "·"}
                 </span>
               </span>
               <span class="row2">
@@ -164,13 +164,13 @@
                   >T{clip.track_id ?? "?"}</span
                 >
               </span>
-              {#if clip.labeled && (clip.behaviors.length || clip.dogs.length)}
+              {#if clip.behaviors.length || clip.dogs.length}
                 <span class="row3">
                   {#each clip.behaviors as b (b)}
-                    <span class="chip b-{b}">{b}</span>
+                    <span class="chip b-{b}">{behaviorText(b)}</span>
                   {/each}
                   {#each clip.dogs as d (d)}
-                    <span class="chip dog">{d}</span>
+                    <span class="chip dog d-{d}">{dogText(d)}</span>
                   {/each}
                 </span>
               {/if}
@@ -387,6 +387,10 @@
   .chip.dog {
     background: var(--beh-dog);
     color: #dfe;
+  }
+  .chip.d-not_dog {
+    background: color-mix(in srgb, var(--red) 38%, var(--bg-3));
+    color: #ffdfe3;
   }
   .badge {
     font-size: 0.66rem;

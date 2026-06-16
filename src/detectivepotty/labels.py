@@ -38,25 +38,29 @@ class Behavior(str, Enum):
 
 
 class Dog(str, Enum):
-    """Dog identity. ``UNKNOWN`` is open-set — excluded from dog-ID training."""
+    """Dog identity. ``UNKNOWN`` is an unidentified dog; ``NOT_DOG`` is a false positive."""
 
     GROMIT = "gromit"
     WALLE = "walle"
     APOLLO = "apollo"
     UNKNOWN = "unknown"
+    NOT_DOG = "not_dog"
 
     @classmethod
     def _missing_(cls, value: object) -> "Dog | None":
         if isinstance(value, str):
-            normalized = value.strip().lower().replace("-", "").replace("_", "")
+            normalized = value.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+            if normalized == "unknowndog":
+                return cls.UNKNOWN
             for member in cls:
                 if member.value.replace("-", "").replace("_", "") == normalized:
                     return member
         return None
 
 
-# Behaviors that produce training crops (EXCLUDED never does).
+# Behaviors that produce training crops when the subject is a real dog.
 TRAINABLE_BEHAVIORS = frozenset({Behavior.PEE, Behavior.POOP, Behavior.NOT_POTTY})
+TRAINABLE_DOG_SUBJECTS = frozenset({Dog.GROMIT, Dog.WALLE, Dog.APOLLO, Dog.UNKNOWN})
 
 
 @dataclass(slots=True)
@@ -94,7 +98,7 @@ class LabelRange:
 
     @property
     def is_trainable(self) -> bool:
-        return self.behavior in TRAINABLE_BEHAVIORS
+        return self.behavior in TRAINABLE_BEHAVIORS and self.dog in TRAINABLE_DOG_SUBJECTS
 
     def frames(self) -> range:
         return range(self.start_frame, self.end_frame + 1)

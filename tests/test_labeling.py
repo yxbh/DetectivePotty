@@ -259,6 +259,33 @@ def test_scene_grouping_clusters_overlapping_clips(tmp_path: Path) -> None:
     assert by_id["span_c"]["scene_size"] == 1
 
 
+def test_clip_detail_includes_scene_grouping(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    cam = "camA@w"
+    a = _make_clip_dir(
+        root,
+        "span_a",
+        source_id=cam,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:26+00:00",
+    )
+    _make_clip_dir(
+        root,
+        "span_b",
+        source_id=cam,
+        track_id="2",
+        span_start_utc="2026-06-06T09:49:24+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+    )
+
+    by_id = {r["span_id"]: r for r in labeling.list_clips(root)}
+    detail = labeling.clip_detail(a, root)
+
+    assert detail["scene_id"] == by_id["span_a"]["scene_id"]
+    assert detail["scene_id"] == by_id["span_b"]["scene_id"]
+    assert detail["scene_size"] == 2
+
+
 def test_present_tracks_maps_sibling_into_clip_timeline(tmp_path: Path) -> None:
     root = tmp_path / "harvest"
     cam = "6695ef21030c4603e400040d@20260606T094800Z"
@@ -352,6 +379,77 @@ def test_save_clip_labels_roundtrip_and_validation(tmp_path: Path) -> None:
         labeling.save_clip_labels(clip_dir, bad)
 
 
+def test_save_clip_labels_preserves_scene_grouping(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    cam = "camA@w"
+    clip_dir = _make_clip_dir(
+        root,
+        "span_a",
+        source_id=cam,
+        span_start_utc="2026-06-06T09:49:20+00:00",
+        span_end_utc="2026-06-06T09:49:26+00:00",
+    )
+    _make_clip_dir(
+        root,
+        "span_b",
+        source_id=cam,
+        track_id="2",
+        span_start_utc="2026-06-06T09:49:24+00:00",
+        span_end_utc="2026-06-06T09:49:30+00:00",
+    )
+
+    detail = labeling.save_clip_labels(
+        clip_dir,
+        {
+            "ranges": [
+                {
+                    "start_frame": 2,
+                    "end_frame": 6,
+                    "start_s": 0.066,
+                    "end_s": 0.2,
+                    "behavior": "pee",
+                    "dog": "apollo",
+                    "track_id": "1",
+                }
+            ]
+        },
+        root,
+    )
+    by_id = {r["span_id"]: r for r in labeling.list_clips(root)}
+
+    assert detail["labeled"] is True
+    assert detail["scene_id"] == by_id["span_a"]["scene_id"]
+    assert detail["scene_id"] == by_id["span_b"]["scene_id"]
+    assert detail["scene_size"] == 2
+
+
+def test_summarize_excluded_unknown_range_counts_as_reviewed(tmp_path: Path) -> None:
+    root = tmp_path / "harvest"
+    clip_dir = _make_clip_dir(root, "span_excluded")
+    detail = labeling.save_clip_labels(
+        clip_dir,
+        {
+            "ranges": [
+                {
+                    "start_frame": 2,
+                    "end_frame": 6,
+                    "start_s": 0.066,
+                    "end_s": 0.2,
+                    "behavior": "excluded",
+                    "dog": "unknown",
+                    "track_id": "1",
+                }
+            ]
+        },
+    )
+
+    assert detail["labeled"] is True
+    assert detail["n_ranges"] == 1
+    assert detail["n_trainable_ranges"] == 0
+    assert detail["behaviors"] == ["excluded"]
+    assert detail["dogs"] == ["unknown"]
+
+
 # --- API ------------------------------------------------------------------
 
 
@@ -384,6 +482,7 @@ def test_api_list_clips(tmp_path: Path) -> None:
     assert {c["span_id"] for c in body["clips"]} == {"span_a", "span_b"}
     assert body["vocabulary"]["behaviors"] == ["pee", "poop", "not_potty", "excluded"]
     assert "apollo" in body["vocabulary"]["dogs"]
+    assert "not_dog" in body["vocabulary"]["dogs"]
 
 
 def test_api_clip_detail_and_save(tmp_path: Path) -> None:

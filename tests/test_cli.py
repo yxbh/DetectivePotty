@@ -113,3 +113,50 @@ def test_harvest_camera_forwards_tracker_flags(
     assert captured["center_dist_gate"] == 2.5
     assert captured["download_ahead"] == 4
 
+
+def test_experiment_bakeoff_forwards_abs_cutoff(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--abs-cutoff`` is parsed to floats and reaches ``run_bakeoff``.
+
+    Offline: the YOLO detector and the bake-off runner (which would otherwise
+    decode video + run a model) are stubbed, so no model/video is touched.
+    """
+
+    from detectivepotty import experiment
+    from detectivepotty.experiment.timeline import BakeoffReport
+
+    video = tmp_path / "chunk.mp4"
+    video.write_bytes(b"fake")
+
+    class _FakeDetector:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: D401 - stub
+            self.model_name = kwargs.get("model_name")
+            self.device = "cpu"
+
+    monkeypatch.setattr("detectivepotty.detect.yolo.DogDetector", _FakeDetector)
+
+    captured: dict = {}
+
+    def _fake_run_bakeoff(video_path, detector, **kwargs):
+        captured.update(kwargs)
+        return BakeoffReport(
+            source="chunk.mp4", duration_s=0, ground_truth_dog_seconds=0, scores=[]
+        )
+
+    monkeypatch.setattr(experiment, "run_bakeoff", _fake_run_bakeoff)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "experiment-bakeoff",
+            "--input", str(video),
+            "--thresholds", "0.25",
+            "--abs-cutoff", "1000,289231",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["abs_cutoffs"] == (1000.0, 289231.0)
+
+

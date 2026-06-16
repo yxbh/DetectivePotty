@@ -216,7 +216,7 @@ def summarize_clip(
         "class_distribution": class_distribution,
         "track_id": str(meta.get("track_id")) if meta.get("track_id") is not None else None,
         "n_detections": len(detections),
-        "labeled": bool(trainable),
+        "labeled": bool(ranges),
         "n_ranges": len(ranges),
         "n_trainable_ranges": len(trainable),
         "behaviors": behaviors,
@@ -247,6 +247,25 @@ def list_clips(root: str | Path) -> list[dict[str, Any]]:
     _assign_scenes(rows)
     rows.sort(key=lambda r: (r["labeled"], _neg_ts_key(r), r["span_id"]))
     return rows
+
+
+def _scene_fields_for_clip(
+    root: str | Path,
+    span_id: str,
+    camera_names: dict[str, str],
+) -> dict[str, Any]:
+    rows = [
+        summarize_clip(clip_dir, camera_names=camera_names)
+        for clip_dir in discover_clip_dirs(root)
+    ]
+    _assign_scenes(rows)
+    for row in rows:
+        if row["span_id"] == span_id:
+            return {
+                "scene_id": row["scene_id"],
+                "scene_size": row["scene_size"],
+            }
+    return {"scene_id": None, "scene_size": 1}
 
 
 def _assign_scenes(rows: list[dict[str, Any]]) -> None:
@@ -324,6 +343,9 @@ def clip_detail(clip_dir: Path, root: str | Path | None = None) -> dict[str, Any
         root = clip_dir.parent
     camera_names = load_camera_names(root)
     summary = summarize_clip(clip_dir, camera_names=camera_names)
+    summary.update(
+        _scene_fields_for_clip(root, str(summary["span_id"]), camera_names)
+    )
     tracks: dict[str, list[dict[str, Any]]] = {}
     for det in meta.get("detections", []):
         track_id = str(det.get("track_id"))

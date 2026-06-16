@@ -49,10 +49,17 @@ def test_excluded_behavior_not_trainable() -> None:
     assert not rng.is_trainable
 
 
+def test_not_dog_subject_not_trainable() -> None:
+    rng = LabelRange(0, 5, 0.0, 0.5, behavior=Behavior.NOT_POTTY, dog=Dog.NOT_DOG)
+    assert not rng.is_trainable
+
+
 def test_dog_enum_normalizes_aliases() -> None:
     assert Dog("WALL-E") is Dog.WALLE
     assert Dog("wall_e") is Dog.WALLE
     assert Dog("Gromit") is Dog.GROMIT
+    assert Dog("unknown dog") is Dog.UNKNOWN
+    assert Dog("not dog") is Dog.NOT_DOG
 
 
 def test_clip_labels_save_load_roundtrip(tmp_path: Path) -> None:

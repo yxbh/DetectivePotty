@@ -193,6 +193,36 @@ def test_export_dataset_excludes_excluded_and_unknown_dog(tmp_path: Path) -> Non
     assert not (out_dir / "behavior" / "train" / "excluded").exists()
 
 
+def test_export_dataset_excludes_not_dog_subject(tmp_path: Path) -> None:
+    clips_root = tmp_path / "harvest"
+    clip_dir = clips_root / "span_not_dog"
+    _write_clip(clip_dir)
+    save_labels(
+        ClipLabels(
+            ranges=[
+                LabelRange(0, 6, 0.0, 0.6, behavior=Behavior.NOT_POTTY, dog=Dog.NOT_DOG, track_id="1")
+            ]
+        ),
+        clip_dir,
+    )
+
+    out_dir = tmp_path / "export"
+    stats = export_dataset(
+        clips_root,
+        out_dir,
+        detector=FixedBoxDetector(),
+        sample_stride_s=0.3,
+        val_fraction=0.0,
+        capture_factory=lambda _p: FakeExportCapture(40),
+    )
+
+    assert stats.excluded_ranges == 1
+    assert stats.behavior_counts == {}
+    assert stats.dog_counts == {}
+    assert not (out_dir / "behavior").exists()
+    assert not (out_dir / "dog").exists()
+
+
 def test_export_dataset_drops_unmatched_track(tmp_path: Path) -> None:
     clips_root = tmp_path / "harvest"
     clip_dir = clips_root / "span_c"

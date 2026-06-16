@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { LabelPresentTrack, LabelRangeItem, LabelVocabulary } from "./types";
+  import { behaviorHint, behaviorText, dogHint, dogText } from "./format";
   import { frameToSeconds } from "./video/frameTime";
 
   interface Props {
@@ -14,6 +15,7 @@
     dirty: boolean;
     saving: boolean;
     saveStatus: string | null;
+    rangeFeedback: string | null;
     currentFrame: number;
     onselectclip: (spanId: string) => void;
     onsetmarkin: () => void;
@@ -40,6 +42,7 @@
     dirty,
     saving,
     saveStatus,
+    rangeFeedback,
     currentFrame,
     onselectclip,
     onsetmarkin,
@@ -103,31 +106,39 @@
 
   <div class="pickers">
     <div class="picker">
-      <span class="lbl">Behavior</span>
+      <span
+        class="lbl"
+        title="not potty is a trainable negative; exclude means reviewed but skipped from training."
+        >Behavior</span
+      >
       <div class="seg">
         {#each vocabulary.behaviors as behavior, i (behavior)}
           <button
             type="button"
             class:active={pendingBehavior === behavior}
             onclick={() => onbehavior(behavior)}
-            title={`Set behavior to ${behavior}${i < 9 ? ` (${i + 1})` : ""}`}
+            title={`${behaviorHint(behavior)}${i < 9 ? ` (${i + 1})` : ""}`}
           >
-            {behavior}{#if i < 9}<span class="kh">{i + 1}</span>{/if}
+            {behaviorText(behavior)}{#if i < 9}<span class="kh">{i + 1}</span>{/if}
           </button>
         {/each}
       </div>
     </div>
     <div class="picker">
-      <span class="lbl">Dog</span>
+      <span
+        class="lbl"
+        title="unknown dog is a real dog with uncertain identity; not dog marks a detector false positive."
+        >Dog</span
+      >
       <div class="seg">
         {#each vocabulary.dogs as dog (dog)}
           <button
             type="button"
             class:active={pendingDog === dog}
             onclick={() => ondog(dog)}
-            title={`Set dog to ${dog}${dogKeyHint[dog] ? ` (${dogKeyHint[dog]})` : ""}`}
+            title={`${dogHint(dog)}${dogKeyHint[dog] ? ` (${dogKeyHint[dog]})` : ""}`}
           >
-            {dog}{#if dogKeyHint[dog]}<span class="kh">{dogKeyHint[dog]}</span>{/if}
+            {dogText(dog)}{#if dogKeyHint[dog]}<span class="kh">{dogKeyHint[dog]}</span>{/if}
           </button>
         {/each}
       </div>
@@ -152,6 +163,9 @@
       <span class="error small">{saveStatus}</span>
     {:else if saveStatus === "saved"}
       <span class="ok small">✓ saved</span>
+    {/if}
+    {#if rangeFeedback}
+      <span class="notice small" aria-live="polite">{rangeFeedback}</span>
     {/if}
   </div>
 
@@ -197,7 +211,7 @@
               title="Behavior for this range"
             >
               {#each vocabulary.behaviors as behavior (behavior)}
-                <option value={behavior}>{behavior}</option>
+                <option value={behavior}>{behaviorText(behavior)}</option>
               {/each}
             </select>
             <select
@@ -208,7 +222,7 @@
               title="Dog for this range"
             >
               {#each vocabulary.dogs as dog (dog)}
-                <option value={dog}>{dog}</option>
+                <option value={dog}>{dogText(dog)}</option>
               {/each}
             </select>
             <button
@@ -229,6 +243,10 @@
     Space play · ←/→ step (⇧×10) · I/O mark · 1-4 behavior · ⇧1-4 dog · Enter add · S save ·
     j/k clip · n/N unlabeled
   </p>
+  <p class="legend help">
+    not potty = trainable negative · exclude = reviewed skip · unknown dog = real dog, identity
+    uncertain · not dog = detector false positive
+  </p>
 </div>
 
 <style>
@@ -237,7 +255,7 @@
     flex-direction: column;
     gap: 0.5rem;
     min-height: 0;
-    overflow-y: auto;
+    overflow: hidden;
   }
   .siblings {
     display: flex;
@@ -356,9 +374,11 @@
     cursor: default;
   }
   .ranges {
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     min-height: 0;
+    overflow: hidden;
   }
   .ranges h3 {
     font-size: 0.74rem;
@@ -368,12 +388,17 @@
     margin: 0.2rem 0;
   }
   .ranges ul {
+    flex: 1 1 auto;
     list-style: none;
     margin: 0;
-    padding: 0;
+    padding: 0 0.15rem 0 0;
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
   }
   .ranges li {
     display: flex;
@@ -439,7 +464,15 @@
     color: var(--text-dim);
     border-top: 1px solid var(--line-strong);
     padding-top: 0.4rem;
-    margin-top: auto;
+    margin: 0;
+    flex: none;
+  }
+  .legend.help {
+    border-top: 0;
+    font-family: inherit;
+    line-height: 1.25;
+    margin: -0.3rem 0 0;
+    padding-top: 0;
   }
   .small {
     font-size: 0.72rem;
@@ -452,5 +485,8 @@
   }
   .ok {
     color: var(--green);
+  }
+  .notice {
+    color: var(--amber-bright);
   }
 </style>

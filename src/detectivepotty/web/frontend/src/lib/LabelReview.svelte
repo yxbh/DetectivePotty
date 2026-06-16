@@ -36,6 +36,12 @@
   import LabelRangeEditor from "./LabelRangeEditor.svelte";
   import Transport from "./Transport.svelte";
 
+  interface Props {
+    active?: boolean;
+  }
+
+  let { active = true }: Props = $props();
+
   const BEHAVIOR_KEYS: Record<string, string> = {
     "1": "pee",
     "2": "poop",
@@ -73,6 +79,7 @@
   let dirty = $state(false);
   let saving = $state(false);
   let saveStatus = $state<string | null>(null);
+  let rangeFeedback = $state<string | null>(null);
 
   let videoEl = $state<HTMLVideoElement | null>(null);
   let thumbEl = $state<HTMLVideoElement | null>(null);
@@ -88,6 +95,7 @@
   let crops = $state<{ frame: number; url: string | null }[]>([]);
   let filmstripToken = 0;
   let detailToken = 0;
+  let rangeFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
   let stopLaneResize: (() => void) | null = null;
   let cleanupThumbWait: (() => void) | null = null;
 
@@ -157,6 +165,7 @@
     frameSync.destroy();
     stopLaneResize?.();
     cleanupThumbWait?.();
+    clearRangeFeedback();
     filmstripToken++;
     detailToken++;
   });
@@ -205,6 +214,7 @@
       ranges = data.labels.ranges.map((r) => ({ ...r }));
       dirty = false;
       saveStatus = null;
+      clearRangeFeedback();
       currentFrame = 0;
       markIn = null;
       markOut = null;
@@ -476,31 +486,48 @@
     const b = markOut ?? currentFrame;
     const start = Math.min(a, b);
     const end = Math.max(a, b);
-    ranges = [
-      ...ranges,
-      {
-        start_frame: start,
-        end_frame: end,
-        start_s: timelineFrameToSeconds(timeline, start),
-        end_s: timelineFrameToSeconds(timeline, end),
-        behavior: pendingBehavior,
-        dog: pendingDog,
-        track_id: trackId,
-      },
-    ];
+    const nextRange: LabelRangeItem = {
+      start_frame: start,
+      end_frame: end,
+      start_s: timelineFrameToSeconds(timeline, start),
+      end_s: timelineFrameToSeconds(timeline, end),
+      behavior: pendingBehavior,
+      dog: pendingDog,
+      track_id: trackId,
+    };
+    if (ranges.some((range) => sameRangeIdentity(range, nextRange))) {
+      showRangeFeedback("Duplicate range ignored");
+      markIn = null;
+      markOut = null;
+      return;
+    }
+    clearRangeFeedback();
+    ranges = [...ranges, nextRange];
     dirty = true;
     saveStatus = null;
     markIn = null;
     markOut = null;
   }
 
+  function sameRangeIdentity(a: LabelRangeItem, b: LabelRangeItem): boolean {
+    return (
+      a.start_frame === b.start_frame &&
+      a.end_frame === b.end_frame &&
+      a.behavior === b.behavior &&
+      a.dog === b.dog &&
+      a.track_id === b.track_id
+    );
+  }
+
   function deleteRange(idx: number): void {
+    clearRangeFeedback();
     ranges = ranges.filter((_, i) => i !== idx);
     dirty = true;
     saveStatus = null;
   }
 
   function updateRange(idx: number, patch: Partial<LabelRangeItem>): void {
+    clearRangeFeedback();
     ranges = ranges.map((r, i) => (i === idx ? { ...r, ...patch } : r));
     dirty = true;
     saveStatus = null;
@@ -531,8 +558,39 @@
     seekToFrame(r.start_frame);
   }
 
+  function withPreservedSceneFields(updated: LabelClipDetail): LabelClipDetail {
+    if (updated.scene_size > 1) return updated;
+    const existing = clips.find((clip) => clip.span_id === updated.span_id);
+    if (!existing || existing.scene_size <= 1) return updated;
+    return {
+      ...updated,
+      scene_id: existing.scene_id,
+      scene_size: existing.scene_size,
+    };
+  }
+
+  function showRangeFeedback(message: string): void {
+    if (rangeFeedbackTimer != null) {
+      clearTimeout(rangeFeedbackTimer);
+    }
+    rangeFeedback = message;
+    rangeFeedbackTimer = setTimeout(() => {
+      rangeFeedback = null;
+      rangeFeedbackTimer = null;
+    }, 2400);
+  }
+
+  function clearRangeFeedback(): void {
+    if (rangeFeedbackTimer != null) {
+      clearTimeout(rangeFeedbackTimer);
+      rangeFeedbackTimer = null;
+    }
+    rangeFeedback = null;
+  }
+
   async function save(): Promise<void> {
     if (!detail || saving) return;
+    clearRangeFeedback();
     saving = true;
     saveStatus = null;
     const body: ClipLabelsBody = {
@@ -542,14 +600,17 @@
     };
     try {
       const updated = await saveLabelClip(detail.span_id, body);
-      detail = updated;
-      ranges = updated.labels.ranges.map((r) => ({ ...r }));
+      const updatedDetail = withPreservedSceneFields(updated);
+      detail = updatedDetail;
+      ranges = updatedDetail.labels.ranges.map((r) => ({ ...r }));
       dirty = false;
       saveStatus = "saved";
-      clips = clips.map((c) => (c.span_id === updated.span_id ? updated : c));
-      if (listFilter === "unlabeled" && updated.labeled) {
-        const next = nextUnlabeledTarget(1, updated.span_id);
-        if (next && next.span_id !== updated.span_id) {
+      clips = clips.map((c) =>
+        c.span_id === updatedDetail.span_id ? updatedDetail : c,
+      );
+      if (listFilter === "unlabeled" && updatedDetail.labeled) {
+        const next = nextUnlabeledTarget(1, updatedDetail.span_id);
+        if (next && next.span_id !== updatedDetail.span_id) {
           void selectClip(next.span_id);
         } else {
           saveStatus = "saved · no unlabeled clips left";
@@ -620,7 +681,14 @@
 
   // --- keyboard -----------------------------------------------------------
 
+  function isSpaceKey(event: KeyboardEvent): boolean {
+    return event.key === " " || event.key === "Spacebar" || event.code === "Space";
+  }
+
   function onKey(event: KeyboardEvent): void {
+    if (!active) {
+      return;
+    }
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
       return;
     }
@@ -639,14 +707,17 @@
     }
     switch (event.key) {
       case " ":
+      case "Spacebar":
         event.preventDefault();
         togglePlay();
         break;
       case "ArrowRight":
+      case "Right":
         event.preventDefault();
         stepFrame(event.shiftKey ? 10 : 1);
         break;
       case "ArrowLeft":
+      case "Left":
         event.preventDefault();
         stepFrame(event.shiftKey ? -10 : -1);
         break;
@@ -686,7 +757,23 @@
         jumpUnlabeled(-1);
         break;
       default:
+        if (isSpaceKey(event)) {
+          event.preventDefault();
+          togglePlay();
+          return;
+        }
+        if (event.code === "ArrowRight") {
+          event.preventDefault();
+          stepFrame(event.shiftKey ? 10 : 1);
+          return;
+        }
+        if (event.code === "ArrowLeft") {
+          event.preventDefault();
+          stepFrame(event.shiftKey ? -10 : -1);
+          return;
+        }
         if (event.key in BEHAVIOR_KEYS) {
+          event.preventDefault();
           pendingBehavior = BEHAVIOR_KEYS[event.key];
         }
         break;
@@ -832,6 +919,7 @@
         {dirty}
         {saving}
         {saveStatus}
+        {rangeFeedback}
         {currentFrame}
         onselectclip={(spanId) => void selectClip(spanId)}
         onsetmarkin={setMarkIn}
